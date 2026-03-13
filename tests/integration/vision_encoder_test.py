@@ -43,6 +43,24 @@ DEFAULT_LOAD_PARAMETERS_PATH = (
 class VisionEncoderEmbeddingTest(unittest.TestCase):
 
   CONFIGS = {
+      "qwen3-vl-2b": [
+          None,
+          get_test_config_path(),
+          "model_name=qwen3-vl-2b",
+          "tokenizer_path=Qwen/Qwen3-VL-2B-Instruct",
+          "use_multimodal=True",
+          "run_name=runner_test",
+          "load_parameters_path=gs://placeholder-checkpoint-path",
+          "steps=1",
+          "enable_checkpointing=False",
+          "max_target_length=16",
+          "max_prefill_predict_length=8",
+          "per_device_batch_size=1",
+          "scan_layers=false",
+          "prompt='Describe this image'",
+          rf"image_path={os.path.join(MAXTEXT_TEST_ASSETS_ROOT, 'test_image.jpg')}",
+          "skip_jax_distributed_system=True",
+      ],
       "gemma3-4b": [  # tests decode with multimodal gemma-4b
           None,
           get_test_config_path(),
@@ -104,6 +122,38 @@ class VisionEncoderEmbeddingTest(unittest.TestCase):
     mse = np.mean((image_embeddings - golden_image_embeddings) ** 2)
     print(f"MSE between image_embedding and golden data: {mse}")
     self.assertLess(mse, 1e-2, f"Image embedding mismatch with golden data, MSE {mse} exceeds threshold 1e-2")
+
+  @pytest.mark.skip(reason="Pending weight conversion for Qwen3-VL")
+  @pytest.mark.tpu_only
+  def test_image_embedding_qwen3_vl_2b_tpu(self):
+    os.environ["TF_CPP_MIN_LOG_LEVEL"] = "0"
+    """Correctness test for the qwen3-vl-2b image embedding."""
+    config = pyconfig.initialize(VisionEncoderEmbeddingTest.CONFIGS["qwen3-vl-2b"])
+    engine = maxengine.MaxEngine(config)
+    rng = jax.random.PRNGKey(1234)
+    rng, rng_load_params = jax.random.split(rng)
+
+    params = engine.load_params(rng_load_params)
+
+    input_golden_data_path = os.path.join(MAXTEXT_TEST_ASSETS_ROOT, "golden_logits", "golden_data_qwen3_vl_vit.jsonl")
+    with jsonlines.open(input_golden_data_path, mode="r") as reader:
+      loaded_data = next(iter(reader))
+
+    input_images = jnp.asarray(loaded_data["pixel_values"])
+
+    vision_encoder_model = models.VisionEncoder(config, engine.mesh, rngs=engine.rng)
+    vision_encoder_params = params["params"]["vision_encoder"]
+
+    def apply_vision_encoder_fn(params, images_input):
+      return vision_encoder_model.apply({"params": params}, images_input)
+
+    jitted_apply_vision_encoder_fn = jax.jit(apply_vision_encoder_fn)
+    image_embeddings = jitted_apply_vision_encoder_fn(vision_encoder_params, input_images)
+
+    golden_image_embeddings = np.asarray(loaded_data["soft_embeddings"], dtype=np.float32)
+    mse = np.mean((image_embeddings[0] - golden_image_embeddings) ** 2)
+    print(f"MSE between image_embedding and golden data: {mse}")
+    self.assertLess(mse, 1e-2, f"Image embedding mismatch, MSE {mse} exceeds threshold 1e-2")
 
 
 if __name__ == "__main__":

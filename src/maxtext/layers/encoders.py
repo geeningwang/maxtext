@@ -50,7 +50,7 @@ class VisionEncoder(nnx.Module):
       setattr(self, encoder_name, llama4.Llama4VisionModel(config=self.config, mesh=self.mesh, rngs=self.rngs))
       setattr(self, projector_name, llama4.Llama4MultiModalProjector(config=self.config, mesh=self.mesh, rngs=self.rngs))
       return encoder_name, projector_name
-    elif self.config.model_name in ["qwen3-omni-30b-a3b"]:
+    elif self.config.model_name in ["qwen3-omni-30b-a3b", "qwen3-vl-2b", "qwen3-vl-8b"]:
       from maxtext.models import qwen3  # pylint: disable=import-outside-toplevel
 
       encoder_name = "Qwen3OmniMoeVisionEncoder_0"
@@ -95,7 +95,7 @@ class AudioEncoder(nnx.Module):
 
   def _setup_audio_encoder_layers(self):
     """Setup audio encoder layers specific to the model, instantiate NNX modules."""
-    if self.config.model_name in ["qwen3-omni-30b-a3b"]:
+    if self.config.model_name in ["qwen3-omni-30b-a3b", "qwen3-vl-2b", "qwen3-vl-8b"]:
       from maxtext.models import qwen3  # pylint: disable=import-outside-toplevel
 
       encoder_name = "Qwen3OmniAudioEncoder_0"
