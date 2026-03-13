@@ -194,6 +194,12 @@ def get_bidirectional_mask_vision(config, decoder_input_tokens):
         decoder_input_tokens == QWEN3_OMNI_VIDEO_TOKEN
     )
     # Create image/video mask for deepstack visual embedding injection
+  elif config.model_name in ["qwen3-vl-2b", "qwen3-vl-8b"]:
+    from maxtext.multimodal.processor_qwen3_vl import QWEN3_VL_IMAGE_TOKEN, QWEN3_VL_VIDEO_TOKEN  # pylint: disable=import-outside-toplevel
+
+    bidirectional_mask_vision = (decoder_input_tokens == QWEN3_VL_IMAGE_TOKEN) | (
+        decoder_input_tokens == QWEN3_VL_VIDEO_TOKEN
+    )
   return bidirectional_mask_vision
 
 
