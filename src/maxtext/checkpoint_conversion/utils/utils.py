@@ -81,6 +81,8 @@ HF_IDS = {
     "deepseek3-671b": "deepseek-ai/DeepSeek-V3",
     "gpt-oss-20b": "openai/gpt-oss-20b",
     "gpt-oss-120b": "openai/gpt-oss-120b",
+    "qwen3-vl-2b": "Qwen/Qwen3-VL-2B-Instruct",
+    "qwen3-vl-8b": "Qwen/Qwen3-VL-8B-Instruct",
     "qwen3-omni-30b-a3b": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
     "qwen3-next-80b-a3b": "Qwen/Qwen3-Next-80B-A3B-Instruct",
     "mixtral-8x7b": "mistralai/Mixtral-8x7B-Instruct-v0.1",
@@ -944,6 +946,10 @@ def get_hf_model(model_id: str, token: str, revision: str = None):
     from transformers import Qwen3OmniMoeForConditionalGeneration  # pylint: disable=import-outside-toplevel
 
     model_class = Qwen3OmniMoeForConditionalGeneration
+  elif "Qwen3-VL" in model_id:
+    from transformers import AutoModelForImageTextToText  # pylint: disable=import-outside-toplevel
+
+    model_class = AutoModelForImageTextToText
   else:
     model_class = AutoModelForCausalLM
 

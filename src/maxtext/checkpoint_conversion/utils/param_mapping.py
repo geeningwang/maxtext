@@ -1357,6 +1357,93 @@ def GPT_OSS_TO_HF_PARAM_HOOK_FN(config, maxtext_config, scan_layers=False, savin
   return hooks
 
 
+def QWEN3_VL_MAXTEXT_TO_HF_PARAM_MAPPING(config, maxtext_config, scan_layers=False):
+  """Returns mapping from MaxText to HuggingFace Qwen3-VL weight paths."""
+  mapping = {}
+
+  num_experts_text = config.get("num_experts", 0)
+  if "text_config" in config:
+    n_layers_text = config["text_config"]["num_hidden_layers"]
+  else:
+    n_layers_text = config["num_hidden_layers"]
+
+  text_mapping = QWEN3_MAXTEXT_TO_HF_PARAM_MAPPING(
+      config={"num_hidden_layers": n_layers_text, "num_experts": num_experts_text},
+      maxtext_config=maxtext_config,
+      scan_layers=scan_layers,
+  )
+  mapping.update(text_mapping)
+
+  if "vision_config" in config:
+    vision_config = config["vision_config"]
+  else:
+    vision_config = {
+        "depth": maxtext_config.num_hidden_layers_for_vit,
+        "deepstack_visual_indexes": maxtext_config.deepstack_visual_indexes_for_vit,
+    }
+
+  n_vision_layers = vision_config["depth"]
+
+  # Patch/pos embeddings
+  mapping["params-vision_encoder-Qwen3OmniMoeVisionEncoder_0-patch_embed-proj-kernel"] = "visual.patch_embed.proj.weight"
+  mapping["params-vision_encoder-Qwen3OmniMoeVisionEncoder_0-patch_embed-proj-bias"] = "visual.patch_embed.proj.bias"
+  mapping["params-vision_encoder-Qwen3OmniMoeVisionEncoder_0-pos_embed_interpolate-pos_embed"] = "visual.pos_embed.weight"
+
+  for i in range(n_vision_layers):
+    prefix = f"params-vision_encoder-Qwen3OmniMoeVisionEncoder_0-blocks_{i}"
+    hf_prefix = f"visual.blocks.{i}"
+
+    mapping[f"{prefix}-ln1-scale"] = f"{hf_prefix}.norm1.weight"
+    mapping[f"{prefix}-ln1-bias"] = f"{hf_prefix}.norm1.bias"
+    mapping[f"{prefix}-ln2-scale"] = f"{hf_prefix}.norm2.weight"
+    mapping[f"{prefix}-ln2-bias"] = f"{hf_prefix}.norm2.bias"
+
+    mapping[f"{prefix}-attn-attn-query-kernel"] = f"{hf_prefix}.attn.qkv.weight"
+    mapping[f"{prefix}-attn-attn-query-bias"] = f"{hf_prefix}.attn.qkv.bias"
+    mapping[f"{prefix}-attn-attn-key-kernel"] = f"{hf_prefix}.attn.qkv.weight"
+    mapping[f"{prefix}-attn-attn-key-bias"] = f"{hf_prefix}.attn.qkv.bias"
+    mapping[f"{prefix}-attn-attn-value-kernel"] = f"{hf_prefix}.attn.qkv.weight"
+    mapping[f"{prefix}-attn-attn-value-bias"] = f"{hf_prefix}.attn.qkv.bias"
+
+    mapping[f"{prefix}-attn-attn-out-kernel"] = f"{hf_prefix}.attn.proj.weight"
+    mapping[f"{prefix}-attn-attn-out-bias"] = f"{hf_prefix}.attn.proj.bias"
+
+    mapping[f"{prefix}-mlp-fc1-kernel"] = f"{hf_prefix}.mlp.linear_fc1.weight"
+    mapping[f"{prefix}-mlp-fc1-bias"] = f"{hf_prefix}.mlp.linear_fc1.bias"
+    mapping[f"{prefix}-mlp-fc2-kernel"] = f"{hf_prefix}.mlp.linear_fc2.weight"
+    mapping[f"{prefix}-mlp-fc2-bias"] = f"{hf_prefix}.mlp.linear_fc2.bias"
+
+  # Vision Projector (merger layer)
+  proj_prefix = "params-vision_encoder-Qwen3OmniMoeVisionProjector_0-merger"
+  hf_proj_prefix = "visual.merger"
+  mapping[f"{proj_prefix}-ln_q-scale"] = f"{hf_proj_prefix}.norm.weight"
+  mapping[f"{proj_prefix}-ln_q-bias"] = f"{hf_proj_prefix}.norm.bias"
+  mapping[f"{proj_prefix}-mlp_0-kernel"] = f"{hf_proj_prefix}.linear_fc1.weight"
+  mapping[f"{proj_prefix}-mlp_0-bias"] = f"{hf_proj_prefix}.linear_fc1.bias"
+  mapping[f"{proj_prefix}-mlp_2-kernel"] = f"{hf_proj_prefix}.linear_fc2.weight"
+  mapping[f"{proj_prefix}-mlp_2-bias"] = f"{hf_proj_prefix}.linear_fc2.bias"
+
+  # Deep features extractors
+  deep_indexes = vision_config["deepstack_visual_indexes"]
+  for i, _ in enumerate(deep_indexes):
+    merger_prefix = f"params-vision_encoder-Qwen3OmniMoeVisionEncoder_0-merger_{i}"
+    hf_merger_prefix = f"visual.deepstack_merger_list.{i}"
+
+    mapping[f"{merger_prefix}-ln_q-scale"] = f"{hf_merger_prefix}.norm.weight"
+    mapping[f"{merger_prefix}-ln_q-bias"] = f"{hf_merger_prefix}.norm.bias"
+    mapping[f"{merger_prefix}-mlp_0-kernel"] = f"{hf_merger_prefix}.linear_fc1.weight"
+    mapping[f"{merger_prefix}-mlp_0-bias"] = f"{hf_merger_prefix}.linear_fc1.bias"
+    mapping[f"{merger_prefix}-mlp_2-kernel"] = f"{hf_merger_prefix}.linear_fc2.weight"
+    mapping[f"{merger_prefix}-mlp_2-bias"] = f"{hf_merger_prefix}.linear_fc2.bias"
+
+  return mapping
+
+
+def QWEN3_VL_MAXTEXT_TO_HF_PARAM_HOOK_FN(config, maxtext_config, scan_layers=False, saving_to_hf=False):
+  """Returns hook functions for Qwen3-VL."""
+  return QWEN3_OMNI_MOE_MAXTEXT_TO_HF_PARAM_HOOK_FN(config, maxtext_config, scan_layers, saving_to_hf)
+
+
 def QWEN3_OMNI_MOE_MAXTEXT_TO_HF_PARAM_MAPPING(config, maxtext_config, scan_layers=False):
   """Returns mapping from MaxText to HuggingFace Qwen3-Omni weight paths.
 
@@ -2347,6 +2434,8 @@ PARAM_MAPPING = {
     "deepseek3-671b": DEEPSEEK_MAXTEXT_TO_HF_PARAM_MAPPING,
     "gpt-oss-20b": GPT_OSS_MAXTEXT_TO_HF_PARAM_MAPPING,
     "gpt-oss-120b": GPT_OSS_MAXTEXT_TO_HF_PARAM_MAPPING,
+    "qwen3-vl-2b": QWEN3_VL_MAXTEXT_TO_HF_PARAM_MAPPING,
+    "qwen3-vl-8b": QWEN3_VL_MAXTEXT_TO_HF_PARAM_MAPPING,
     "qwen3-omni-30b-a3b": QWEN3_OMNI_MOE_MAXTEXT_TO_HF_PARAM_MAPPING,
     "qwen3-next-80b-a3b": QWEN3_NEXT_MAXTEXT_TO_HF_PARAM_MAPPING,
     "mixtral-8x7b": MIXTRAL_MAXTEXT_TO_HF_PARAM_MAPPING,
@@ -2379,6 +2468,8 @@ HOOK_FNS = {
     "deepseek3-671b": DEEPSEEK_MAXTEXT_TO_HF_PARAM_HOOK_FN,
     "gpt-oss-20b": GPT_OSS_TO_HF_PARAM_HOOK_FN,
     "gpt-oss-120b": GPT_OSS_TO_HF_PARAM_HOOK_FN,
+    "qwen3-vl-2b": QWEN3_VL_MAXTEXT_TO_HF_PARAM_HOOK_FN,
+    "qwen3-vl-8b": QWEN3_VL_MAXTEXT_TO_HF_PARAM_HOOK_FN,
     "qwen3-omni-30b-a3b": QWEN3_OMNI_MOE_MAXTEXT_TO_HF_PARAM_HOOK_FN,
     "qwen3-next-80b-a3b": QWEN3_NEXT_MAXTEXT_TO_HF_PARAM_HOOK_FN,
     "mixtral-8x7b": MIXTRAL_MAXTEXT_TO_HF_PARAM_HOOK_FN,

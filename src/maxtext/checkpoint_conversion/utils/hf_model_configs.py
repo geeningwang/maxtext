@@ -807,6 +807,118 @@ mixtral_8x22b_dict = {
 mixtral_8x22b_config = transformers.MixtralConfig(**mixtral_8x22b_dict)
 
 
+qwen3_vl_2b_dict = {
+    "architectures": ["Qwen3VLForConditionalGeneration"],
+    "image_token_id": 151655,
+    "model_type": "qwen3_vl",
+    "text_config": {
+        "attention_bias": False,
+        "attention_dropout": 0.0,
+        "bos_token_id": 151643,
+        "dtype": "bfloat16",
+        "eos_token_id": 151645,
+        "head_dim": 128,
+        "hidden_act": "silu",
+        "hidden_size": 2048,
+        "initializer_range": 0.02,
+        "intermediate_size": 6144,
+        "max_position_embeddings": 262144,
+        "model_type": "qwen3_vl_text",
+        "num_attention_heads": 16,
+        "num_hidden_layers": 28,
+        "num_key_value_heads": 8,
+        "rms_norm_eps": 1e-06,
+        "rope_scaling": {"mrope_interleaved": True, "mrope_section": [24, 20, 20], "rope_type": "default"},
+        "rope_theta": 5000000,
+        "use_cache": True,
+        "vocab_size": 151936,
+    },
+    "tie_word_embeddings": True,
+    "video_token_id": 151656,
+    "vision_config": {
+        "deepstack_visual_indexes": [5, 11, 17],
+        "depth": 24,
+        "hidden_act": "gelu_pytorch_tanh",
+        "hidden_size": 1024,
+        "in_channels": 3,
+        "initializer_range": 0.02,
+        "intermediate_size": 4096,
+        "model_type": "qwen3_vl",
+        "num_heads": 16,
+        "num_position_embeddings": 2304,
+        "out_hidden_size": 2048,
+        "patch_size": 16,
+        "spatial_merge_size": 2,
+        "temporal_patch_size": 2,
+    },
+    "vision_end_token_id": 151653,
+    "vision_start_token_id": 151652,
+}
+# Wait, for maxtext HF_MODEL_CONFIGS, it expects actual transformers.PretrainedConfig objects.
+# Let's use transformers.PretrainedConfig as base since it just needs to hold attributes.
+from transformers import PretrainedConfig
+
+
+class DummyQwen3VLConfig(PretrainedConfig):
+
+  def __init__(self, **kwargs):
+    super().__init__(**kwargs)
+    for k, v in kwargs.items():
+      setattr(self, k, v)
+
+
+qwen3_vl_2b_config = DummyQwen3VLConfig(**qwen3_vl_2b_dict)
+
+qwen3_vl_8b_dict = {
+    "architectures": ["Qwen3VLForConditionalGeneration"],
+    "image_token_id": 151655,
+    "model_type": "qwen3_vl",
+    "text_config": {
+        "attention_bias": False,
+        "attention_dropout": 0.0,
+        "bos_token_id": 151643,
+        "dtype": "bfloat16",
+        "eos_token_id": 151645,
+        "head_dim": 128,
+        "hidden_act": "silu",
+        "hidden_size": 4096,
+        "initializer_range": 0.02,
+        "intermediate_size": 12288,
+        "max_position_embeddings": 262144,
+        "model_type": "qwen3_vl_text",
+        "num_attention_heads": 32,
+        "num_hidden_layers": 36,
+        "num_key_value_heads": 8,
+        "rms_norm_eps": 1e-06,
+        "rope_scaling": {"mrope_interleaved": True, "mrope_section": [24, 20, 20], "rope_type": "default"},
+        "rope_theta": 5000000,
+        "use_cache": True,
+        "vocab_size": 151936,
+    },
+    "tie_word_embeddings": False,
+    "video_token_id": 151656,
+    "vision_config": {
+        "deepstack_visual_indexes": [8, 16, 24],
+        "depth": 27,
+        "hidden_act": "gelu_pytorch_tanh",
+        "hidden_size": 1152,
+        "in_channels": 3,
+        "initializer_range": 0.02,
+        "intermediate_size": 4304,
+        "model_type": "qwen3_vl",
+        "num_heads": 16,
+        "num_position_embeddings": 2304,
+        "out_hidden_size": 4096,
+        "patch_size": 16,
+        "spatial_merge_size": 2,
+        "temporal_patch_size": 2,
+    },
+    "vision_end_token_id": 151653,
+    "vision_start_token_id": 151652,
+}
+qwen3_vl_8b_config = DummyQwen3VLConfig(**qwen3_vl_8b_dict)
+
+
 # {maxtext model name: hf model config}
 HF_MODEL_CONFIGS = {
     "gemma2-2b": gemma2_2b_config,
@@ -832,6 +944,8 @@ HF_MODEL_CONFIGS = {
     "gpt-oss-20b": gpt_oss_20b_config,
     "gpt-oss-120b": gpt_oss_120b_config,
     "qwen3-omni-30b-a3b": qwen3_omni_30b_a3b_config,
+    "qwen3-vl-2b": qwen3_vl_2b_config,
+    "qwen3-vl-8b": qwen3_vl_8b_config,
     "qwen3-next-80b-a3b": qwen3_next_80b_a3b_config,
     "mixtral-8x7b": mixtral_8x7b_config,
     "mixtral-8x22b": mixtral_8x22b_config,
