@@ -153,6 +153,10 @@ def get_dummy_image_shape_for_init(model_name, batch_size=1, num_image_per_seque
     from maxtext.multimodal.processor_qwen3_omni import get_dummy_image_shape_for_init_qwen3_omni  # pylint: disable=import-outside-toplevel
 
     image_shape = get_dummy_image_shape_for_init_qwen3_omni(batch_size)
+  elif model_name.startswith("qwen3-vl"):
+    from maxtext.multimodal.processor_qwen3_vl import get_dummy_image_shape_for_init_qwen3_vl  # pylint: disable=import-outside-toplevel
+
+    image_shape = get_dummy_image_shape_for_init_qwen3_vl(batch_size)
   return image_shape
 
 

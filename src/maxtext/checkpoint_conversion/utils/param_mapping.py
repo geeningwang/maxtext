@@ -1371,6 +1371,23 @@ def QWEN3_VL_MAXTEXT_TO_HF_PARAM_MAPPING(config, maxtext_config, scan_layers=Fal
       maxtext_config=maxtext_config,
       scan_layers=scan_layers,
   )
+
+  # Add "model.language_model." prefix to text mappings for Qwen3-VL
+  # The base Qwen3 mapping returns paths like "model.embed_tokens.weight"
+  # We need to convert them to "model.language_model.embed_tokens.weight"
+  def fix_language_model_prefix(value):
+    """Fix the model prefix for Qwen3-VL (from model.X to model.language_model.X)."""
+    if isinstance(value, list):
+      return [fix_language_model_prefix(v) for v in value]
+    else:
+      # Replace "model." prefix with "model.language_model."
+      if value.startswith("model."):
+        return value.replace("model.", "model.language_model.", 1)
+      return value
+
+  for key, value in text_mapping.items():
+    text_mapping[key] = fix_language_model_prefix(value)
+  
   mapping.update(text_mapping)
 
   if "vision_config" in config:
@@ -1383,14 +1400,14 @@ def QWEN3_VL_MAXTEXT_TO_HF_PARAM_MAPPING(config, maxtext_config, scan_layers=Fal
 
   n_vision_layers = vision_config["depth"]
 
-  # Patch/pos embeddings
-  mapping["params-vision_encoder-Qwen3OmniMoeVisionEncoder_0-patch_embed-proj-kernel"] = "visual.patch_embed.proj.weight"
-  mapping["params-vision_encoder-Qwen3OmniMoeVisionEncoder_0-patch_embed-proj-bias"] = "visual.patch_embed.proj.bias"
-  mapping["params-vision_encoder-Qwen3OmniMoeVisionEncoder_0-pos_embed_interpolate-pos_embed"] = "visual.pos_embed.weight"
+  # Patch/pos embeddings (under model.visual.* in Qwen3-VL)
+  mapping["params-vision_encoder-Qwen3OmniMoeVisionEncoder_0-patch_embed-proj-kernel"] = "model.visual.patch_embed.proj.weight"
+  mapping["params-vision_encoder-Qwen3OmniMoeVisionEncoder_0-patch_embed-proj-bias"] = "model.visual.patch_embed.proj.bias"
+  mapping["params-vision_encoder-Qwen3OmniMoeVisionEncoder_0-pos_embed_interpolate-pos_embed"] = "model.visual.pos_embed.weight"
 
   for i in range(n_vision_layers):
     prefix = f"params-vision_encoder-Qwen3OmniMoeVisionEncoder_0-blocks_{i}"
-    hf_prefix = f"visual.blocks.{i}"
+    hf_prefix = f"model.visual.blocks.{i}"
 
     mapping[f"{prefix}-ln1-scale"] = f"{hf_prefix}.norm1.weight"
     mapping[f"{prefix}-ln1-bias"] = f"{hf_prefix}.norm1.bias"
@@ -1407,14 +1424,14 @@ def QWEN3_VL_MAXTEXT_TO_HF_PARAM_MAPPING(config, maxtext_config, scan_layers=Fal
     mapping[f"{prefix}-attn-attn-out-kernel"] = f"{hf_prefix}.attn.proj.weight"
     mapping[f"{prefix}-attn-attn-out-bias"] = f"{hf_prefix}.attn.proj.bias"
 
-    mapping[f"{prefix}-mlp-fc1-kernel"] = f"{hf_prefix}.mlp.linear_fc1.weight"
-    mapping[f"{prefix}-mlp-fc1-bias"] = f"{hf_prefix}.mlp.linear_fc1.bias"
-    mapping[f"{prefix}-mlp-fc2-kernel"] = f"{hf_prefix}.mlp.linear_fc2.weight"
-    mapping[f"{prefix}-mlp-fc2-bias"] = f"{hf_prefix}.mlp.linear_fc2.bias"
+    mapping[f"{prefix}-mlp-kernel"] = f"{hf_prefix}.mlp.linear_fc1.weight"
+    mapping[f"{prefix}-mlp-bias"] = f"{hf_prefix}.mlp.linear_fc1.bias"
+    mapping[f"{prefix}-mlp_out-kernel"] = f"{hf_prefix}.mlp.linear_fc2.weight"
+    mapping[f"{prefix}-mlp_out-bias"] = f"{hf_prefix}.mlp.linear_fc2.bias"
 
   # Vision Projector (merger layer)
   proj_prefix = "params-vision_encoder-Qwen3OmniMoeVisionProjector_0-merger"
-  hf_proj_prefix = "visual.merger"
+  hf_proj_prefix = "model.visual.merger"
   mapping[f"{proj_prefix}-ln_q-scale"] = f"{hf_proj_prefix}.norm.weight"
   mapping[f"{proj_prefix}-ln_q-bias"] = f"{hf_proj_prefix}.norm.bias"
   mapping[f"{proj_prefix}-mlp_0-kernel"] = f"{hf_proj_prefix}.linear_fc1.weight"
@@ -1426,7 +1443,7 @@ def QWEN3_VL_MAXTEXT_TO_HF_PARAM_MAPPING(config, maxtext_config, scan_layers=Fal
   deep_indexes = vision_config["deepstack_visual_indexes"]
   for i, _ in enumerate(deep_indexes):
     merger_prefix = f"params-vision_encoder-Qwen3OmniMoeVisionEncoder_0-merger_{i}"
-    hf_merger_prefix = f"visual.deepstack_merger_list.{i}"
+    hf_merger_prefix = f"model.visual.deepstack_merger_list.{i}"
 
     mapping[f"{merger_prefix}-ln_q-scale"] = f"{hf_merger_prefix}.norm.weight"
     mapping[f"{merger_prefix}-ln_q-bias"] = f"{hf_merger_prefix}.norm.bias"
@@ -1562,8 +1579,8 @@ def QWEN3_VL_MAXTEXT_TO_HF_PARAM_HOOK_FN(config, maxtext_config, scan_layers=Fal
     mapping[f"{prefix}-attn-attn-value-bias"] = split_qkv_bias_value
     mapping[f"{prefix}-attn-attn-out-kernel"] = reshape_vision_attn_out
 
-    mapping[f"{prefix}-mlp-fc1-kernel"] = reshape_kernel_vision
-    mapping[f"{prefix}-mlp-fc2-kernel"] = reshape_kernel_vision
+    mapping[f"{prefix}-mlp-kernel"] = reshape_kernel_vision
+    mapping[f"{prefix}-mlp_out-kernel"] = reshape_kernel_vision
 
   # Map hooks to projector (merger)
   proj_prefix = "params-vision_encoder-Qwen3OmniMoeVisionProjector_0-merger"

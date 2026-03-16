@@ -946,7 +946,7 @@ def get_hf_model(model_id: str, token: str, revision: str = None):
     from transformers import Qwen3OmniMoeForConditionalGeneration  # pylint: disable=import-outside-toplevel
 
     model_class = Qwen3OmniMoeForConditionalGeneration
-  elif "Qwen3-VL" in model_id:
+  elif "Qwen3-VL" in model_id or "qwen3_vl" in model_id:
     from transformers import AutoModelForImageTextToText  # pylint: disable=import-outside-toplevel
 
     model_class = AutoModelForImageTextToText
