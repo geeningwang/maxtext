@@ -46,7 +46,6 @@ parameter from the source checkpoint and build the target checkpoint.
 """
 
 import warnings
-import numpy as np
 
 import jax
 import jax.numpy as jnp
@@ -1440,8 +1439,145 @@ def QWEN3_VL_MAXTEXT_TO_HF_PARAM_MAPPING(config, maxtext_config, scan_layers=Fal
 
 
 def QWEN3_VL_MAXTEXT_TO_HF_PARAM_HOOK_FN(config, maxtext_config, scan_layers=False, saving_to_hf=False):
-  """Returns hook functions for Qwen3-VL."""
-  return QWEN3_OMNI_MOE_MAXTEXT_TO_HF_PARAM_HOOK_FN(config, maxtext_config, scan_layers, saving_to_hf)
+  """Returns hook functions for Qwen3-VL.
+
+  This function provides a dictionary of transformation functions (hooks) for
+  converting Qwen3-VL model parameters between MaxText and Hugging Face formats.
+  It handles embedding padding, kernel reshaping, and QKV splitting/fusion.
+  """
+
+  mapping = {}
+
+  # Text hooks
+  num_experts_text = config.get("num_experts", 0)
+  if "text_config" in config:
+    n_layers_text = config["text_config"]["num_hidden_layers"]
+  else:
+    n_layers_text = config["num_hidden_layers"]
+
+  text_hooks = QWEN3_MAXTEXT_TO_HF_PARAM_HOOK_FN(
+      config={"num_hidden_layers": n_layers_text, "num_experts": num_experts_text},
+      maxtext_config=maxtext_config,
+      scan_layers=scan_layers,
+      saving_to_hf=saving_to_hf,
+  )
+  mapping.update(text_hooks)
+
+  # Vision hooks
+  if "vision_config" in config:
+    vision_config = config["vision_config"]
+  else:
+    vision_config = {
+        "depth": maxtext_config.num_hidden_layers_for_vit,
+        "hidden_size": maxtext_config.hidden_size_for_vit,
+        "deepstack_visual_indexes": maxtext_config.deepstack_visual_indexes_for_vit,
+    }
+
+  n_vision_layers = vision_config["depth"]
+  hidden_size = vision_config["hidden_size"]
+
+  def reshape_kernel_vision(input_tensor, target_shape):
+    """Reshape kernel for vision layers."""
+    if saving_to_hf:
+      flipped_target_shape = np.flip(np.array(target_shape))
+      return input_tensor.reshape(flipped_target_shape).T
+    else:
+      return input_tensor.T.reshape(target_shape)
+
+  def reshape_conv3d_patch_embed(input_tensor, target_shape):
+    """Reshape 3D conv patch embedding weight.
+    HF: (out_channels, in_channels, temporal, height, width)
+    MaxText: (temporal, height, width, in_channels, out_channels)
+    """
+    if saving_to_hf:
+      return input_tensor.transpose(4, 3, 0, 1, 2)
+    else:
+      return input_tensor.transpose(2, 3, 4, 1, 0)
+
+  def split_qkv_query(input_tensor, target_shape):
+    """Extract Q from fused QKV."""
+    if saving_to_hf:
+      raise NotImplementedError("Use fusion hook for MaxText->HF")
+    else:
+      q_weight = input_tensor[:hidden_size, :]
+      return q_weight.T.reshape(target_shape)
+
+  def split_qkv_key(input_tensor, target_shape):
+    """Extract K from fused QKV."""
+    if saving_to_hf:
+      raise NotImplementedError("Use fusion hook for MaxText->HF")
+    else:
+      k_weight = input_tensor[hidden_size : 2 * hidden_size, :]
+      return k_weight.T.reshape(target_shape)
+
+  def split_qkv_value(input_tensor, target_shape):
+    """Extract V from fused QKV."""
+    if saving_to_hf:
+      raise NotImplementedError("Use fusion hook for MaxText->HF")
+    else:
+      v_weight = input_tensor[2 * hidden_size :, :]
+      return v_weight.T.reshape(target_shape)
+
+  def split_qkv_bias_query(input_tensor, target_shape):
+    """Extract Q bias from fused QKV bias."""
+    if saving_to_hf:
+      raise NotImplementedError("Use fusion hook for MaxText->HF")
+    else:
+      q_bias = input_tensor[:hidden_size]
+      return q_bias.reshape(target_shape)
+
+  def split_qkv_bias_key(input_tensor, target_shape):
+    """Extract K bias from fused QKV bias."""
+    if saving_to_hf:
+      raise NotImplementedError("Use fusion hook for MaxText->HF")
+    else:
+      k_bias = input_tensor[hidden_size : 2 * hidden_size]
+      return k_bias.reshape(target_shape)
+
+  def split_qkv_bias_value(input_tensor, target_shape):
+    """Extract V bias from fused QKV bias."""
+    if saving_to_hf:
+      raise NotImplementedError("Use fusion hook for MaxText->HF")
+    else:
+      v_bias = input_tensor[2 * hidden_size :]
+      return v_bias.reshape(target_shape)
+
+  def reshape_vision_attn_out(input_tensor, target_shape):
+    if saving_to_hf:
+      raise NotImplementedError("Use fusion hook for MaxText->HF")
+    else:
+      return input_tensor.T.reshape(target_shape)
+
+  # Map hooks to patch embedding
+  mapping["params-vision_encoder-Qwen3OmniMoeVisionEncoder_0-patch_embed-proj-kernel"] = reshape_conv3d_patch_embed
+
+  # Map hooks to vision blocks
+  for i in range(n_vision_layers):
+    prefix = f"params-vision_encoder-Qwen3OmniMoeVisionEncoder_0-blocks_{i}"
+    mapping[f"{prefix}-attn-attn-query-kernel"] = split_qkv_query
+    mapping[f"{prefix}-attn-attn-key-kernel"] = split_qkv_key
+    mapping[f"{prefix}-attn-attn-value-kernel"] = split_qkv_value
+    mapping[f"{prefix}-attn-attn-query-bias"] = split_qkv_bias_query
+    mapping[f"{prefix}-attn-attn-key-bias"] = split_qkv_bias_key
+    mapping[f"{prefix}-attn-attn-value-bias"] = split_qkv_bias_value
+    mapping[f"{prefix}-attn-attn-out-kernel"] = reshape_vision_attn_out
+
+    mapping[f"{prefix}-mlp-fc1-kernel"] = reshape_kernel_vision
+    mapping[f"{prefix}-mlp-fc2-kernel"] = reshape_kernel_vision
+
+  # Map hooks to projector (merger)
+  proj_prefix = "params-vision_encoder-Qwen3OmniMoeVisionProjector_0-merger"
+  mapping[f"{proj_prefix}-mlp_0-kernel"] = reshape_kernel_vision
+  mapping[f"{proj_prefix}-mlp_2-kernel"] = reshape_kernel_vision
+
+  # Map hooks to deepstack extractors (merger list)
+  deep_indexes = vision_config["deepstack_visual_indexes"]
+  for i, _ in enumerate(deep_indexes):
+    merger_prefix = f"params-vision_encoder-Qwen3OmniMoeVisionEncoder_0-merger_{i}"
+    mapping[f"{merger_prefix}-mlp_0-kernel"] = reshape_kernel_vision
+    mapping[f"{merger_prefix}-mlp_2-kernel"] = reshape_kernel_vision
+
+  return mapping
 
 
 def QWEN3_OMNI_MOE_MAXTEXT_TO_HF_PARAM_MAPPING(config, maxtext_config, scan_layers=False):
