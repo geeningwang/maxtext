@@ -50,12 +50,27 @@ class VisionEncoder(nnx.Module):
       setattr(self, encoder_name, llama4.Llama4VisionModel(config=self.config, mesh=self.mesh, rngs=self.rngs))
       setattr(self, projector_name, llama4.Llama4MultiModalProjector(config=self.config, mesh=self.mesh, rngs=self.rngs))
       return encoder_name, projector_name
-    elif self.config.model_name in ["qwen3-omni-30b-a3b", "qwen3-vl-2b", "qwen3-vl-8b"]:
+    elif self.config.model_name in ["qwen3-omni-30b-a3b"]:
       from maxtext.models import qwen3  # pylint: disable=import-outside-toplevel
 
       encoder_name = "Qwen3OmniMoeVisionEncoder_0"
       projector_name = "Qwen3OmniMoeVisionProjector_0"
       setattr(self, encoder_name, qwen3.Qwen3OmniMoeVisionEncoder(config=self.config, mesh=self.mesh, rngs=self.rngs))
+      setattr(self, projector_name, qwen3.Qwen3OmniMoeVisionProjector(config=self.config, rngs=self.rngs))
+      return encoder_name, projector_name
+    elif self.config.model_name in ["qwen3-vl-2b", "qwen3-vl-8b"]:
+      import importlib.util as _ilu  # pylint: disable=import-outside-toplevel
+      import os as _os  # pylint: disable=import-outside-toplevel
+      from maxtext.models import qwen3  # pylint: disable=import-outside-toplevel
+
+      _vl_path = _os.path.join(_os.path.dirname(__file__), "..", "models", "qwen3-vl.py")
+      _spec = _ilu.spec_from_file_location("qwen3_vl_module", _os.path.abspath(_vl_path))
+      _qwen3_vl = _ilu.module_from_spec(_spec)
+      _spec.loader.exec_module(_qwen3_vl)
+      # Keep the same attribute name as Qwen3OmniMoe so checkpoint keys match.
+      encoder_name = "Qwen3OmniMoeVisionEncoder_0"
+      projector_name = "Qwen3OmniMoeVisionProjector_0"
+      setattr(self, encoder_name, _qwen3_vl.Qwen3VLVisionEncoder(config=self.config, mesh=self.mesh, rngs=self.rngs))
       setattr(self, projector_name, qwen3.Qwen3OmniMoeVisionProjector(config=self.config, rngs=self.rngs))
       return encoder_name, projector_name
     else:
