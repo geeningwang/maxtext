@@ -73,22 +73,6 @@ _PAD_ID           = 0
 # Image helpers (shared with other demo scripts)
 # ---------------------------------------------------------------------------
 
-def _preprocess_image(image_path: str, model_name: str = "qwen3-vl-2b") -> np.ndarray:
-  """Load and preprocess image via the canonical MaxText preprocessor.
-
-  Delegates to ``preprocess_image_for_training`` in ``maxtext.multimodal.processor``
-  so preprocessing is consistent between training and inference.
-
-  Returns:
-    pixel_values: ``(1, 3, 2, 448, 448)`` float32 array with values in ``[-1, 1]``.
-  """
-  from maxtext.multimodal import utils as mm_utils
-  from maxtext.multimodal.processor import preprocess_image_for_training
-  img = mm_utils.load_image_from_path(image_path)
-  proc_out = preprocess_image_for_training(img, model_name)
-  return proc_out.pixel_values  # (1, 3, 2, 448, 448)
-
-
 # ---------------------------------------------------------------------------
 # Tokenisation helpers for MaxEngine inference
 # ---------------------------------------------------------------------------
@@ -171,7 +155,8 @@ class _EngineRunner:
     mrope_deltas = mrope_deltas.astype(np.int32)
 
     # 3. Pixel values ─────────────────────────────────────────────────────
-    pixel_values = jnp.asarray(_preprocess_image(image_path, self.config.model_name))  # (1,3,2,H,W)
+    from maxtext.multimodal.processor import preprocess_mm_data
+    pixel_values = jnp.asarray(preprocess_mm_data(self.config, image_path=image_path).pixel_values)  # (1,3,2,H,W)
 
     # 4. Prefill ──────────────────────────────────────────────────────────
     rng = jax.random.PRNGKey(42)
@@ -316,7 +301,9 @@ def _build_training_batch(
   inputs_position = np.arange(max_len, dtype=np.int32)
 
   # ── Pixel values ─────────────────────────────────────────────────────────
-  images = _preprocess_image(image_path).astype(np.float32)  # (1, 3, 2, 448, 448)  -- model_name default is fine for training batch
+  import types
+  from maxtext.multimodal.processor import preprocess_mm_data
+  images = preprocess_mm_data(types.SimpleNamespace(model_name="qwen3-vl-2b"), image_path=image_path).pixel_values.astype(np.float32)  # (1, 3, 2, 448, 448)
 
   # ── Add batch dimension ───────────────────────────────────────────────────
   return {

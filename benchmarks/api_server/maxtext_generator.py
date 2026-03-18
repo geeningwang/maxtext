@@ -505,7 +505,7 @@ class MaxTextGenerator:
           model_name=self.config.model_name,
           num_images=1,
       )
-      processor_output = mm_processor.preprocess_mm_data(self.config)
+      processor_output = mm_processor.preprocess_mm_data(self.config, image_path=image_path)
       prefill_length -= mm_processor.get_image_offsets(config=self.config, processor_output=processor_output)
       images = processor_output.pixel_values
 
