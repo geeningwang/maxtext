@@ -58,28 +58,33 @@ Raw image (np.ndarray HWC) + text prompt (str)
 
 ## Module 1 — Image Preprocessor
 
-**Entry point (inference):** `src/maxtext/multimodal/processor.py` → `preprocess_mm_data(config)`  
-**Entry point (training):** `src/maxtext/multimodal/processor.py` → `preprocess_image_for_training(image, model_name)`  
+**Entry point (file path → tensor):** `src/maxtext/multimodal/processor.py` → `preprocess_mm_data(config, image_path=None)`  
+**Entry point (array → tensor):** `src/maxtext/multimodal/processor.py` → `preprocess_image_for_training(image, model_name)`  
 **Implementation:** `src/maxtext/multimodal/processor_qwen3_vl.py` → `preprocess_mm_data_qwen3_vl(images)`
 
-Both entry points route to the same underlying implementation. `preprocess_mm_data(config)` reads
-image paths from `config.image_path`, loads them, then delegates. `preprocess_image_for_training`
-accepts a pre-loaded `np.ndarray` or list and is used by the SFT data pipeline.
+Both entry points route to the same underlying implementation.
+
+- **`preprocess_mm_data`**: starts from a file path. The path comes from `config.image_path` by
+  default, but can be overridden per-call with the `image_path=` kwarg (used by inference demos
+  and the API server where the image path is a runtime argument, not a startup config field).
+- **`preprocess_image_for_training`**: starts from a pre-loaded `np.ndarray`. Used by the SFT
+  training data pipeline (`input_pipeline_utils.py`) where images are already decoded from dataset
+  records into arrays before preprocessing.
 
 ### Inputs
 
-**`preprocess_mm_data(config)`** (inference CLI/server):
+**`preprocess_mm_data(config, image_path=None)`** (inference demos / server / CLI):
 
 | Arg | Description |
 |-----|-------------|
-| `config.image_path` | Comma-separated image file paths |
 | `config.model_name` | `"qwen3-vl-2b"` or `"qwen3-vl-8b"` |
+| `image_path` | Comma-separated image file path(s). Overrides `config.image_path` when provided. |
 
-**`preprocess_image_for_training(image, model_name)`** (SFT data pipeline):
+**`preprocess_image_for_training(image, model_name)`** (SFT training data pipeline):
 
 | Arg | Type / Shape | Description |
 |-----|-------------|-------------|
-| `image` | `np.ndarray (H, W, 3)` uint8, or `list[np.ndarray]` | One or more raw RGB images already loaded |
+| `image` | `np.ndarray (H, W, 3)` uint8, or `list[np.ndarray]` | One or more raw RGB images already loaded into memory |
 
 ### Output — `Qwen3VLPreprocessorOutput`
 | Field | Shape | Description |
