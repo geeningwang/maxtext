@@ -59,24 +59,41 @@ def preprocess_image_for_training(image, model_name):
     from maxtext.multimodal.processor_llama4 import preprocess_mm_data_llama4  # pylint: disable=import-outside-toplevel
 
     return preprocess_mm_data_llama4(image)
+  elif model_name in ["qwen3-vl-2b", "qwen3-vl-8b"]:
+    from maxtext.multimodal.processor_qwen3_vl import preprocess_mm_data_qwen3_vl  # pylint: disable=import-outside-toplevel
+
+    return preprocess_mm_data_qwen3_vl(image)
   else:
     raise ValueError(f"Model {model_name} not supported for image preprocessing.")
 
 
 def get_image_offsets(config, processor_output: mm_utils.PreprocessorOutput | None):
-  """Get the increase in total token count after inserting image token placeholders"""
-  if config.model_name in ["gemma3-4b", "gemma3-12b", "gemma3-27b"]:
+  """Get the increase in total token count after inserting image token placeholders.
+
+  Args:
+    config: Either a config object with a .model_name attribute, or a plain
+            model-name string (e.g. as passed from PadOrTrimToMaxLength).
+    processor_output: The preprocessor output for the current example.
+  """
+  # Accept both a config object and a bare model-name string.
+  model_name = config if isinstance(config, str) else config.model_name
+
+  if model_name in ["gemma3-4b", "gemma3-12b", "gemma3-27b"]:
     from maxtext.multimodal.processor_gemma3 import get_image_offsets_gemma3  # pylint: disable=import-outside-toplevel
 
     return get_image_offsets_gemma3(processor_output)
-  elif config.model_name in ["llama4-17b-16e", "llama4-17b-128e"]:
+  elif model_name in ["llama4-17b-16e", "llama4-17b-128e"]:
     from maxtext.multimodal.processor_llama4 import get_image_offsets_llama4  # pylint: disable=import-outside-toplevel
 
     return get_image_offsets_llama4(processor_output)
-  elif config.model_name in ["qwen3-omni-30b-a3b"]:
+  elif model_name in ["qwen3-omni-30b-a3b"]:
     from maxtext.multimodal.processor_qwen3_omni import get_mm_offsets_qwen3_omni  # pylint: disable=import-outside-toplevel
 
     return get_mm_offsets_qwen3_omni(config, processor_output)
+  elif model_name in ["qwen3-vl-2b", "qwen3-vl-8b"]:
+    from maxtext.multimodal.processor_qwen3_vl import get_image_offsets_qwen3_vl  # pylint: disable=import-outside-toplevel
+
+    return get_image_offsets_qwen3_vl(processor_output)
   else:
     return 0
 
@@ -101,6 +118,10 @@ def reformat_prompt(prompt, image_placeholder, model_name, num_images, video_pla
         video_placeholder=video_placeholder,
         num_videos=num_videos,
     )
+  elif model_name in ["qwen3-vl-2b", "qwen3-vl-8b"]:
+    from maxtext.multimodal.processor_qwen3_vl import reformat_prompt_qwen3_vl  # pylint: disable=import-outside-toplevel
+
+    return reformat_prompt_qwen3_vl(prompt, image_placeholder, num_images)
   else:
     return prompt
 
@@ -113,7 +134,7 @@ def reformat_response(response, model_name):
   elif model_name in ["gemma3-4b", "gemma3-12b", "gemma3-27b"]:
     formatted_response = f"{response}<end_of_turn>"
     return formatted_response
-  elif model_name in ["qwen3-omni-30b-a3b"]:
+  elif model_name in ["qwen3-omni-30b-a3b", "qwen3-vl-2b", "qwen3-vl-8b"]:
     formatted_response = f"{response}<|im_end|>"
     return formatted_response
   else:
@@ -134,6 +155,10 @@ def prepare_text_for_image_fusion(tokens, config, processor_output=None):
     from maxtext.multimodal.processor_qwen3_omni import add_extra_tokens_for_qwen3_omni  # pylint: disable=import-outside-toplevel
 
     return add_extra_tokens_for_qwen3_omni(tokens, config, processor_output)
+  elif config.model_name in ["qwen3-vl-2b", "qwen3-vl-8b"]:
+    from maxtext.multimodal.processor_qwen3_vl import add_extra_tokens_for_images_qwen3_vl  # pylint: disable=import-outside-toplevel
+
+    return add_extra_tokens_for_images_qwen3_vl(tokens, processor_output)
   else:
     raise ValueError(f"Model {config.model_name} does not support multimodal inference.")
 
