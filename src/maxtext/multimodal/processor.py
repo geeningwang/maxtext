@@ -43,6 +43,11 @@ def preprocess_mm_data(config):
     from maxtext.multimodal.processor_qwen3_omni import preprocess_mm_data_qwen3_omni  # pylint: disable=import-outside-toplevel
 
     processor_outputs = preprocess_mm_data_qwen3_omni(config)
+  elif config.model_name in ["qwen3-vl-2b", "qwen3-vl-8b"]:
+    from maxtext.multimodal.processor_qwen3_vl import preprocess_mm_data_qwen3_vl  # pylint: disable=import-outside-toplevel
+
+    images = [mm_utils.load_image_from_path(p) for p in config.image_path.split(",")]
+    processor_outputs = preprocess_mm_data_qwen3_vl(images)
   else:
     raise ValueError(f"Model {config.model_name} not supported for multimodal preprocessing.")
 

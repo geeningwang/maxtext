@@ -73,14 +73,20 @@ _PAD_ID           = 0
 # Image helpers (shared with other demo scripts)
 # ---------------------------------------------------------------------------
 
-def _preprocess_image(image_path: str, target_size: int = _VIT_INPUT_SIZE) -> np.ndarray:
-  """Load image → (1, 3, 2, H, W) float32, normalised to [-1, 1]."""
-  img = Image.open(image_path).convert("RGB")
-  img = img.resize((target_size, target_size), Image.Resampling.LANCZOS)
-  arr = np.array(img, dtype=np.float32) / 127.5 - 1.0   # (H, W, C)
-  arr = arr.transpose(2, 0, 1)                            # (C, H, W)
-  arr = np.stack([arr, arr], axis=1)                      # (C, 2, H, W)
-  return arr[None, ...]                                   # (1, C, 2, H, W)
+def _preprocess_image(image_path: str, model_name: str = "qwen3-vl-2b") -> np.ndarray:
+  """Load and preprocess image via the canonical MaxText preprocessor.
+
+  Delegates to ``preprocess_image_for_training`` in ``maxtext.multimodal.processor``
+  so preprocessing is consistent between training and inference.
+
+  Returns:
+    pixel_values: ``(1, 3, 2, 448, 448)`` float32 array with values in ``[-1, 1]``.
+  """
+  from maxtext.multimodal import utils as mm_utils
+  from maxtext.multimodal.processor import preprocess_image_for_training
+  img = mm_utils.load_image_from_path(image_path)
+  proc_out = preprocess_image_for_training(img, model_name)
+  return proc_out.pixel_values  # (1, 3, 2, 448, 448)
 
 
 # ---------------------------------------------------------------------------
@@ -165,7 +171,7 @@ class _EngineRunner:
     mrope_deltas = mrope_deltas.astype(np.int32)
 
     # 3. Pixel values ─────────────────────────────────────────────────────
-    pixel_values = jnp.asarray(_preprocess_image(image_path))  # (1,3,2,H,W)
+    pixel_values = jnp.asarray(_preprocess_image(image_path, self.config.model_name))  # (1,3,2,H,W)
 
     # 4. Prefill ──────────────────────────────────────────────────────────
     rng = jax.random.PRNGKey(42)
@@ -310,7 +316,7 @@ def _build_training_batch(
   inputs_position = np.arange(max_len, dtype=np.int32)
 
   # ── Pixel values ─────────────────────────────────────────────────────────
-  images = _preprocess_image(image_path).astype(np.float32)  # (1, 3, 2, 448, 448)
+  images = _preprocess_image(image_path).astype(np.float32)  # (1, 3, 2, 448, 448)  -- model_name default is fine for training batch
 
   # ── Add batch dimension ───────────────────────────────────────────────────
   return {

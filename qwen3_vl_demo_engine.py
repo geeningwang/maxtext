@@ -76,18 +76,20 @@ def _print_result(result: dict, output_json: bool = False) -> None:
 # Image / tokenisation helpers  (shared with qwen3_vl_demo_jax.py)
 # ---------------------------------------------------------------------------
 
-def _preprocess_image(image_path: str, target_size: int = _VIT_INPUT_SIZE) -> np.ndarray:
-  """Load an image and return a ``(1, 3, 2, H, W)`` float32 array.
+def _preprocess_image(image_path: str, model_name: str = "qwen3-vl-2b") -> np.ndarray:
+  """Load and preprocess image via the canonical MaxText preprocessor.
 
-  Qwen3-VL normalises with mean=0.5, std=0.5 → values in [-1, 1].
-  The temporal dim is 2 (``temporal_patch_size``) so we duplicate the frame.
+  Delegates to ``preprocess_image_for_training`` in ``maxtext.multimodal.processor``
+  so preprocessing is consistent between training and inference.
+
+  Returns:
+    pixel_values: ``(1, 3, 2, 448, 448)`` float32 array with values in ``[-1, 1]``.
   """
-  img = Image.open(image_path).convert("RGB")
-  img = img.resize((target_size, target_size), Image.Resampling.LANCZOS)
-  arr = np.array(img, dtype=np.float32) / 127.5 - 1.0   # (H, W, C)
-  arr = arr.transpose(2, 0, 1)                            # (C, H, W)
-  arr = np.stack([arr, arr], axis=1)                      # (C, 2, H, W)
-  return arr[None, ...]                                   # (1, C, 2, H, W)
+  from maxtext.multimodal import utils as mm_utils
+  from maxtext.multimodal.processor import preprocess_image_for_training
+  img = mm_utils.load_image_from_path(image_path)
+  proc_out = preprocess_image_for_training(img, model_name)
+  return proc_out.pixel_values  # (1, 3, 2, 448, 448)
 
 
 def _build_input_ids(tokenizer, prompt: str, num_vis_tokens: int) -> list:
@@ -246,7 +248,7 @@ class Qwen3VLDemoEngine:
       print(f"[{BACKEND}] mRoPE positions computed: {position_ids.shape}")
 
     # ── 3. Preprocess image for the vision encoder ───────────────────────────
-    pixel_values = jnp.asarray(_preprocess_image(image_path))  # (1,3,2,H,W)
+    pixel_values = jnp.asarray(_preprocess_image(image_path, self._config.model_name))  # (1,3,2,H,W)
     if verbose:
       print(f"[{BACKEND}] Pixel values shape: {pixel_values.shape}")
 
