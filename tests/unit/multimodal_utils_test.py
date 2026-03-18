@@ -281,5 +281,196 @@ class TestLlama4PostProcessing(unittest.TestCase):
     np.testing.assert_array_equal(merged_null[0, 0], text_embeddings[0, 0])
 
 
+class TestQwen3VLPreprocessor(unittest.TestCase):
+  """Unit tests for Qwen3-VL image preprocessing and SFT data-preparation functions.
+
+  These tests exercise:
+    - ``preprocess_mm_data_qwen3_vl`` (pixel shape, normalisation, grid_thw)
+    - ``reformat_prompt_qwen3_vl``   (chat template, placeholder substitution)
+    - ``add_extra_tokens_for_images_qwen3_vl`` (token expansion: 1 → 196)
+    - ``get_image_offsets_qwen3_vl`` (offset arithmetic)
+    - ``processor.py`` routing functions for model_name "qwen3-vl-2b"
+  """
+
+  # ------------------------------------------------------------------ helpers
+
+  def _fake_image(self, h=100, w=150):
+    """Return a random uint8 HWC numpy array suitable as input."""
+    return np.random.randint(0, 255, (h, w, 3), dtype=np.uint8)
+
+  def _make_processor_output(self, n=1):
+    """Return a Qwen3VLPreprocessorOutput for *n* 448×448 images."""
+    from maxtext.multimodal.processor_qwen3_vl import Qwen3VLPreprocessorOutput  # pylint: disable=import-outside-toplevel
+
+    return Qwen3VLPreprocessorOutput(
+        pixel_values=np.zeros((n, 3, 2, 448, 448), dtype=np.float32),
+        num_images=n,
+        pixel_grid_thw=np.tile(np.array([1, 28, 28], dtype=np.int32), (n, 1)),
+    )
+
+  # -------------------------------------------------------- preprocess shape
+
+  def test_single_image_pixel_shape(self):
+    """A single image should produce pixel_values of shape (1, 3, 2, 448, 448)."""
+    from maxtext.multimodal.processor_qwen3_vl import preprocess_mm_data_qwen3_vl  # pylint: disable=import-outside-toplevel
+
+    out = preprocess_mm_data_qwen3_vl(self._fake_image())
+    self.assertEqual(out.pixel_values.shape, (1, 3, 2, 448, 448))
+    self.assertEqual(out.num_images, 1)
+
+  def test_single_image_grid_thw(self):
+    """grid_thw for a 448×448 image with patch_size=16, merge_size=2 must be [1, 28, 28]."""
+    from maxtext.multimodal.processor_qwen3_vl import preprocess_mm_data_qwen3_vl  # pylint: disable=import-outside-toplevel
+
+    out = preprocess_mm_data_qwen3_vl(self._fake_image())
+    np.testing.assert_array_equal(out.pixel_grid_thw[0], [1, 28, 28])
+
+  def test_multi_image_shape(self):
+    """Two images should produce shape (2, 3, 2, 448, 448) and grid_thw of shape (2, 3)."""
+    from maxtext.multimodal.processor_qwen3_vl import preprocess_mm_data_qwen3_vl  # pylint: disable=import-outside-toplevel
+
+    out = preprocess_mm_data_qwen3_vl([self._fake_image(), self._fake_image(200, 300)])
+    self.assertEqual(out.pixel_values.shape, (2, 3, 2, 448, 448))
+    self.assertEqual(out.pixel_grid_thw.shape, (2, 3))
+    self.assertEqual(out.num_images, 2)
+
+  def test_normalization_black_image(self):
+    """An all-black image (0) should normalise to approximately -1.0."""
+    from maxtext.multimodal.processor_qwen3_vl import preprocess_mm_data_qwen3_vl  # pylint: disable=import-outside-toplevel
+
+    black = np.zeros((64, 64, 3), dtype=np.uint8)
+    out = preprocess_mm_data_qwen3_vl(black)
+    self.assertAlmostEqual(float(out.pixel_values.min()), -1.0, places=3)
+
+  def test_normalization_white_image(self):
+    """An all-white image (255) should normalise to approximately +1.0."""
+    from maxtext.multimodal.processor_qwen3_vl import preprocess_mm_data_qwen3_vl  # pylint: disable=import-outside-toplevel
+
+    white = np.full((64, 64, 3), 255, dtype=np.uint8)
+    out = preprocess_mm_data_qwen3_vl(white)
+    self.assertAlmostEqual(float(out.pixel_values.max()), 1.0, places=3)
+
+  # -------------------------------------------------------- reformat_prompt
+
+  def test_reformat_prompt_chat_template(self):
+    """Output must be wrapped in the Qwen im_start/im_end chat template."""
+    from maxtext.multimodal.processor_qwen3_vl import reformat_prompt_qwen3_vl  # pylint: disable=import-outside-toplevel
+
+    result = reformat_prompt_qwen3_vl("What is this?", "<|image|>", 0)
+    self.assertIn("<|im_start|>user\n", result)
+    self.assertIn("<|im_end|>", result)
+    self.assertIn("<|im_start|>assistant\n", result)
+
+  def test_reformat_prompt_replaces_placeholder(self):
+    """Image placeholder must be replaced with the Qwen3-VL vision token sequence."""
+    from maxtext.multimodal.processor_qwen3_vl import reformat_prompt_qwen3_vl  # pylint: disable=import-outside-toplevel
+
+    result = reformat_prompt_qwen3_vl("<|image|> describe it", "<|image|>", 1)
+    self.assertIn("<|vision_start|><|image_pad|><|vision_end|>", result)
+    self.assertNotIn("<|image|>", result)
+
+  def test_reformat_prompt_prepends_missing_image(self):
+    """If num_images > occurrences in prompt, missing vision tokens are prepended."""
+    from maxtext.multimodal.processor_qwen3_vl import reformat_prompt_qwen3_vl  # pylint: disable=import-outside-toplevel
+
+    # Prompt has no placeholder but num_images=1
+    result = reformat_prompt_qwen3_vl("describe it", "<|image|>", 1)
+    self.assertIn("<|vision_start|><|image_pad|><|vision_end|>", result)
+
+  # ------------------------------------------------ add_extra_tokens
+
+  def test_add_extra_tokens_single_image(self):
+    """One <|image_pad|> token must expand to 196 copies (1×28×28÷4)."""
+    from maxtext.multimodal.processor_qwen3_vl import (  # pylint: disable=import-outside-toplevel
+        add_extra_tokens_for_images_qwen3_vl,
+        QWEN3_VL_IMAGE_TOKEN,
+    )
+
+    tokens = np.array([1, QWEN3_VL_IMAGE_TOKEN, 2], dtype=np.int32)
+    out = add_extra_tokens_for_images_qwen3_vl(tokens, self._make_processor_output(1))
+    # [1] + [IMAGE_TOKEN]*196 + [2]
+    self.assertEqual(len(out), 198)
+    self.assertTrue(np.all(out[1:197] == QWEN3_VL_IMAGE_TOKEN))
+    self.assertEqual(out[0], 1)
+    self.assertEqual(out[197], 2)
+
+  def test_add_extra_tokens_no_image_tokens(self):
+    """A token sequence without any image placeholders must be returned unchanged."""
+    from maxtext.multimodal.processor_qwen3_vl import add_extra_tokens_for_images_qwen3_vl  # pylint: disable=import-outside-toplevel
+
+    tokens = np.array([10, 20, 30, 40], dtype=np.int32)
+    out = add_extra_tokens_for_images_qwen3_vl(tokens, self._make_processor_output(1))
+    np.testing.assert_array_equal(out, tokens)
+
+  def test_add_extra_tokens_two_images(self):
+    """Two placeholders each expand to 196; total length = 2 + 2*196."""
+    from maxtext.multimodal.processor_qwen3_vl import (  # pylint: disable=import-outside-toplevel
+        add_extra_tokens_for_images_qwen3_vl,
+        QWEN3_VL_IMAGE_TOKEN,
+    )
+
+    tokens = np.array([QWEN3_VL_IMAGE_TOKEN, 5, QWEN3_VL_IMAGE_TOKEN], dtype=np.int32)
+    out = add_extra_tokens_for_images_qwen3_vl(tokens, self._make_processor_output(2))
+    self.assertEqual(len(out), 2 * 196 + 1)
+
+  # ------------------------------------------------ get_image_offsets
+
+  def test_get_offsets_single_image(self):
+    """Offset for one 448×448 image = 195 (196 expanded tokens − 1 placeholder)."""
+    from maxtext.multimodal.processor_qwen3_vl import get_image_offsets_qwen3_vl  # pylint: disable=import-outside-toplevel
+
+    self.assertEqual(get_image_offsets_qwen3_vl(self._make_processor_output(1)), 195)
+
+  def test_get_offsets_two_images(self):
+    """Two images → offset = 2 × 195 = 390."""
+    from maxtext.multimodal.processor_qwen3_vl import get_image_offsets_qwen3_vl  # pylint: disable=import-outside-toplevel
+
+    self.assertEqual(get_image_offsets_qwen3_vl(self._make_processor_output(2)), 390)
+
+  def test_get_offsets_none_input(self):
+    """None processor_output must return 0."""
+    from maxtext.multimodal.processor_qwen3_vl import get_image_offsets_qwen3_vl  # pylint: disable=import-outside-toplevel
+
+    self.assertEqual(get_image_offsets_qwen3_vl(None), 0)
+
+  # ----------------------------------------------- processor.py routing
+
+  def test_router_preprocess_image(self):
+    """mm_processor.preprocess_image_for_training must route qwen3-vl-2b to Qwen3VLPreprocessorOutput."""
+    from maxtext.multimodal.processor_qwen3_vl import Qwen3VLPreprocessorOutput  # pylint: disable=import-outside-toplevel
+
+    out = mm_processor.preprocess_image_for_training(self._fake_image(), "qwen3-vl-2b")
+    self.assertIsInstance(out, Qwen3VLPreprocessorOutput)
+    self.assertEqual(out.pixel_values.shape, (1, 3, 2, 448, 448))
+
+  def test_router_preprocess_image_8b(self):
+    """qwen3-vl-8b must also route to Qwen3VLPreprocessorOutput."""
+    from maxtext.multimodal.processor_qwen3_vl import Qwen3VLPreprocessorOutput  # pylint: disable=import-outside-toplevel
+
+    out = mm_processor.preprocess_image_for_training(self._fake_image(), "qwen3-vl-8b")
+    self.assertIsInstance(out, Qwen3VLPreprocessorOutput)
+
+  def test_router_reformat_response(self):
+    """mm_processor.reformat_response must append <|im_end|> for qwen3-vl-2b."""
+    result = mm_processor.reformat_response("A cat.", "qwen3-vl-2b")
+    self.assertEqual(result, "A cat.<|im_end|>")
+
+  def test_router_reformat_response_8b(self):
+    """qwen3-vl-8b must produce the same <|im_end|> suffix."""
+    result = mm_processor.reformat_response("A cat.", "qwen3-vl-8b")
+    self.assertEqual(result, "A cat.<|im_end|>")
+
+  def test_router_reformat_prompt(self):
+    """mm_processor.reformat_prompt wraps qwen3-vl-2b prompt in Qwen chat template."""
+    result = mm_processor.reformat_prompt("What is this?", "<|image|>", "qwen3-vl-2b", num_images=0)
+    self.assertIn("<|im_start|>user\n", result)
+    self.assertIn("<|im_start|>assistant\n", result)
+
+  def test_router_get_image_offsets_string_config(self):
+    """get_image_offsets must accept a bare model-name string (PadOrTrimToMaxLength usage)."""
+    offset = mm_processor.get_image_offsets("qwen3-vl-2b", self._make_processor_output(1))
+    self.assertEqual(offset, 195)
+
+
 if __name__ == "__main__":
   unittest.main()

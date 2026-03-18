@@ -4,6 +4,8 @@ Three standardised demo scripts for running Qwen3-VL-2B-Instruct inference,
 covering every backend available on this machine: HuggingFace / PyTorch (CPU),
 JAX/NNX direct (TPU v6 lite), and MaxEngine serving API (TPU v6 lite).
 
+For supervised fine-tuning of Qwen3-VL, see [Qwen3-VL SFT](qwen3_vl_sft.md).
+
 All three scripts share the same CLI flags, the same output format, and the same
 return-value schema so that their results are directly comparable.
 

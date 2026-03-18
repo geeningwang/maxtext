@@ -23,12 +23,15 @@ import json
 import os
 
 import jax
+import jax.experimental.mesh_utils as jax_mesh_utils
 import jax.numpy as jnp
 import jax.tree_util as jtu
 import numpy as np
 import pytest
+from jax.sharding import Mesh
 
-from maxtext.utils.globals import MAXTEXT_CONFIGS_DIR, MAXTEXT_TEST_ASSETS_ROOT
+from maxtext.configs import pyconfig
+from maxtext.utils.globals import MAXTEXT_ASSETS_ROOT, MAXTEXT_CONFIGS_DIR, MAXTEXT_TEST_ASSETS_ROOT
 
 # ---------------------------------------------------------------------------
 # Path constants
@@ -711,6 +714,171 @@ class TestQwen3VLIntegration:
     print(f"Sample weight dtypes: {sample_dtypes}")
     for dt in sample_dtypes:
       assert dt in (jnp.float32, jnp.bfloat16, jnp.float16), f"Unexpected dtype: {dt}"
+
+
+class TestQwen3VLSFTPipeline:
+  """Integration tests for the Qwen3-VL vision SFT data pipeline.
+
+  Exercises ``vision_sft_preprocessing_pipeline`` end-to-end with:
+    - A synthetic in-memory HuggingFace IterableDataset (no network access)
+    - The local Qwen3-VL tokenizer at ``<MAXTEXT_ASSETS_ROOT>/tokenizers/qwen3-tokenizer``
+
+  The tests verify batch keys, shapes, pixel value ranges, prompt masking,
+  and the presence of image tokens after placeholder expansion.
+  Skips automatically when the local tokenizer or SFT config is absent.
+  """
+
+  # Constants shared across tests
+  _MODEL_NAME = "qwen3-vl-2b"
+  _MAX_LEN = 512
+  _TOKENS_PER_IMAGE = 196  # 1×28×28÷4
+  _IMAGE_TOKEN = 151655  # QWEN3_VL_IMAGE_TOKEN
+  _SFT_VISION_CFG = os.path.join(MAXTEXT_CONFIGS_DIR, "post_train", "sft-vision-qwen3vl.yml")
+  _VL_TOKENIZER = os.path.join(MAXTEXT_ASSETS_ROOT, "tokenizers", "qwen3-tokenizer")
+
+  # ------------------------------------------------------------------ setup
+
+  @classmethod
+  def setup_class(cls):
+    """Build config, fake dataset, and run the pipeline once."""
+    if not os.path.exists(cls._VL_TOKENIZER):
+      pytest.skip(f"Local tokenizer not found: {cls._VL_TOKENIZER}")
+    if not os.path.exists(cls._SFT_VISION_CFG):
+      pytest.skip(f"SFT vision config not found: {cls._SFT_VISION_CFG}")
+
+    import datasets  # pylint: disable=import-outside-toplevel
+    from PIL import Image  # pylint: disable=import-outside-toplevel
+    from maxtext.input_pipeline import hf_data_processing  # pylint: disable=import-outside-toplevel
+    from maxtext.input_pipeline import input_pipeline_interface  # pylint: disable=import-outside-toplevel
+
+    # ---- config ----
+    config = pyconfig.initialize(
+        ["test_runner", cls._SFT_VISION_CFG],
+        run_name="test-qwen3vl-sft-integ",
+        model_name=cls._MODEL_NAME,
+        tokenizer_path=cls._VL_TOKENIZER,
+        per_device_batch_size=1,
+        max_target_length=cls._MAX_LEN,
+        enable_checkpointing=False,
+        load_parameters_path="",
+        use_tunix_gradient_accumulation=False,
+        gradient_accumulation_steps=1,
+        enable_data_shuffling=False,
+        num_epoch=1,
+        skip_jax_distributed_system=True,
+        base_output_directory="/tmp/test_qwen3vl_sft_integ/",
+        # Simplify to a flat 1D data-parallel mesh for single-device testing
+        mesh_axes=["data"],
+        logical_axis_rules=[["batch", "data"]],
+        data_sharding=["data"],
+    )
+    cls.config = config
+
+    # ---- fake dataset (4 examples, random 100×150 colour images) ----
+    rng = np.random.default_rng(7)
+    fake_img = Image.fromarray(rng.integers(0, 255, (100, 150, 3), dtype=np.uint8))
+    n = 4
+    ds = datasets.Dataset.from_dict(
+        {
+            "query": ["What does this chart show?"] * n,
+            "label": [["Revenue growth over time."]] * n,
+            "image": [fake_img] * n,
+        },
+        features=datasets.Features(
+            {
+                "query": datasets.Value("string"),
+                "label": datasets.Sequence(datasets.Value("string")),
+                "image": datasets.Image(),
+            }
+        ),
+    )
+    # Convert to IterableDataset so lazy map calls (pre_process_image_sft)
+    # don't materialise PreprocessorOutput to Arrow format.
+    ds = ds.to_iterable_dataset()
+
+    # ---- mesh & process indices ----
+    mesh_shape_1d = (len(jax.devices()),)
+    mesh = Mesh(
+        jax_mesh_utils.create_device_mesh(mesh_shape_1d),
+        config.mesh_axes,
+    )
+    process_indices = input_pipeline_interface.get_process_loading_real_data(
+        config.data_sharding,
+        config.global_batch_size_to_load,
+        config.global_batch_size_to_train_on,
+        config.max_target_length,
+        mesh,
+    )
+
+    # ---- run pipeline ----
+    train_iter = hf_data_processing.vision_sft_preprocessing_pipeline(
+        dataset=ds,
+        config=config,
+        dataloading_host_index=process_indices.index(jax.process_index()),
+        dataloading_host_count=len(process_indices),
+        global_mesh=mesh,
+        text_columns=["query", "label"],
+        image_column="image",
+        global_batch_size=config.global_batch_size_to_load,
+    )
+    cls.batch = next(train_iter)
+
+  # ------------------------------------------------------------------ keys
+
+  def test_batch_has_required_keys(self):
+    """Batch must contain text sequence keys and an images key."""
+    for key in ("inputs", "targets", "inputs_segmentation", "targets_segmentation", "images"):
+      assert key in self.batch, f"Missing batch key: {key}"
+
+  # ---------------------------------------------------------------- shapes
+
+  def test_text_shapes(self):
+    """Token-sequence tensors must have shape (B, _MAX_LEN)."""
+    B = self.config.global_batch_size_to_load
+    L = self._MAX_LEN
+    for key in ("inputs", "targets", "inputs_segmentation", "targets_segmentation"):
+      shape = tuple(self.batch[key].shape)
+      assert shape == (B, L), f"Key '{key}': expected {(B, L)}, got {shape}"
+
+  def test_images_shape(self):
+    """Images must be (B*N, 3, 2, 448, 448) after FoldImagesIntoBatch."""
+    B = self.config.global_batch_size_to_load
+    N = self.config.max_num_images_per_example  # 1
+    expected = (B * N, 3, 2, 448, 448)
+    actual = tuple(self.batch["images"].shape)
+    assert actual == expected, f"Images: expected {expected}, got {actual}"
+
+  # ---------------------------------------------------------- data validity
+
+  def test_pixel_values_finite_and_normalised(self):
+    """Pixel values must be finite and approximately in [-1, 1]."""
+    imgs = np.array(self.batch["images"])
+    assert np.all(np.isfinite(imgs)), "Pixel values contain NaN/Inf"
+    assert float(imgs.min()) >= -1.1, f"Pixel min out of range: {imgs.min()}"
+    assert float(imgs.max()) <= 1.1, f"Pixel max out of range: {imgs.max()}"
+
+  def test_input_ids_non_negative(self):
+    """Input token IDs must be non-negative."""
+    inputs = np.array(self.batch["inputs"])
+    assert np.all(inputs >= 0), "Found negative input token IDs"
+
+  def test_image_tokens_expanded_in_inputs(self):
+    """After placeholder expansion, inputs must contain ≥_TOKENS_PER_IMAGE image tokens."""
+    inputs = np.array(self.batch["inputs"])
+    count = int((inputs == self._IMAGE_TOKEN).sum())
+    assert count >= self._TOKENS_PER_IMAGE, (
+        f"Expected ≥{self._TOKENS_PER_IMAGE} image tokens per example, found {count}"
+    )
+
+  def test_completion_only_masking(self):
+    """With sft_train_on_completion_only=True, targets_segmentation must not be all 1s.
+
+    Prompt/query tokens should be masked out (seg=0); at least one position
+    must be 1 (the completion/response tokens).
+    """
+    tgt_seg = np.array(self.batch["targets_segmentation"])
+    assert np.any(tgt_seg == 0), "No masked positions; prompt masking not applied"
+    assert np.any(tgt_seg > 0), "No trainable positions; response missing or all masked"
 
 
 if __name__ == "__main__":
