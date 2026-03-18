@@ -155,8 +155,11 @@ class _EngineRunner:
     mrope_deltas = mrope_deltas.astype(np.int32)
 
     # 3. Pixel values ─────────────────────────────────────────────────────
+    import types
     from maxtext.multimodal.processor import preprocess_mm_data
-    pixel_values = jnp.asarray(preprocess_mm_data(self.config, image_path=image_path).pixel_values)  # (1,3,2,H,W)
+    pixel_values = jnp.asarray(preprocess_mm_data(
+        types.SimpleNamespace(model_name=self.config.model_name, image_path=image_path)
+    ).pixel_values)  # (1,3,2,H,W)
 
     # 4. Prefill ──────────────────────────────────────────────────────────
     rng = jax.random.PRNGKey(42)
@@ -303,7 +306,7 @@ def _build_training_batch(
   # ── Pixel values ─────────────────────────────────────────────────────────
   import types
   from maxtext.multimodal.processor import preprocess_mm_data
-  images = preprocess_mm_data(types.SimpleNamespace(model_name="qwen3-vl-2b"), image_path=image_path).pixel_values.astype(np.float32)  # (1, 3, 2, 448, 448)
+  images = preprocess_mm_data(types.SimpleNamespace(model_name="qwen3-vl-2b", image_path=image_path)).pixel_values.astype(np.float32)  # (1, 3, 2, 448, 448)
 
   # ── Add batch dimension ───────────────────────────────────────────────────
   return {

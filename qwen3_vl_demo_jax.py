@@ -320,8 +320,11 @@ class Qwen3VLDemoJAX:
     # ── 1. vision encoder ──────────────────────────────────────────────────
     if verbose:
       print(f"[{BACKEND}] Running vision encoder on '{image_path}' …")
+    import types
     from maxtext.multimodal.processor import preprocess_mm_data
-    pixel_values = jnp.asarray(preprocess_mm_data(self._config, image_path=image_path).pixel_values)
+    pixel_values = jnp.asarray(preprocess_mm_data(
+        types.SimpleNamespace(model_name=self._config.model_name, image_path=image_path)
+    ).pixel_values)
     m = self._nnx.merge(self._graphdef, self._state)
     image_embeds, deep_feats = m.vision_encoder(
         input_images=pixel_values, deterministic=True

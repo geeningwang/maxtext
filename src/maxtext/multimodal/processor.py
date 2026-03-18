@@ -17,22 +17,22 @@
 from maxtext.multimodal import utils as mm_utils
 
 
-def preprocess_mm_data(config, image_path: str | None = None):
+def preprocess_mm_data(config):
   """Preprocesses multimodal data based on the provided configuration.
   Routes to the appropriate preprocessing function based on the model name.
 
   Args:
-    config: A `pyconfig.Config` object containing configuration parameters.
-    image_path: Optional comma-separated image path(s) that overrides
-      ``config.image_path``.  Pass this when the image path is known only at
-      call time (e.g. per-request in a server) rather than at config
-      initialisation time.
+    config: A `pyconfig.Config` (or `types.SimpleNamespace`) object with at
+      minimum ``config.model_name`` and ``config.image_path`` set.
+      Callers that receive the image path at call time (e.g. per-request in a
+      server) should construct a ``types.SimpleNamespace`` rather than
+      modifying the shared ``pyconfig`` object.
 
   Returns:
     A `PreprocessorOutput` object containing the processed multimodal data.
   """
   processor_outputs = mm_utils.PreprocessorOutput()
-  path = image_path if image_path is not None else config.image_path
+  path = config.image_path
 
   if config.model_name in ["gemma3-4b", "gemma3-12b", "gemma3-27b"]:
     from maxtext.multimodal.processor_gemma3 import preprocess_mm_data_gemma3  # pylint: disable=import-outside-toplevel

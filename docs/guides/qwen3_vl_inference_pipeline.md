@@ -9,11 +9,11 @@ relevant source file, input/output tensor specs, and how to verify correctness.
 ## Pipeline Overview
 
 ```
-Raw image (np.ndarray HWC) + text prompt (str)
+Image file path (str) + text prompt (str)
         │
         ▼
-① preprocess_mm_data()                   ← multimodal/processor.py  (routes to below)
-  └─ preprocess_mm_data_qwen3_vl()       ← multimodal/processor_qwen3_vl.py
+① preprocess_mm_data(config)              ← multimodal/processor.py  (routes to below)
+  └─ preprocess_mm_data_qwen3_vl()          ← multimodal/processor_qwen3_vl.py
         │  pixel_values  (N, 3, 2, 448, 448)
         │  pixel_grid_thw (N, 3)
         ▼
@@ -58,33 +58,39 @@ Raw image (np.ndarray HWC) + text prompt (str)
 
 ## Module 1 — Image Preprocessor
 
-**Entry point (file path → tensor):** `src/maxtext/multimodal/processor.py` → `preprocess_mm_data(config, image_path=None)`  
+**Entry point (file path → tensor):** `src/maxtext/multimodal/processor.py` → `preprocess_mm_data(config)`  
 **Entry point (array → tensor):** `src/maxtext/multimodal/processor.py` → `preprocess_image_for_training(image, model_name)`  
 **Implementation:** `src/maxtext/multimodal/processor_qwen3_vl.py` → `preprocess_mm_data_qwen3_vl(images)`
 
 Both entry points route to the same underlying implementation.
 
-- **`preprocess_mm_data`**: starts from a file path. The path comes from `config.image_path` by
-  default, but can be overridden per-call with the `image_path=` kwarg (used by inference demos
-  and the API server where the image path is a runtime argument, not a startup config field).
+- **`preprocess_mm_data`**: starts from a file path (`config.image_path`). Callers that receive
+  the image path at call time (inference demos, API server) construct a
+  `types.SimpleNamespace(model_name=..., image_path=...)` rather than modifying the shared
+  pyconfig. `decode.py` and other CLI callers pass the full pyconfig directly since `image_path`
+  is already baked in at startup.
+  **Does not support `qwen3-omni`** via this path — that model passes the whole config to its own
+  preprocessor.
 - **`preprocess_image_for_training`**: starts from a pre-loaded `np.ndarray`. Used by the SFT
-  training data pipeline (`input_pipeline_utils.py`) where images are already decoded from dataset
-  records into arrays before preprocessing.
+  training data pipeline (`input_pipeline_utils.py::pre_process_image_sft`) where images arrive
+  as decoded PIL images (converted via `mm_utils.convert_to_RGB`) already in memory.
+  **Does not support `qwen3-omni`** — that model is not present in its routing table.
 
 ### Inputs
 
-**`preprocess_mm_data(config, image_path=None)`** (inference demos / server / CLI):
+**`preprocess_mm_data(config)`** (inference demos / server / CLI):
 
 | Arg | Description |
 |-----|-------------|
 | `config.model_name` | `"qwen3-vl-2b"` or `"qwen3-vl-8b"` |
-| `image_path` | Comma-separated image file path(s). Overrides `config.image_path` when provided. |
+| `config.image_path` | Comma-separated image file path(s). Callers with a runtime path use `types.SimpleNamespace(model_name=..., image_path=...)`. |
 
 **`preprocess_image_for_training(image, model_name)`** (SFT training data pipeline):
 
 | Arg | Type / Shape | Description |
 |-----|-------------|-------------|
-| `image` | `np.ndarray (H, W, 3)` uint8, or `list[np.ndarray]` | One or more raw RGB images already loaded into memory |
+| `image` | `np.ndarray (H, W, 3)` uint8, or `list[np.ndarray]` | One or more RGB images decoded from a dataset record (e.g. via `mm_utils.convert_to_RGB`) and converted to `np.ndarray` |
+| `model_name` | str | `"qwen3-vl-2b"`, `"qwen3-vl-8b"`, `"gemma3-*"`, or `"llama4-*"` — `qwen3-omni` is not supported |
 
 ### Output — `Qwen3VLPreprocessorOutput`
 | Field | Shape | Description |

@@ -232,8 +232,11 @@ class Qwen3VLDemoEngine:
       print(f"[{BACKEND}] mRoPE positions computed: {position_ids.shape}")
 
     # ── 3. Preprocess image for the vision encoder ───────────────────────────
+    import types
     from maxtext.multimodal.processor import preprocess_mm_data
-    pixel_values = jnp.asarray(preprocess_mm_data(self._config, image_path=image_path).pixel_values)  # (1,3,2,H,W)
+    pixel_values = jnp.asarray(preprocess_mm_data(
+        types.SimpleNamespace(model_name=self._config.model_name, image_path=image_path)
+    ).pixel_values)  # (1,3,2,H,W)
     if verbose:
       print(f"[{BACKEND}] Pixel values shape: {pixel_values.shape}")
 
