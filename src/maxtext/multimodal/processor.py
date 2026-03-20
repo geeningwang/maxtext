@@ -49,10 +49,16 @@ def preprocess_mm_data(config):
 
     processor_outputs = preprocess_mm_data_qwen3_omni(config)
   elif config.model_name in ["qwen3-vl-2b", "qwen3-vl-8b"]:
-    from maxtext.multimodal.processor_qwen3_vl import preprocess_mm_data_qwen3_vl  # pylint: disable=import-outside-toplevel
+    has_video = bool(getattr(config, "video_path", ""))
+    if has_video:
+      from maxtext.multimodal.processor_qwen3_vl import preprocess_video_qwen3_vl  # pylint: disable=import-outside-toplevel
 
-    images = [mm_utils.load_image_from_path(p) for p in path.split(",")]
-    processor_outputs = preprocess_mm_data_qwen3_vl(images)
+      processor_outputs = preprocess_video_qwen3_vl(config.video_path)
+    else:
+      from maxtext.multimodal.processor_qwen3_vl import preprocess_mm_data_qwen3_vl  # pylint: disable=import-outside-toplevel
+
+      images = [mm_utils.load_image_from_path(p) for p in path.split(",")]
+      processor_outputs = preprocess_mm_data_qwen3_vl(images)  # dynamic resolution
   else:
     raise ValueError(f"Model {config.model_name} not supported for multimodal preprocessing.")
 
@@ -70,9 +76,13 @@ def preprocess_image_for_training(image, model_name):
 
     return preprocess_mm_data_llama4(image)
   elif model_name in ["qwen3-vl-2b", "qwen3-vl-8b"]:
-    from maxtext.multimodal.processor_qwen3_vl import preprocess_mm_data_qwen3_vl  # pylint: disable=import-outside-toplevel
+    from maxtext.multimodal.processor_qwen3_vl import preprocess_mm_data_qwen3_vl, QWEN3_VL_IMAGE_SIZE  # pylint: disable=import-outside-toplevel
 
-    return preprocess_mm_data_qwen3_vl(image)
+    # Force the fixed 448×448 resolution for training so all images in the
+    # batch have identical spatial shapes and can be stacked.
+    return preprocess_mm_data_qwen3_vl(
+        image, force_size=(QWEN3_VL_IMAGE_SIZE, QWEN3_VL_IMAGE_SIZE)
+    )
   else:
     raise ValueError(f"Model {model_name} not supported for image preprocessing.")
 
