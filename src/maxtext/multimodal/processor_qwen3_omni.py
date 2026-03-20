@@ -80,7 +80,7 @@ class Qwen3OmniPreprocessorOutput(mm_utils.PreprocessorOutput):
   # Image attributes.
   num_images: int = 0
   pixel_values: None | np.ndarray = None
-  pixel_grid_thw: None | np.ndarray = None
+  image_grid_thw: None | np.ndarray = None
   # Video attributes.
   num_videos: int = 0
   video_values: None | np.ndarray = None
@@ -480,9 +480,9 @@ def preprocess_mm_data_qwen3_omni(config):
 
   if config.image_path:
     images = [mm_utils.load_image_from_path(p) for p in config.image_path.split(",")]
-    pixel_values, pixel_grid_thw = pre_process_qwen3_image(images, config)
+    pixel_values, image_grid_thw = pre_process_qwen3_image(images, config)
     processor_outputs.pixel_values = pixel_values
-    processor_outputs.pixel_grid_thw = pixel_grid_thw
+    processor_outputs.image_grid_thw = image_grid_thw
     processor_outputs.num_images = len(images)
 
   if config.video_path:
@@ -528,7 +528,7 @@ def add_extra_tokens_for_qwen3_omni(tokens, config, processor_output):
   Returns:
     Expanded token sequence with correct number of image/video/audio tokens.
   """
-  image_grid_thw = getattr(processor_output, "pixel_grid_thw", None)
+  image_grid_thw = getattr(processor_output, "image_grid_thw", None)
   video_grid_thw = getattr(processor_output, "video_grid_thw", None)
   audio_lengths = getattr(processor_output, "audio_lengths", None)
   second_per_grids = getattr(processor_output, "video_second_per_grid", None)
@@ -1082,8 +1082,8 @@ def get_mm_offsets_qwen3_omni(config, processor_output):
   merge_length = spatial_merge_size**2
 
   # Image tokens: <|image_pad|> expands to multiple image tokens
-  if processor_output.pixel_grid_thw is not None:
-    image_grid_thw = processor_output.pixel_grid_thw
+  if processor_output.image_grid_thw is not None:
+    image_grid_thw = processor_output.image_grid_thw
     for grid in image_grid_thw:
       num_image_tokens = int((grid[0] * grid[1] * grid[2]) // merge_length)
       total_offset += num_image_tokens - 1  # -1 for the original <|image_pad|> token

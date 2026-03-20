@@ -145,7 +145,7 @@ def main(argv: Sequence[str]) -> None:
 
       position_ids, mrope_position_deltas = processor_qwen3_omni.get_rope_index(
           input_ids=tokens,
-          image_grid_thw=processor_outputs.pixel_grid_thw,  # pytype: disable=attribute-error
+          image_grid_thw=processor_outputs.image_grid_thw,  # pytype: disable=attribute-error
           video_grid_thw=processor_outputs.video_grid_thw,  # pytype: disable=attribute-error
           attention_mask=np.ones_like(tokens),
           use_audio_in_video=config.use_audio and getattr(processor_outputs, 'num_videos', 0) > 0,

@@ -1,7 +1,8 @@
 # Qwen3-VL Inference Pipeline: Module-by-Module Guide
 
 This document traces the full inference data flow for Qwen3-VL models in MaxText,
-from a raw image + text prompt to decoded output text. Each section covers the
+from a raw image(s), video, or mixed image+video input combined with a text prompt,
+to decoded output text. Each section covers the
 relevant source file, input/output tensor specs, and how to verify correctness.
 
 ---
@@ -9,13 +10,18 @@ relevant source file, input/output tensor specs, and how to verify correctness.
 ## Pipeline Overview
 
 ```
-Image file path (str) + text prompt (str)
+Image file path(s) (str) and/or video path (str) + text prompt (str)
         │
         ▼
 ① preprocess_mm_data(config)              ← multimodal/processor.py  (routes to below)
-  └─ preprocess_mm_data_qwen3_vl()          ← multimodal/processor_qwen3_vl.py
-        │  pixel_values  (N, 3, 2, 448, 448)
-        │  pixel_grid_thw (N, 3)
+  ├─ preprocess_image_qwen3_vl()            ← multimodal/processor_qwen3_vl.py  [if image_path set]
+  │       │  pixel_values    (N, 3, 2, H_bar, W_bar)   dynamic resolution
+  │       │  image_grid_thw  (N, 3)
+  ├─ preprocess_video_qwen3_vl()            ← multimodal/processor_qwen3_vl.py  [if video_path set]
+  │       │  pixel_values_videos  (1, 3, T_padded, H_bar, W_bar)
+  │       │  video_grid_thw       (1, 3)
+  └─ merge_preprocessor_outputs_qwen3_vl()  ← multimodal/processor_qwen3_vl.py  [if both set]
+          │  combines all image + video fields into one Qwen3VLPreprocessorOutput
         ▼
 ② reformat_prompt_qwen3_vl()             ← multimodal/processor_qwen3_vl.py
         │  formatted prompt string (Qwen chat template)
@@ -23,8 +29,9 @@ Image file path (str) + text prompt (str)
 ③ tokenizer.encode()                     ← HuggingFace BPE tokenizer
         │  token_ids  int[]
         ▼
-④ add_extra_tokens_for_images_qwen3_vl() ← multimodal/processor_qwen3_vl.py
-        │  expanded token_ids  (196 image tokens per image)
+④ add_extra_tokens_for_images_qwen3_vl()   ← multimodal/processor_qwen3_vl.py  [images]
+   add_extra_tokens_for_video_qwen3_vl()    ← multimodal/processor_qwen3_vl.py  [video]
+        │  expanded token_ids  (dynamic token count per image/video)
         ▼
 ⑤ get_rope_index()                       ← multimodal/processor_qwen3_omni.py
         │  position_ids  (3, 1, seq_len)
@@ -58,32 +65,39 @@ Image file path (str) + text prompt (str)
 
 ## Module 1 — Image Preprocessor
 
-**Entry point (file path → tensor):** `src/maxtext/multimodal/processor.py` → `preprocess_mm_data(config)`  
+**Entry point (file/video path → tensor):** `src/maxtext/multimodal/processor.py` → `preprocess_mm_data(config)`  
 **Entry point (array → tensor):** `src/maxtext/multimodal/processor.py` → `preprocess_image_for_training(image, model_name)`  
-**Implementation:** `src/maxtext/multimodal/processor_qwen3_vl.py` → `preprocess_mm_data_qwen3_vl(images)`
+**Image implementation:** `src/maxtext/multimodal/processor_qwen3_vl.py` → `preprocess_image_qwen3_vl(images)`  
+**Video implementation:** `src/maxtext/multimodal/processor_qwen3_vl.py` → `preprocess_video_qwen3_vl(source)`
 
-Both entry points route to the same underlying implementation.
+- **`preprocess_mm_data`**: starts from file path(s). Independently runs each preprocessor
+  that has a non-empty path set, then combines the results:
+  - `config.image_path` set → calls `preprocess_image_qwen3_vl` with **dynamic resolution**
+  - `config.video_path` set → calls `preprocess_video_qwen3_vl`
+  - **Both set** → calls both, then merges via `merge_preprocessor_outputs_qwen3_vl` to produce
+    a single `Qwen3VLPreprocessorOutput` with all image *and* video fields populated
+  - Neither set → raises `ValueError`
 
-- **`preprocess_mm_data`**: starts from a file path (`config.image_path`). Callers that receive
-  the image path at call time (inference demos, API server) construct a
-  `types.SimpleNamespace(model_name=..., image_path=...)` rather than modifying the shared
-  pyconfig. `decode.py` and other CLI callers pass the full pyconfig directly since `image_path`
-  is already baked in at startup.
+  Callers that receive paths at call time construct a `types.SimpleNamespace(model_name=...,
+  image_path=..., video_path=...)` rather than modifying the shared pyconfig.
   **Does not support `qwen3-omni`** via this path — that model passes the whole config to its own
   preprocessor.
 - **`preprocess_image_for_training`**: starts from a pre-loaded `np.ndarray`. Used by the SFT
-  training data pipeline (`input_pipeline_utils.py::pre_process_image_sft`) where images arrive
-  as decoded PIL images (converted via `mm_utils.convert_to_RGB`) already in memory.
+  training data pipeline. Always applies `force_size=(448, 448)` so that all images in a batch
+  have identical spatial shapes and can be stacked.
   **Does not support `qwen3-omni`** — that model is not present in its routing table.
 
 ### Inputs
 
 **`preprocess_mm_data(config)`** (inference demos / server / CLI):
 
-| Arg | Description |
-|-----|-------------|
-| `config.model_name` | `"qwen3-vl-2b"` or `"qwen3-vl-8b"` |
-| `config.image_path` | Comma-separated image file path(s). Callers with a runtime path use `types.SimpleNamespace(model_name=..., image_path=...)`. |
+| Arg | Required? | Description |
+|-----|-----------|-------------|
+| `config.model_name` | always | `"qwen3-vl-2b"` or `"qwen3-vl-8b"` |
+| `config.image_path` | optional | Comma-separated image file path(s). Omit, leave absent, or set to empty string for video-only or text-only input. |
+| `config.video_path` | optional | Path to a single video file (GIF, MP4, etc.). Omit, leave absent, or set to empty string for image-only or text-only input. Set both for mixed image+video input. |
+
+At least one of `image_path` / `video_path` must be non-empty for visual input. Both may be absent or empty for **text-only** input — in that case `preprocess_mm_data` returns an empty `Qwen3VLPreprocessorOutput` (`num_images=0`, `num_videos=0`, all visual fields `None`). Skip `preprocess_mm_data` entirely if you prefer not to call it for text-only requests.
 
 **`preprocess_image_for_training(image, model_name)`** (SFT training data pipeline):
 
@@ -93,64 +107,152 @@ Both entry points route to the same underlying implementation.
 | `model_name` | str | `"qwen3-vl-2b"`, `"qwen3-vl-8b"`, `"gemma3-*"`, or `"llama4-*"` — `qwen3-omni` is not supported |
 
 ### Output — `Qwen3VLPreprocessorOutput`
+
+**Image fields** (from `preprocess_image_qwen3_vl`):
+
 | Field | Shape | Description |
 |-------|-------|-------------|
-| `pixel_values` | `(N, 3, 2, 448, 448)` float32 | Normalised pixel tensor. T=2 (image duplicated for temporal axis) |
-| `pixel_grid_thw` | `(N, 3)` int32 | Grid dims `[grid_t, grid_h, grid_w]` = `[1, 28, 28]` for 448×448 |
+| `pixel_values` | `(N, 3, 2, H_bar, W_bar)` float32 | Normalised pixel tensor. T=2 (image duplicated for temporal axis). H_bar/W_bar multiples of 32. |
+| `image_grid_thw` | `(N, 3)` int32 | Grid dims `[grid_t, grid_h, grid_w]` where `grid_h = H_bar // 16`, `grid_w = W_bar // 16` |
 | `num_images` | int | N |
 
+Inference uses **dynamic resolution**: H_bar × W_bar ∈ [min_pixels, max_pixels], aligned to multiples of `QWEN3_VL_RESIZE_FACTOR` (32).  
+Training (`preprocess_image_for_training`) always uses `force_size=(448, 448)` → H_bar=W_bar=448, grid always `[1, 28, 28]`.
+
+In **mixed image+video mode**, all image fields and all video fields are present simultaneously in the same `Qwen3VLPreprocessorOutput`.
+
+**Video fields** (from `preprocess_video_qwen3_vl`):
+
+| Field | Shape | Description |
+|-------|-------|-------------|
+| `pixel_values_videos` | `(1, 3, T_padded, H_bar, W_bar)` float32 | Normalised video frames. T_padded is multiple of `QWEN3_VL_TEMPORAL_PATCH_SIZE`. |
+| `video_grid_thw` | `(1, 3)` int32 | `[grid_t, grid_h, grid_w]` where `grid_t = T_padded // 2` |
+| `num_videos` | int | 1 |
+
 ### Key constants
-| Constant | Value |
-|----------|-------|
-| `QWEN3_VL_IMAGE_SIZE` | 448 — resize target (BICUBIC) |
-| `QWEN3_VL_PATCH_SIZE` | 16 — patch side length → 28×28 grid |
-| `QWEN3_VL_TEMPORAL_PATCH_SIZE` | 2 — image duplicated along T |
-| `QWEN3_VL_NUM_FRAMES` | 2 → after fold: `num_frames = 2 // 2 = 1` |
-| Normalisation | `(pixel − 127.5) / 127.5` → range `[−1, +1]` |
+| Constant | Value | Description |
+|----------|-------|-------------|
+| `QWEN3_VL_PATCH_SIZE` | 16 | Spatial patch side length |
+| `QWEN3_VL_TEMPORAL_PATCH_SIZE` | 2 | Temporal patch depth — images duplicated, video padded to multiples of 2 |
+| `QWEN3_VL_SPATIAL_MERGE_SIZE` | 2 | PatchMerger 2×2 → 1 token (4× reduction) |
+| `QWEN3_VL_RESIZE_FACTOR` | 32 | `= patch_size × merge_size`; output H/W must be multiples of this |
+| `QWEN3_VL_IMAGE_MIN_PIXELS` | 3136 (56×56) | Minimum H×W for image dynamic resize |
+| `QWEN3_VL_IMAGE_MAX_PIXELS` | 1003520 (28×28×1280) | Maximum H×W for image dynamic resize |
+| `QWEN3_VL_IMAGE_SIZE` | 448 | Fixed resize for training (force_size) |
+| `QWEN3_VL_VIDEO_DEFAULT_FPS` | 2.0 | Default output fps for video sampling |
+| `QWEN3_VL_VIDEO_MIN_PIXELS` | 131072 | Minimum T×H×W for video dynamic resize |
+| `QWEN3_VL_VIDEO_MAX_PIXELS` | 786432 | Maximum T×H×W for video dynamic resize |
+| Normalisation | `(pixel − 127.5) / 127.5` → `[−1, +1]` | Applied to both images and video frames |
 
 ### Verifying correctness
 ```python
-# Shape check
-assert out.pixel_values.shape == (N, 3, 2, 448, 448)
-assert out.pixel_grid_thw.shape == (N, 3)
-assert np.all(out.pixel_grid_thw == [1, 28, 28])
-
-# Value range check
+# Image — dynamic resolution
+assert out.pixel_values.ndim == 5             # (N, C, T, H, W)
+assert out.pixel_values.shape[1] == 3         # RGB
+assert out.pixel_values.shape[2] == 2         # temporal duplicate
+assert out.pixel_values.shape[3] % 32 == 0    # H_bar multiple of resize_factor
+assert out.pixel_values.shape[4] % 32 == 0    # W_bar multiple of resize_factor
 assert out.pixel_values.min() >= -1.1
 assert out.pixel_values.max() <= +1.1
+
+# Image — training (force_size)
+assert out.pixel_values.shape == (N, 3, 2, 448, 448)
+assert np.all(out.image_grid_thw == [1, 28, 28])
+
+# Video
+assert out.pixel_values_videos.ndim == 5       # (1, C, T, H, W)
+assert out.pixel_values_videos.shape[2] % 2 == 0  # T_padded divisible by temporal_patch_size
 ```
 
-**Tests:** `pytest tests/unit/qwen3_vl_sft_data_processing_test.py -k "pixel"`
+```python
+# Mixed image+video mode
+import types
+config = types.SimpleNamespace(
+    model_name="qwen3-vl-2b",
+    image_path="photo.jpg",
+    video_path="clip.gif",
+)
+out = preprocess_mm_data(config)  # out has pixel_values AND pixel_values_videos
+assert out.num_images >= 1
+assert out.num_videos >= 1
+assert out.pixel_values is not None
+assert out.pixel_values_videos is not None
+```
+
+**Tests:**
+```
+pytest tests/unit/qwen3_vl_sft_data_processing_test.py -k "pixel"              # training path
+pytest tests/unit/qwen3_vl_preprocessor_test.py -k "PreprocessMmData"          # dynamic inference path
+pytest tests/unit/qwen3_vl_preprocessor_test.py -k "PreprocessVideo"           # video path
+pytest tests/unit/qwen3_vl_preprocessor_test.py -k "MixedImageVideo"           # mixed image+video path
+```
+
+### `merge_preprocessor_outputs_qwen3_vl`
+
+**File:** `src/maxtext/multimodal/processor_qwen3_vl.py`  
+**Function:** `merge_preprocessor_outputs_qwen3_vl(image_output, video_output)`
+
+Combines two separate `Qwen3VLPreprocessorOutput` objects — one from `preprocess_image_qwen3_vl` and one from `preprocess_video_qwen3_vl` — into a single output with all fields populated.
+
+```python
+image_out = preprocess_image_qwen3_vl(images)          # pixel_values, image_grid_thw, num_images
+video_out = preprocess_video_qwen3_vl(video_path)      # pixel_values_videos, video_grid_thw, num_videos
+merged   = merge_preprocessor_outputs_qwen3_vl(image_out, video_out)
+# merged.pixel_values         ← from image_out (unchanged)
+# merged.image_grid_thw       ← from image_out (unchanged)
+# merged.pixel_values_videos  ← from video_out (unchanged)
+# merged.video_grid_thw       ← from video_out (unchanged)
+```
+
+Called automatically by `preprocess_mm_data` when both `image_path` and `video_path` are set.
 
 ---
 
 ## Module 2 — Prompt Formatter
 
 **File:** `src/maxtext/multimodal/processor_qwen3_vl.py`  
-**Function:** `reformat_prompt_qwen3_vl(prompt, image_placeholder, num_images)`
+**Function:** `reformat_prompt_qwen3_vl(prompt, image_placeholder, num_images, video_placeholder="<|video|>", num_videos=0)`
 
 ### Input
-| Arg | Type | Description |
-|-----|------|-------------|
-| `prompt` | str | Raw user prompt, may contain `image_placeholder` |
-| `image_placeholder` | str | Generic placeholder (e.g. `"<\|image\|>"`) |
-| `num_images` | int | Number of images for this example |
+| Arg | Type | Default | Description |
+|-----|------|---------|-------------|
+| `prompt` | str | — | Raw user prompt, may contain placeholders |
+| `image_placeholder` | str | — | Generic image placeholder (e.g. `"<\|image\|>"`) |
+| `num_images` | int | — | Number of images for this example |
+| `video_placeholder` | str | `"<\|video\|>"` | Generic video placeholder |
+| `num_videos` | int | `0` | Number of videos for this example |
 
 ### Output
-Formatted string (Qwen chat template):
+Formatted string (Qwen chat template). Examples:
 ```
+# Image-only input
 <|im_start|>user
 <|vision_start|><|image_pad|><|vision_end|>{user text}<|im_end|>
+<|im_start|>assistant
+
+# Video-only input
+<|im_start|>user
+<|vision_start|><|video_pad|><|vision_end|>{user text}<|im_end|>
+<|im_start|>assistant
+
+# Mixed image+video input (num_images=1, num_videos=1)
+<|im_start|>user
+<|vision_start|><|image_pad|><|vision_end|><|vision_start|><|video_pad|><|vision_end|>{user text}<|im_end|>
 <|im_start|>assistant
 ```
 
 - `<|image_pad|>` (token ID `151655`) is inserted once per image
-- Missing image placeholders are prepended automatically
+- `<|video_pad|>` (token ID `151656`) is inserted once per video
+- Missing placeholders are prepended automatically (images first, then videos)
 
 ### Why it matters
-The `<|image_pad|>` sentinel is what Module 4 expands into the 196 per-image vision tokens. Its position in the sequence determines where image embeddings are later injected in Module 8.
+The sentinel tokens are what Module 4 expands into per-image/per-video vision tokens. Their positions in the sequence determine where visual embeddings are injected in Module 8.
 
-**Tests:** `pytest tests/unit/qwen3_vl_sft_data_processing_test.py -k "image_tokens"`
+**Tests:**
+```
+pytest tests/unit/qwen3_vl_sft_data_processing_test.py -k "image_tokens"
+pytest tests/unit/qwen3_vl_preprocessor_test.py -k "ReformatPrompt"
+```
 
 ---
 
@@ -162,34 +264,62 @@ No custom logic — use the HuggingFace `AutoTokenizer` directly.
 
 ---
 
-## Module 4 — Image Token Expansion
+## Module 4 — Visual Token Expansion
 
-**File:** `src/maxtext/multimodal/processor_qwen3_vl.py`  
-**Function:** `add_extra_tokens_for_images_qwen3_vl(tokens, processor_output)`
+**File:** `src/maxtext/multimodal/processor_qwen3_vl.py`
 
-### Input
-| Arg | Shape | Description |
-|-----|-------|-------------|
-| `tokens` | `int[seq_compact]` 1D | Token IDs from tokenizer (compact, one placeholder per image) |
-| `processor_output.pixel_grid_thw` | `(N, 3)` | Grid dimensions |
+Two functions — one for images, one for video. The router `prepare_text_for_image_fusion` in `processor.py` applies **both in sequence** for qwen3-vl, so a single call handles image-only, video-only, and mixed inputs transparently:
 
-### Output
-`np.ndarray int32[seq_expanded]` — each `<|image_pad|>` (151655) replaced by:
+```python
+# Inside prepare_text_for_image_fusion (processor.py)
+tokens = add_extra_tokens_for_images_qwen3_vl(tokens, processor_output)  # no-op if no images
+tokens = add_extra_tokens_for_video_qwen3_vl(tokens, processor_output)   # no-op if no video
 ```
-num_tokens = grid_t × grid_h × grid_w // spatial_merge_size²
-           = 1 × 28 × 28 // 4
-           = 196   tokens per image (at 448×448)
+
+Each function is a **no-op** when its corresponding grid field (`image_grid_thw` / `video_grid_thw`) is `None` in the processor output.
+
+| Function | Expands | Uses field | No-op when |
+|----------|---------|------------|------------|
+| `add_extra_tokens_for_images_qwen3_vl(tokens, processor_output)` | `<\|image_pad\|>` (151655) | `processor_output.image_grid_thw` | `image_grid_thw is None` |
+| `add_extra_tokens_for_video_qwen3_vl(tokens, processor_output)` | `<\|video_pad\|>` (151656) | `processor_output.video_grid_thw` | `video_grid_thw is None` |
+
+### Token count formula
 ```
+num_tokens = grid_t × grid_h × grid_w // spatial_merge_size²  (÷ 4)
+
+# Image examples:
+#   448×448  → [1, 28, 28] →  1×28×28÷4 = 196 tokens  (training / force_size)
+#   320×224  → [1, 14, 10] →  1×14×10÷4 =  35 tokens  (dynamic inference)
+
+# Video example:
+#   8 frames, 240×320 → [4, 15, 20] → 4×15×20÷4 = 300 tokens
+```
+
+The token count is **dynamic at inference time** — it depends on `image_grid_thw` / `video_grid_thw` from the preprocessor output. Only training (with `force_size=448`) always yields 196 tokens per image.
 
 ### Verifying correctness
 ```python
-original_image_count = (tokens == 151655).sum()
+# Image expansion
+from maxtext.multimodal.processor_qwen3_vl import add_extra_tokens_for_images_qwen3_vl
+tokens = np.array([IMAGE_TOKEN])  # single placeholder
 expanded = add_extra_tokens_for_images_qwen3_vl(tokens, proc_out)
-extra = (expanded == 151655).sum() - original_image_count
-assert extra == original_image_count * 195  # each placeholder → 196 copies (net +195)
+expected = int(np.prod(proc_out.image_grid_thw[0])) // 4
+assert len(expanded) == expected
+
+# Video expansion
+from maxtext.multimodal.processor_qwen3_vl import add_extra_tokens_for_video_qwen3_vl
+tokens_v = np.array([VIDEO_TOKEN])
+expanded_v = add_extra_tokens_for_video_qwen3_vl(tokens_v, proc_out)
+expected_v = int(np.prod(proc_out.video_grid_thw[0])) // 4
+assert len(expanded_v) == expected_v
 ```
 
-**Tests:** `pytest tests/unit/qwen3_vl_sft_data_processing_test.py -k "segmentation or image_tokens"`
+**Tests:**
+```
+pytest tests/unit/qwen3_vl_sft_data_processing_test.py -k "segmentation or image_tokens"  # training (196)
+pytest tests/unit/qwen3_vl_preprocessor_test.py -k "AddExtraTokens"                       # dynamic + video
+pytest tests/unit/qwen3_vl_preprocessor_test.py -k "MixedImageVideo"                      # mixed mode
+```
 
 ---
 
@@ -393,8 +523,12 @@ pytest tests/integration/qwen3_vl_checkpoint_validation_test.py -k "determinism"
 
 | Module | Test command | What is checked |
 |--------|-------------|-----------------|
-| Image preprocessor | `pytest tests/unit/qwen3_vl_sft_data_processing_test.py -k "pixel"` | Shape `(N,3,2,448,448)`, range `[−1,+1]` |
-| Token expansion | `pytest tests/unit/qwen3_vl_sft_data_processing_test.py -k "image_tokens or segmentation"` | 196 tokens per image, mask alignment |
+| Image preprocessor (training) | `pytest tests/unit/qwen3_vl_sft_data_processing_test.py -k "pixel"` | Shape `(N,3,2,448,448)`, range `[−1,+1]` |
+| Image preprocessor (dynamic) | `pytest tests/unit/qwen3_vl_preprocessor_test.py -k "PreprocessMmData"` | Dynamic H_bar/W_bar multiples of 32, pixel bounds |
+| Video preprocessor | `pytest tests/unit/qwen3_vl_preprocessor_test.py -k "PreprocessVideo"` | Shape `(1,3,T,H,W)`, temporal padding, factor alignment |
+| Token expansion (images) | `pytest tests/unit/qwen3_vl_sft_data_processing_test.py -k "image_tokens or segmentation"` | 196 tokens per image, mask alignment |
+| Token expansion (dynamic+video) | `pytest tests/unit/qwen3_vl_preprocessor_test.py -k "AddExtraTokens"` | Dynamic token count, video expansion |
+| Mixed image+video mode | `pytest tests/unit/qwen3_vl_preprocessor_test.py -k "MixedImageVideo"` | Merge fields, combined token expansion, offsets |
 | mRoPE position IDs | `pytest tests/unit/qwen3_omni_layers_test.py` | Shape `(3,batch,seq)`, text/image ranges |
 | Vision encoder | `pytest tests/integration/qwen3_vl_checkpoint_validation_test.py -k "vision_encoder"` | Shape `(batch,196,emb_dim)`, values vs golden |
 | Full model logits | `pytest tests/integration/qwen3_vl_checkpoint_validation_test.py -k "full_model"` | Logit shape `(batch,seq,vocab)`, values vs golden |
@@ -423,7 +557,7 @@ pytest tests/integration/qwen3_vl_checkpoint_validation_test.py -k "determinism"
 | Purpose | File |
 |---------|------|
 | Inference/training preprocessing router | `src/maxtext/multimodal/processor.py` |
-| Image preprocessing & prompt formatting | `src/maxtext/multimodal/processor_qwen3_vl.py` |
+| Image/video preprocessing & prompt formatting | `src/maxtext/multimodal/processor_qwen3_vl.py` |
 | mRoPE + token expansion (shared with Qwen3-Omni) | `src/maxtext/multimodal/processor_qwen3_omni.py` |
 | Embedding merge utilities | `src/maxtext/multimodal/utils.py` |
 | VisionEncoder / AudioEncoder wrappers | `src/maxtext/layers/encoders.py` |

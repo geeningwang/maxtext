@@ -67,19 +67,22 @@ QWEN3_VL_VIDEO_PAD_STR = "<|video_pad|>"
 class Qwen3VLPreprocessorOutput(mm_utils.PreprocessorOutput):
   """Holds the output of the Qwen3-VL multimodal preprocessor.
 
-  Image fields:
-    pixel_values:   (N, 3, T=2, H, W) float32 — T always = QWEN3_VL_TEMPORAL_PATCH_SIZE.
-    pixel_grid_thw: (N, 3) int32 — [grid_t, grid_h, grid_w] per image.
-    num_images:     N (inherited from PreprocessorOutput).
+  Fields inherited from PreprocessorOutput:
+    pixel_values:   (N, 3, T=2, H, W) float32 — normalised image tensor;
+                    T always = QWEN3_VL_TEMPORAL_PATCH_SIZE.
+    num_images:     N — number of images.
 
-  Video fields:
+  Image fields defined here:
+    image_grid_thw: (N, 3) int32 — [grid_t, grid_h, grid_w] per image.
+
+  Video fields defined here:
     pixel_values_videos: (N_vid, 3, T_frames, H, W) float32 — T_frames is the
                          actual frame count (rounded up to temporal_patch_size
                          multiple).
     video_grid_thw:      (N_vid, 3) int32 — [grid_t, grid_h, grid_w] per video.
     num_videos:          N_vid.
   """
-  pixel_grid_thw: None | np.ndarray = None
+  image_grid_thw: None | np.ndarray = None
   pixel_values_videos: None | np.ndarray = None
   video_grid_thw: None | np.ndarray = None
   num_videos: int = 0
@@ -195,7 +198,7 @@ def _normalise_hwc(img_np: np.ndarray) -> np.ndarray:
 
 # ─── Image preprocessing ──────────────────────────────────────────────────────
 
-def preprocess_mm_data_qwen3_vl(
+def preprocess_image_qwen3_vl(
     image: Union[np.ndarray, list],
     min_pixels: int = QWEN3_VL_IMAGE_MIN_PIXELS,
     max_pixels: int = QWEN3_VL_IMAGE_MAX_PIXELS,
@@ -220,7 +223,7 @@ def preprocess_mm_data_qwen3_vl(
   Returns:
     Qwen3VLPreprocessorOutput with:
       pixel_values:   (N, 3, 2, H_bar, W_bar) float32
-      pixel_grid_thw: (N, 3) int32 — [grid_t, grid_h, grid_w] per image
+      image_grid_thw: (N, 3) int32 — [grid_t, grid_h, grid_w] per image
       num_images:     N
   """
   images_in = image if isinstance(image, list) else [image]
@@ -261,12 +264,12 @@ def preprocess_mm_data_qwen3_vl(
         "Use force_size=(H, W) or process images of equal resolution."
     ) from exc
 
-  pixel_grid_thw = np.stack(grids_thw, axis=0)  # (N, 3)
+  image_grid_thw = np.stack(grids_thw, axis=0)  # (N, 3)
 
   return Qwen3VLPreprocessorOutput(
       num_images=len(images_in),
       pixel_values=pixel_values,
-      pixel_grid_thw=pixel_grid_thw,
+      image_grid_thw=image_grid_thw,
   )
 
 
@@ -435,10 +438,10 @@ def preprocess_video_qwen3_vl(
 
 def reformat_prompt_qwen3_vl(
     prompt,
-    image_placeholder,
     num_images,
-    video_placeholder="<|video|>",
     num_videos=0,
+    image_placeholder="<|image|>",
+    video_placeholder="<|video|>",
 ):
   """Reformat a prompt for Qwen3-VL inference or SFT training.
 
@@ -447,10 +450,10 @@ def reformat_prompt_qwen3_vl(
 
   Args:
     prompt: Raw user prompt string.
-    image_placeholder: Generic image placeholder (e.g. ``"<|image|>"``).
     num_images: Number of images for this example.
-    video_placeholder: Generic video placeholder (e.g. ``"<|video|>"``).
     num_videos: Number of videos for this example.
+    image_placeholder: Generic image placeholder (default ``"<|image|>"``).
+    video_placeholder: Generic video placeholder (default ``"<|video|>"``).
 
   Returns:
     Formatted prompt string ready for tokenisation.
@@ -480,19 +483,19 @@ def add_extra_tokens_for_images_qwen3_vl(tokens, processor_output):
 
   Each single placeholder token is replaced by
   ``grid_t × grid_h × grid_w // spatial_merge_size²`` tokens, where
-  ``pixel_grid_thw`` comes from the preprocessor output (dynamic resolution).
+  ``image_grid_thw`` comes from the preprocessor output (dynamic resolution).
 
   Example (448×448 with patch_size=16, merge_size=2):
     grid_thw = [1, 28, 28] → 1×28×28 // 4 = 196 tokens per image.
 
   Args:
     tokens: 1-D int array of token IDs (after tokenisation).
-    processor_output: Qwen3VLPreprocessorOutput with pixel_grid_thw.
+    processor_output: Qwen3VLPreprocessorOutput with image_grid_thw.
 
   Returns:
     New 1-D int32 np.ndarray with placeholders expanded.
   """
-  pixel_grid_thw = getattr(processor_output, "pixel_grid_thw", None)
+  image_grid_thw = getattr(processor_output, "image_grid_thw", None)
   merge_length = QWEN3_VL_SPATIAL_MERGE_SIZE ** 2  # 4
 
   if not isinstance(tokens, np.ndarray):
@@ -506,10 +509,10 @@ def add_extra_tokens_for_images_qwen3_vl(tokens, processor_output):
   for token in token_list:
     if (
         token == QWEN3_VL_IMAGE_TOKEN
-        and pixel_grid_thw is not None
-        and image_idx < len(pixel_grid_thw)
+        and image_grid_thw is not None
+        and image_idx < len(image_grid_thw)
     ):
-      grid = pixel_grid_thw[image_idx]
+      grid = image_grid_thw[image_idx]
       num_tokens = int((grid[0] * grid[1] * grid[2]) // merge_length)
       new_tokens.extend([QWEN3_VL_IMAGE_TOKEN] * num_tokens)
       image_idx += 1
@@ -565,17 +568,17 @@ def get_image_offsets_qwen3_vl(processor_output):
   Each placeholder token expands to N tokens, so the offset per image is N-1.
 
   Args:
-    processor_output: Qwen3VLPreprocessorOutput with pixel_grid_thw.
+    processor_output: Qwen3VLPreprocessorOutput with image_grid_thw.
 
   Returns:
     Integer: total token count increase across all images.
   """
-  if processor_output is None or getattr(processor_output, "pixel_grid_thw", None) is None:
+  if processor_output is None or getattr(processor_output, "image_grid_thw", None) is None:
     return 0
 
   merge_length = QWEN3_VL_SPATIAL_MERGE_SIZE ** 2
   total_offset = 0
-  for grid in processor_output.pixel_grid_thw:
+  for grid in processor_output.image_grid_thw:
     num_tokens = int((grid[0] * grid[1] * grid[2]) // merge_length)
     total_offset += num_tokens - 1
   return total_offset
@@ -599,6 +602,33 @@ def get_video_offsets_qwen3_vl(processor_output):
     num_tokens = int((grid[0] * grid[1] * grid[2]) // merge_length)
     total_offset += num_tokens - 1
   return total_offset
+
+
+def merge_preprocessor_outputs_qwen3_vl(
+    image_output: "Qwen3VLPreprocessorOutput",
+    video_output: "Qwen3VLPreprocessorOutput",
+) -> "Qwen3VLPreprocessorOutput":
+  """Merge image and video preprocessor outputs for mixed image+video inference.
+
+  Combines the image fields from *image_output* and the video fields from
+  *video_output* into a single ``Qwen3VLPreprocessorOutput``.  This enables
+  passing both images and a video to the model in a single execution.
+
+  Args:
+    image_output: Result of ``preprocess_image_qwen3_vl`` (image fields only).
+    video_output: Result of ``preprocess_video_qwen3_vl`` (video fields only).
+
+  Returns:
+    ``Qwen3VLPreprocessorOutput`` with all image *and* video fields populated.
+  """
+  return Qwen3VLPreprocessorOutput(
+      num_images=image_output.num_images,
+      pixel_values=image_output.pixel_values,
+      image_grid_thw=image_output.image_grid_thw,
+      num_videos=video_output.num_videos,
+      pixel_values_videos=video_output.pixel_values_videos,
+      video_grid_thw=video_output.video_grid_thw,
+  )
 
 
 def get_dummy_image_shape_for_init_qwen3_vl(

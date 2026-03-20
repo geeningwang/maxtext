@@ -17,7 +17,7 @@
 Tests cover:
   - ``smart_resize_image``   — dynamic resolution helper for images
   - ``smart_resize_video``   — dynamic resolution helper for videos
-  - ``preprocess_mm_data_qwen3_vl``   — image preprocessing (dynamic + force_size)
+  - ``preprocess_image_qwen3_vl``   — image preprocessing (dynamic + force_size)
   - ``preprocess_video_qwen3_vl``     — video preprocessing
   - ``add_extra_tokens_for_images_qwen3_vl`` — token expansion
   - ``add_extra_tokens_for_video_qwen3_vl``  — video token expansion
@@ -30,10 +30,12 @@ Run:
 """
 
 import math
+import types
 import unittest
 
 import numpy as np
 
+from maxtext.multimodal.processor import preprocess_mm_data
 from maxtext.multimodal.processor_qwen3_vl import (
     QWEN3_VL_IMAGE_MAX_PIXELS,
     QWEN3_VL_IMAGE_MIN_PIXELS,
@@ -55,7 +57,8 @@ from maxtext.multimodal.processor_qwen3_vl import (
     add_extra_tokens_for_video_qwen3_vl,
     get_image_offsets_qwen3_vl,
     get_video_offsets_qwen3_vl,
-    preprocess_mm_data_qwen3_vl,
+    merge_preprocessor_outputs_qwen3_vl,
+    preprocess_image_qwen3_vl,
     preprocess_video_qwen3_vl,
     reformat_prompt_qwen3_vl,
     smart_resize_image,
@@ -221,7 +224,7 @@ class TestSmartResizeVideo(unittest.TestCase):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# preprocess_mm_data_qwen3_vl
+# preprocess_image_qwen3_vl
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TestPreprocessMmDataQwen3VL(unittest.TestCase):
@@ -230,36 +233,36 @@ class TestPreprocessMmDataQwen3VL(unittest.TestCase):
 
   def test_returns_qwen3vl_output(self):
     img = _rand_image(224, 224)
-    out = preprocess_mm_data_qwen3_vl(img)
+    out = preprocess_image_qwen3_vl(img)
     self.assertIsInstance(out, Qwen3VLPreprocessorOutput)
 
   def test_pixel_values_present(self):
     img = _rand_image(224, 224)
-    out = preprocess_mm_data_qwen3_vl(img)
+    out = preprocess_image_qwen3_vl(img)
     self.assertIsNotNone(out.pixel_values)
 
-  def test_pixel_grid_thw_present(self):
+  def test_image_grid_thw_present(self):
     img = _rand_image(448, 448)
-    out = preprocess_mm_data_qwen3_vl(img)
-    self.assertIsNotNone(out.pixel_grid_thw)
+    out = preprocess_image_qwen3_vl(img)
+    self.assertIsNotNone(out.image_grid_thw)
 
   # ── Shape — single image, dynamic resolution ───────────────────────────────
 
   def test_output_shape_ndim(self):
     """pixel_values must be 5-D: (N, C, T, H, W)."""
     img = _rand_image(224, 224)
-    out = preprocess_mm_data_qwen3_vl(img)
+    out = preprocess_image_qwen3_vl(img)
     self.assertEqual(out.pixel_values.ndim, 5)
 
   def test_output_channels(self):
     img = _rand_image(224, 224)
-    out = preprocess_mm_data_qwen3_vl(img)
+    out = preprocess_image_qwen3_vl(img)
     self.assertEqual(out.pixel_values.shape[1], 3)  # C=3
 
   def test_output_temporal_dim(self):
     """T must equal QWEN3_VL_TEMPORAL_PATCH_SIZE (2)."""
     img = _rand_image(224, 224)
-    out = preprocess_mm_data_qwen3_vl(img)
+    out = preprocess_image_qwen3_vl(img)
     self.assertEqual(out.pixel_values.shape[2], QWEN3_VL_TEMPORAL_PATCH_SIZE)
 
   def test_spatial_dims_factor_aligned(self):
@@ -267,7 +270,7 @@ class TestPreprocessMmDataQwen3VL(unittest.TestCase):
     for sz in [(100, 150), (224, 224), (640, 480)]:
       with self.subTest(sz=sz):
         img = _rand_image(*sz)
-        out = preprocess_mm_data_qwen3_vl(img)
+        out = preprocess_image_qwen3_vl(img)
         _, _, _, H_bar, W_bar = out.pixel_values.shape
         self.assertEqual(H_bar % QWEN3_VL_RESIZE_FACTOR, 0)
         self.assertEqual(W_bar % QWEN3_VL_RESIZE_FACTOR, 0)
@@ -275,7 +278,7 @@ class TestPreprocessMmDataQwen3VL(unittest.TestCase):
   def test_pixel_count_within_bounds(self):
     """H_bar × W_bar must lie within [min_pixels, max_pixels]."""
     img = _rand_image(300, 400)
-    out = preprocess_mm_data_qwen3_vl(img)
+    out = preprocess_image_qwen3_vl(img)
     _, _, _, H_bar, W_bar = out.pixel_values.shape
     pix = H_bar * W_bar
     self.assertGreaterEqual(pix, QWEN3_VL_IMAGE_MIN_PIXELS)
@@ -286,7 +289,7 @@ class TestPreprocessMmDataQwen3VL(unittest.TestCase):
   def test_force_size_square(self):
     """force_size=(448, 448) must produce exactly 448×448 output."""
     img = _rand_image(100, 150)
-    out = preprocess_mm_data_qwen3_vl(img, force_size=(QWEN3_VL_IMAGE_SIZE, QWEN3_VL_IMAGE_SIZE))
+    out = preprocess_image_qwen3_vl(img, force_size=(QWEN3_VL_IMAGE_SIZE, QWEN3_VL_IMAGE_SIZE))
     _, _, _, H, W = out.pixel_values.shape
     self.assertEqual(H, QWEN3_VL_IMAGE_SIZE)
     self.assertEqual(W, QWEN3_VL_IMAGE_SIZE)
@@ -294,18 +297,18 @@ class TestPreprocessMmDataQwen3VL(unittest.TestCase):
   def test_force_size_produces_standard_grid(self):
     """force_size=(448, 448) → grid_thw should be [1, 28, 28]."""
     img = _rand_image(100, 150)
-    out = preprocess_mm_data_qwen3_vl(img, force_size=(QWEN3_VL_IMAGE_SIZE, QWEN3_VL_IMAGE_SIZE))
+    out = preprocess_image_qwen3_vl(img, force_size=(QWEN3_VL_IMAGE_SIZE, QWEN3_VL_IMAGE_SIZE))
     expected_grid_h = QWEN3_VL_IMAGE_SIZE // QWEN3_VL_PATCH_SIZE  # 28
     np.testing.assert_array_equal(
-        out.pixel_grid_thw[0], [1, expected_grid_h, expected_grid_h]
+        out.image_grid_thw[0], [1, expected_grid_h, expected_grid_h]
     )
 
   def test_force_size_token_count_196(self):
     """force_size=(448, 448) → 196 tokens per image (28×28 // 4)."""
     img = _rand_image(100, 150)
-    out = preprocess_mm_data_qwen3_vl(img, force_size=(QWEN3_VL_IMAGE_SIZE, QWEN3_VL_IMAGE_SIZE))
+    out = preprocess_image_qwen3_vl(img, force_size=(QWEN3_VL_IMAGE_SIZE, QWEN3_VL_IMAGE_SIZE))
     merge_sq = QWEN3_VL_SPATIAL_MERGE_SIZE ** 2
-    grid = out.pixel_grid_thw[0]
+    grid = out.image_grid_thw[0]
     tokens = int(grid[0] * grid[1] * grid[2]) // merge_sq
     self.assertEqual(tokens, 196)
 
@@ -314,7 +317,7 @@ class TestPreprocessMmDataQwen3VL(unittest.TestCase):
   def test_pixel_range(self):
     """Normalised pixel values must lie in [−1.1, 1.1]."""
     img = _rand_image(224, 224)
-    out = preprocess_mm_data_qwen3_vl(img)
+    out = preprocess_image_qwen3_vl(img)
     pv = out.pixel_values
     self.assertGreater(float(pv.min()), -1.2)
     self.assertLess(float(pv.max()), 1.2)
@@ -322,18 +325,18 @@ class TestPreprocessMmDataQwen3VL(unittest.TestCase):
   def test_zero_image_maps_to_neg_one(self):
     """All-zero image normalised: (0 − 127.5) / 127.5 = −1."""
     img = np.zeros((64, 64, 3), dtype=np.uint8)
-    out = preprocess_mm_data_qwen3_vl(img)
+    out = preprocess_image_qwen3_vl(img)
     self.assertAlmostEqual(float(out.pixel_values.min()), -1.0, places=4)
 
   def test_255_image_maps_to_pos_one(self):
     """All-255 image normalised: (255 − 127.5) / 127.5 = +1."""
     img = np.full((64, 64, 3), 255, dtype=np.uint8)
-    out = preprocess_mm_data_qwen3_vl(img)
+    out = preprocess_image_qwen3_vl(img)
     self.assertAlmostEqual(float(out.pixel_values.max()), 1.0, places=4)
 
   def test_finite_pixel_values(self):
     img = _rand_image(224, 224)
-    out = preprocess_mm_data_qwen3_vl(img)
+    out = preprocess_image_qwen3_vl(img)
     self.assertTrue(np.all(np.isfinite(out.pixel_values)))
 
   # ── Batch (multiple identical-resolution images) ───────────────────────────
@@ -341,10 +344,10 @@ class TestPreprocessMmDataQwen3VL(unittest.TestCase):
   def test_multi_image_batch(self):
     """Multiple same-size images must be stacked along the N axis."""
     imgs = [_rand_image(224, 224, seed=i) for i in range(3)]
-    out = preprocess_mm_data_qwen3_vl(imgs)
+    out = preprocess_image_qwen3_vl(imgs)
     self.assertEqual(out.num_images, 3)
     self.assertEqual(out.pixel_values.shape[0], 3)
-    self.assertEqual(out.pixel_grid_thw.shape, (3, 3))
+    self.assertEqual(out.image_grid_thw.shape, (3, 3))
 
   def test_different_size_images_raise(self):
     """Images with different smart_resize outputs cannot be stacked."""
@@ -354,22 +357,22 @@ class TestPreprocessMmDataQwen3VL(unittest.TestCase):
     h2, w2 = smart_resize_image(400, 800)
     if (h1, w1) != (h2, w2):
       with self.assertRaises(ValueError):
-        preprocess_mm_data_qwen3_vl(imgs)
+        preprocess_image_qwen3_vl(imgs)
 
-  # ── pixel_grid_thw correctness ─────────────────────────────────────────────
+  # ── image_grid_thw correctness ─────────────────────────────────────────────
 
-  def test_pixel_grid_thw_shape(self):
-    """pixel_grid_thw must be (N, 3)."""
+  def test_image_grid_thw_shape(self):
+    """image_grid_thw must be (N, 3)."""
     img = _rand_image(224, 224)
-    out = preprocess_mm_data_qwen3_vl(img)
-    self.assertEqual(out.pixel_grid_thw.shape, (1, 3))
+    out = preprocess_image_qwen3_vl(img)
+    self.assertEqual(out.image_grid_thw.shape, (1, 3))
 
-  def test_pixel_grid_thw_consistent_with_pixel_values(self):
+  def test_image_grid_thw_consistent_with_pixel_values(self):
     """grid_h * patch_size == H_bar, grid_w * patch_size == W_bar."""
     img = _rand_image(640, 480)
-    out = preprocess_mm_data_qwen3_vl(img)
+    out = preprocess_image_qwen3_vl(img)
     _, _, _, H_bar, W_bar = out.pixel_values.shape
-    grid = out.pixel_grid_thw[0]
+    grid = out.image_grid_thw[0]
     self.assertEqual(grid[1] * QWEN3_VL_PATCH_SIZE, H_bar)
     self.assertEqual(grid[2] * QWEN3_VL_PATCH_SIZE, W_bar)
 
@@ -377,32 +380,32 @@ class TestPreprocessMmDataQwen3VL(unittest.TestCase):
     """For images, grid_t always equals 1."""
     for sz in [(224, 224), (448, 448), (100, 150)]:
       img = _rand_image(*sz)
-      out = preprocess_mm_data_qwen3_vl(img)
-      self.assertEqual(out.pixel_grid_thw[0, 0], 1)
+      out = preprocess_image_qwen3_vl(img)
+      self.assertEqual(out.image_grid_thw[0, 0], 1)
 
   # ── dtype ──────────────────────────────────────────────────────────────────
 
   def test_output_dtype_float32(self):
     img = _rand_image(224, 224)
-    out = preprocess_mm_data_qwen3_vl(img)
+    out = preprocess_image_qwen3_vl(img)
     self.assertEqual(out.pixel_values.dtype, np.float32)
 
   def test_grid_dtype_int32(self):
     img = _rand_image(224, 224)
-    out = preprocess_mm_data_qwen3_vl(img)
-    self.assertEqual(out.pixel_grid_thw.dtype, np.int32)
+    out = preprocess_image_qwen3_vl(img)
+    self.assertEqual(out.image_grid_thw.dtype, np.int32)
 
   # ── Input type robustness ──────────────────────────────────────────────────
 
   def test_accepts_float_array(self):
     """Float arrays (HWC, values 0–255) must be handled without error."""
     img_float = _rand_image(128, 128).astype(np.float32)
-    out = preprocess_mm_data_qwen3_vl(img_float)
+    out = preprocess_image_qwen3_vl(img_float)
     self.assertIsNotNone(out.pixel_values)
 
   def test_accepts_list_input(self):
     imgs = [_rand_image(224, 224)]
-    out = preprocess_mm_data_qwen3_vl(imgs)
+    out = preprocess_image_qwen3_vl(imgs)
     self.assertEqual(out.num_images, 1)
 
 
@@ -558,7 +561,7 @@ class TestAddExtraTokensForImages(unittest.TestCase):
   def _make_output(self, grid_thw):
     """Build a minimal Qwen3VLPreprocessorOutput with given grid."""
     out = Qwen3VLPreprocessorOutput()
-    out.pixel_grid_thw = np.array([grid_thw], dtype=np.int32)  # (1, 3)
+    out.image_grid_thw = np.array([grid_thw], dtype=np.int32)  # (1, 3)
     return out
 
   def test_single_image_196_tokens_at_448(self):
@@ -657,28 +660,28 @@ class TestReformatPromptQwen3VL(unittest.TestCase):
 
   def test_image_placeholder_replaced(self):
     """Image placeholder must become the Qwen image vision token."""
-    result = reformat_prompt_qwen3_vl("Describe <|image|>.", "<|image|>", num_images=1)
+    result = reformat_prompt_qwen3_vl("Describe <|image|>.", 1)
     self.assertIn(QWEN3_VL_IMAGE_PAD_STR, result)
     self.assertNotIn("<|image|>", result)
 
   def test_chat_template_wrapping(self):
     """Result must be wrapped in Qwen chat template."""
-    result = reformat_prompt_qwen3_vl("Hello", "<|image|>", num_images=0)
+    result = reformat_prompt_qwen3_vl("Hello", 0)
     self.assertTrue(result.startswith("<|im_start|>user\n"))
     self.assertIn("<|im_end|>", result)
     self.assertIn("<|im_start|>assistant\n", result)
 
   def test_missing_placeholders_prepended(self):
     """If num_images > occurrences in prompt, extras are prepended."""
-    result = reformat_prompt_qwen3_vl("Describe this.", "<|image|>", num_images=2)
+    result = reformat_prompt_qwen3_vl("Describe this.", 2)
     count = result.count(QWEN3_VL_IMAGE_PAD_STR)
     self.assertEqual(count, 2)
 
   def test_video_placeholder_replaced(self):
     """Video placeholder must become the Qwen video vision token."""
     result = reformat_prompt_qwen3_vl(
-        "Describe <|video|>.", "<|image|>",
-        num_images=0, video_placeholder="<|video|>", num_videos=1
+        "Describe <|video|>.", 0,
+        num_videos=1,
     )
     self.assertIn(QWEN3_VL_VIDEO_PAD_STR, result)
     self.assertNotIn("<|video|>", result)
@@ -686,8 +689,8 @@ class TestReformatPromptQwen3VL(unittest.TestCase):
   def test_missing_video_placeholders_prepended(self):
     """If num_videos > occurrences, extras are prepended."""
     result = reformat_prompt_qwen3_vl(
-        "Analyse.", "<|image|>",
-        num_images=0, video_placeholder="<|video|>", num_videos=2
+        "Analyse.", 0,
+        num_videos=2,
     )
     count = result.count(QWEN3_VL_VIDEO_PAD_STR)
     self.assertEqual(count, 2)
@@ -696,7 +699,7 @@ class TestReformatPromptQwen3VL(unittest.TestCase):
     """Both image and video placeholders can appear in one prompt."""
     prompt = "<|image|> compare with <|video|>"
     result = reformat_prompt_qwen3_vl(
-        prompt, "<|image|>", num_images=1, video_placeholder="<|video|>", num_videos=1
+        prompt, 1, num_videos=1,
     )
     self.assertEqual(result.count(QWEN3_VL_IMAGE_PAD_STR), 1)
     self.assertEqual(result.count(QWEN3_VL_VIDEO_PAD_STR), 1)
@@ -711,14 +714,14 @@ class TestOffsetFunctions(unittest.TestCase):
   def test_image_offset_196(self):
     """Fixed 448×448 → grid [1, 28, 28] → offset = 196 − 1 = 195 per image."""
     out = Qwen3VLPreprocessorOutput()
-    out.pixel_grid_thw = np.array([[1, 28, 28]], dtype=np.int32)
+    out.image_grid_thw = np.array([[1, 28, 28]], dtype=np.int32)
     offset = get_image_offsets_qwen3_vl(out)
     self.assertEqual(offset, 195)
 
   def test_image_offset_dynamic(self):
     """Dynamic grid [1, 6, 10] → tokens=15, offset=14."""
     out = Qwen3VLPreprocessorOutput()
-    out.pixel_grid_thw = np.array([[1, 6, 10]], dtype=np.int32)
+    out.image_grid_thw = np.array([[1, 6, 10]], dtype=np.int32)
     offset = get_image_offsets_qwen3_vl(out)
     self.assertEqual(offset, 14)  # 15 - 1
 
@@ -751,13 +754,13 @@ class TestOffsetFunctions(unittest.TestCase):
 class TestEndToEndImageTokenExpansion(unittest.TestCase):
 
   def test_dynamic_roundtrip(self):
-    """preprocess_mm_data_qwen3_vl grid must be consistent with token expansion."""
+    """preprocess_image_qwen3_vl grid must be consistent with token expansion."""
     img = _rand_image(224, 320)
-    proc_out = preprocess_mm_data_qwen3_vl(img)
+    proc_out = preprocess_image_qwen3_vl(img)
     tokens = np.array([0, QWEN3_VL_IMAGE_TOKEN, 1], dtype=np.int32)
     expanded = add_extra_tokens_for_images_qwen3_vl(tokens, proc_out)
     merge_sq = QWEN3_VL_SPATIAL_MERGE_SIZE ** 2
-    grid = proc_out.pixel_grid_thw[0]
+    grid = proc_out.image_grid_thw[0]
     expected_image_tokens = int(grid[0] * grid[1] * grid[2]) // merge_sq
     actual_image_tokens = int((expanded == QWEN3_VL_IMAGE_TOKEN).sum())
     self.assertEqual(actual_image_tokens, expected_image_tokens)
@@ -765,7 +768,7 @@ class TestEndToEndImageTokenExpansion(unittest.TestCase):
   def test_fixed_size_roundtrip_196_tokens(self):
     """force_size=(448,448) → exactly 196 image tokens after expansion."""
     img = _rand_image(100, 150)
-    proc_out = preprocess_mm_data_qwen3_vl(img, force_size=(448, 448))
+    proc_out = preprocess_image_qwen3_vl(img, force_size=(448, 448))
     tokens = np.array([QWEN3_VL_IMAGE_TOKEN], dtype=np.int32)
     expanded = add_extra_tokens_for_images_qwen3_vl(tokens, proc_out)
     self.assertEqual(len(expanded), 196)
@@ -784,11 +787,183 @@ class TestEndToEndImageTokenExpansion(unittest.TestCase):
   def test_offset_equals_expansion_minus_one(self):
     """get_image_offsets_qwen3_vl must equal (expanded tokens − 1)."""
     img = _rand_image(448, 448)
-    proc_out = preprocess_mm_data_qwen3_vl(img)
+    proc_out = preprocess_image_qwen3_vl(img)
     tokens = np.array([QWEN3_VL_IMAGE_TOKEN], dtype=np.int32)
     expanded = add_extra_tokens_for_images_qwen3_vl(tokens, proc_out)
     offset = get_image_offsets_qwen3_vl(proc_out)
     self.assertEqual(offset, len(expanded) - 1)
+
+
+class TestMixedImageVideoPreprocessing(unittest.TestCase):
+  """Tests for merge_preprocessor_outputs_qwen3_vl (mixed image+video mode)."""
+
+  def test_merge_has_image_fields(self):
+    img_out = preprocess_image_qwen3_vl(_rand_image(224, 224))
+    vid_out = preprocess_video_qwen3_vl(_rand_frames(4, 240, 320))
+    merged = merge_preprocessor_outputs_qwen3_vl(img_out, vid_out)
+    self.assertIsNotNone(merged.pixel_values)
+    self.assertIsNotNone(merged.image_grid_thw)
+    self.assertEqual(merged.num_images, 1)
+
+  def test_merge_has_video_fields(self):
+    img_out = preprocess_image_qwen3_vl(_rand_image(224, 224))
+    vid_out = preprocess_video_qwen3_vl(_rand_frames(4, 240, 320))
+    merged = merge_preprocessor_outputs_qwen3_vl(img_out, vid_out)
+    self.assertIsNotNone(merged.pixel_values_videos)
+    self.assertIsNotNone(merged.video_grid_thw)
+    self.assertEqual(merged.num_videos, 1)
+
+  def test_merge_image_values_unchanged(self):
+    img_out = preprocess_image_qwen3_vl(_rand_image(224, 224))
+    vid_out = preprocess_video_qwen3_vl(_rand_frames(4, 240, 320))
+    merged = merge_preprocessor_outputs_qwen3_vl(img_out, vid_out)
+    np.testing.assert_array_equal(merged.pixel_values, img_out.pixel_values)
+    np.testing.assert_array_equal(merged.image_grid_thw, img_out.image_grid_thw)
+
+  def test_merge_video_values_unchanged(self):
+    img_out = preprocess_image_qwen3_vl(_rand_image(224, 224))
+    vid_out = preprocess_video_qwen3_vl(_rand_frames(4, 240, 320))
+    merged = merge_preprocessor_outputs_qwen3_vl(img_out, vid_out)
+    np.testing.assert_array_equal(merged.pixel_values_videos, vid_out.pixel_values_videos)
+    np.testing.assert_array_equal(merged.video_grid_thw, vid_out.video_grid_thw)
+
+  def test_token_expansion_both_types(self):
+    """Both image and video placeholders are expanded correctly in mixed mode."""
+    img_out = preprocess_image_qwen3_vl(_rand_image(224, 224),
+                                        force_size=(QWEN3_VL_IMAGE_SIZE, QWEN3_VL_IMAGE_SIZE))
+    vid_out = preprocess_video_qwen3_vl(_rand_frames(4, 240, 320))
+    merged = merge_preprocessor_outputs_qwen3_vl(img_out, vid_out)
+
+    tokens = np.array([QWEN3_VL_IMAGE_TOKEN, 1000, QWEN3_VL_VIDEO_TOKEN, 2000], dtype=np.int32)
+    tokens = add_extra_tokens_for_images_qwen3_vl(tokens, merged)
+    tokens = add_extra_tokens_for_video_qwen3_vl(tokens, merged)
+
+    merge_sq = QWEN3_VL_SPATIAL_MERGE_SIZE ** 2
+    expected_img = int(np.prod(img_out.image_grid_thw[0])) // merge_sq   # 196
+    expected_vid = int(np.prod(vid_out.video_grid_thw[0])) // merge_sq
+    self.assertEqual((tokens == QWEN3_VL_IMAGE_TOKEN).sum(), expected_img)
+    self.assertEqual((tokens == QWEN3_VL_VIDEO_TOKEN).sum(), expected_vid)
+    self.assertIn(1000, tokens)
+    self.assertIn(2000, tokens)
+
+  def test_text_tokens_preserved_in_mixed_expansion(self):
+    """Non-vision tokens are untouched after mixed expansion."""
+    img_out = preprocess_image_qwen3_vl(_rand_image(64, 64))
+    vid_out = preprocess_video_qwen3_vl(_rand_frames(4, 64, 64))
+    merged = merge_preprocessor_outputs_qwen3_vl(img_out, vid_out)
+
+    text_ids = [100, 200, 300, 400, 500]
+    tokens = np.array(
+        [QWEN3_VL_IMAGE_TOKEN] + text_ids + [QWEN3_VL_VIDEO_TOKEN], dtype=np.int32
+    )
+    tokens = add_extra_tokens_for_images_qwen3_vl(tokens, merged)
+    tokens = add_extra_tokens_for_video_qwen3_vl(tokens, merged)
+    for tid in text_ids:
+      self.assertIn(tid, tokens)
+
+  def test_offset_functions_combined(self):
+    """Image + video offsets are both positive and independent in mixed mode."""
+    img_out = preprocess_image_qwen3_vl(_rand_image(224, 224),
+                                        force_size=(QWEN3_VL_IMAGE_SIZE, QWEN3_VL_IMAGE_SIZE))
+    vid_out = preprocess_video_qwen3_vl(_rand_frames(4, 240, 320))
+    merged = merge_preprocessor_outputs_qwen3_vl(img_out, vid_out)
+
+    self.assertEqual(get_image_offsets_qwen3_vl(merged), 196 - 1)  # 195
+    self.assertGreater(get_video_offsets_qwen3_vl(merged), 0)
+    self.assertEqual(
+        get_image_offsets_qwen3_vl(merged) + get_video_offsets_qwen3_vl(merged),
+        get_image_offsets_qwen3_vl(img_out) + get_video_offsets_qwen3_vl(vid_out),
+    )
+
+  def test_image_expansion_is_noop_on_video_only_output(self):
+    """add_extra_tokens_for_images is a no-op when image_grid_thw is None."""
+    vid_out = preprocess_video_qwen3_vl(_rand_frames(4, 240, 320))
+    tokens = np.array([QWEN3_VL_VIDEO_TOKEN, 1234], dtype=np.int32)
+    result = add_extra_tokens_for_images_qwen3_vl(tokens, vid_out)
+    np.testing.assert_array_equal(result, tokens)
+
+  def test_video_expansion_is_noop_on_image_only_output(self):
+    """add_extra_tokens_for_video is a no-op when video_grid_thw is None."""
+    img_out = preprocess_image_qwen3_vl(_rand_image(224, 224))
+    tokens = np.array([QWEN3_VL_IMAGE_TOKEN, 1234], dtype=np.int32)
+    result = add_extra_tokens_for_video_qwen3_vl(tokens, img_out)
+    np.testing.assert_array_equal(result, tokens)
+
+
+class TestTextOnlyPreprocessing(unittest.TestCase):
+  """Tests for text-only (no image, no video) input via preprocess_mm_data."""
+
+  def _text_only_config(self):
+    return types.SimpleNamespace(model_name="qwen3-vl-2b", image_path="", video_path="")
+
+  def test_returns_qwen3vl_output(self):
+    out = preprocess_mm_data(self._text_only_config())
+    self.assertIsInstance(out, Qwen3VLPreprocessorOutput)
+
+  def test_num_images_is_zero(self):
+    out = preprocess_mm_data(self._text_only_config())
+    self.assertEqual(out.num_images, 0)
+
+  def test_num_videos_is_zero(self):
+    out = preprocess_mm_data(self._text_only_config())
+    self.assertEqual(out.num_videos, 0)
+
+  def test_pixel_values_is_none(self):
+    out = preprocess_mm_data(self._text_only_config())
+    self.assertIsNone(out.pixel_values)
+
+  def test_image_grid_thw_is_none(self):
+    out = preprocess_mm_data(self._text_only_config())
+    self.assertIsNone(out.image_grid_thw)
+
+  def test_pixel_values_videos_is_none(self):
+    out = preprocess_mm_data(self._text_only_config())
+    self.assertIsNone(out.pixel_values_videos)
+
+  def test_video_grid_thw_is_none(self):
+    out = preprocess_mm_data(self._text_only_config())
+    self.assertIsNone(out.video_grid_thw)
+
+  def test_image_token_expansion_is_noop(self):
+    """No image placeholders → tokens are returned unchanged."""
+    out = preprocess_mm_data(self._text_only_config())
+    tokens = np.array([100, 200, 300], dtype=np.int32)
+    result = add_extra_tokens_for_images_qwen3_vl(tokens, out)
+    np.testing.assert_array_equal(result, tokens)
+
+  def test_video_token_expansion_is_noop(self):
+    """No video placeholders → tokens are returned unchanged."""
+    out = preprocess_mm_data(self._text_only_config())
+    tokens = np.array([100, 200, 300], dtype=np.int32)
+    result = add_extra_tokens_for_video_qwen3_vl(tokens, out)
+    np.testing.assert_array_equal(result, tokens)
+
+  def test_image_offsets_zero(self):
+    out = preprocess_mm_data(self._text_only_config())
+    self.assertEqual(get_image_offsets_qwen3_vl(out), 0)
+
+  def test_video_offsets_zero(self):
+    out = preprocess_mm_data(self._text_only_config())
+    self.assertEqual(get_video_offsets_qwen3_vl(out), 0)
+
+  def test_reformat_prompt_text_only(self):
+    """No vision tokens are injected for text-only prompts."""
+    result = reformat_prompt_qwen3_vl(
+        prompt="What is the capital of France?",
+        num_images=0,
+        num_videos=0,
+    )
+    self.assertIn("What is the capital of France?", result)
+    self.assertNotIn(QWEN3_VL_IMAGE_PAD_STR, result)
+    self.assertNotIn(QWEN3_VL_VIDEO_PAD_STR, result)
+
+  def test_config_without_image_path_attr(self):
+    """image_path and video_path attrs may be absent entirely (text-only)."""
+    config = types.SimpleNamespace(model_name="qwen3-vl-2b")
+    out = preprocess_mm_data(config)
+    self.assertIsInstance(out, Qwen3VLPreprocessorOutput)
+    self.assertEqual(out.num_images, 0)
+    self.assertEqual(out.num_videos, 0)
 
 
 if __name__ == "__main__":

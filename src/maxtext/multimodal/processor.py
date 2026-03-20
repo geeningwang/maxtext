@@ -23,16 +23,21 @@ def preprocess_mm_data(config):
 
   Args:
     config: A `pyconfig.Config` (or `types.SimpleNamespace`) object with at
-      minimum ``config.model_name`` and ``config.image_path`` set.
-      Callers that receive the image path at call time (e.g. per-request in a
-      server) should construct a ``types.SimpleNamespace`` rather than
-      modifying the shared ``pyconfig`` object.
+      minimum ``config.model_name`` set.  ``config.image_path`` and
+      ``config.video_path`` are optional — both may be absent or empty for
+      text-only inputs (qwen3-vl only; other models still require an image).
+      Callers that receive paths at call time (e.g. per-request in a server)
+      should construct a ``types.SimpleNamespace`` rather than modifying the
+      shared ``pyconfig`` object.
 
   Returns:
-    A `PreprocessorOutput` object containing the processed multimodal data.
+    A `PreprocessorOutput` (or model-specific subclass) containing the
+    processed multimodal data.  For text-only qwen3-vl inputs the returned
+    object has ``num_images=0``, ``num_videos=0``, and all visual fields set
+    to ``None``.
   """
   processor_outputs = mm_utils.PreprocessorOutput()
-  path = config.image_path
+  path = getattr(config, "image_path", "")
 
   if config.model_name in ["gemma3-4b", "gemma3-12b", "gemma3-27b"]:
     from maxtext.multimodal.processor_gemma3 import preprocess_mm_data_gemma3  # pylint: disable=import-outside-toplevel
@@ -49,16 +54,33 @@ def preprocess_mm_data(config):
 
     processor_outputs = preprocess_mm_data_qwen3_omni(config)
   elif config.model_name in ["qwen3-vl-2b", "qwen3-vl-8b"]:
-    has_video = bool(getattr(config, "video_path", ""))
-    if has_video:
-      from maxtext.multimodal.processor_qwen3_vl import preprocess_video_qwen3_vl  # pylint: disable=import-outside-toplevel
+    from maxtext.multimodal.processor_qwen3_vl import (  # pylint: disable=import-outside-toplevel
+        preprocess_image_qwen3_vl,
+        preprocess_video_qwen3_vl,
+        merge_preprocessor_outputs_qwen3_vl,
+    )
 
-      processor_outputs = preprocess_video_qwen3_vl(config.video_path)
-    else:
-      from maxtext.multimodal.processor_qwen3_vl import preprocess_mm_data_qwen3_vl  # pylint: disable=import-outside-toplevel
+    video_path = getattr(config, "video_path", "")
+    image_out = None
+    video_out = None
 
+    if path:
       images = [mm_utils.load_image_from_path(p) for p in path.split(",")]
-      processor_outputs = preprocess_mm_data_qwen3_vl(images)  # dynamic resolution
+      image_out = preprocess_image_qwen3_vl(images)
+
+    if video_path:
+      video_out = preprocess_video_qwen3_vl(video_path)
+
+    if image_out is not None and video_out is not None:
+      processor_outputs = merge_preprocessor_outputs_qwen3_vl(image_out, video_out)
+    elif image_out is not None:
+      processor_outputs = image_out
+    elif video_out is not None:
+      processor_outputs = video_out
+    else:
+      # Text-only input: return an empty output with no visual fields.
+      from maxtext.multimodal.processor_qwen3_vl import Qwen3VLPreprocessorOutput  # pylint: disable=import-outside-toplevel
+      processor_outputs = Qwen3VLPreprocessorOutput()
   else:
     raise ValueError(f"Model {config.model_name} not supported for multimodal preprocessing.")
 
@@ -76,11 +98,11 @@ def preprocess_image_for_training(image, model_name):
 
     return preprocess_mm_data_llama4(image)
   elif model_name in ["qwen3-vl-2b", "qwen3-vl-8b"]:
-    from maxtext.multimodal.processor_qwen3_vl import preprocess_mm_data_qwen3_vl, QWEN3_VL_IMAGE_SIZE  # pylint: disable=import-outside-toplevel
+    from maxtext.multimodal.processor_qwen3_vl import preprocess_image_qwen3_vl, QWEN3_VL_IMAGE_SIZE  # pylint: disable=import-outside-toplevel
 
     # Force the fixed 448×448 resolution for training so all images in the
     # batch have identical spatial shapes and can be stacked.
-    return preprocess_mm_data_qwen3_vl(
+    return preprocess_image_qwen3_vl(
         image, force_size=(QWEN3_VL_IMAGE_SIZE, QWEN3_VL_IMAGE_SIZE)
     )
   else:
@@ -111,9 +133,12 @@ def get_image_offsets(config, processor_output: mm_utils.PreprocessorOutput | No
 
     return get_mm_offsets_qwen3_omni(config, processor_output)
   elif model_name in ["qwen3-vl-2b", "qwen3-vl-8b"]:
-    from maxtext.multimodal.processor_qwen3_vl import get_image_offsets_qwen3_vl  # pylint: disable=import-outside-toplevel
+    from maxtext.multimodal.processor_qwen3_vl import (  # pylint: disable=import-outside-toplevel
+        get_image_offsets_qwen3_vl,
+        get_video_offsets_qwen3_vl,
+    )
 
-    return get_image_offsets_qwen3_vl(processor_output)
+    return get_image_offsets_qwen3_vl(processor_output) + get_video_offsets_qwen3_vl(processor_output)
   else:
     return 0
 
@@ -141,7 +166,9 @@ def reformat_prompt(prompt, image_placeholder, model_name, num_images, video_pla
   elif model_name in ["qwen3-vl-2b", "qwen3-vl-8b"]:
     from maxtext.multimodal.processor_qwen3_vl import reformat_prompt_qwen3_vl  # pylint: disable=import-outside-toplevel
 
-    return reformat_prompt_qwen3_vl(prompt, image_placeholder, num_images)
+    return reformat_prompt_qwen3_vl(
+        prompt, num_images, num_videos, image_placeholder, video_placeholder
+    )
   else:
     return prompt
 
@@ -176,9 +203,14 @@ def prepare_text_for_image_fusion(tokens, config, processor_output=None):
 
     return add_extra_tokens_for_qwen3_omni(tokens, config, processor_output)
   elif config.model_name in ["qwen3-vl-2b", "qwen3-vl-8b"]:
-    from maxtext.multimodal.processor_qwen3_vl import add_extra_tokens_for_images_qwen3_vl  # pylint: disable=import-outside-toplevel
+    from maxtext.multimodal.processor_qwen3_vl import (  # pylint: disable=import-outside-toplevel
+        add_extra_tokens_for_images_qwen3_vl,
+        add_extra_tokens_for_video_qwen3_vl,
+    )
 
-    return add_extra_tokens_for_images_qwen3_vl(tokens, processor_output)
+    tokens = add_extra_tokens_for_images_qwen3_vl(tokens, processor_output)
+    tokens = add_extra_tokens_for_video_qwen3_vl(tokens, processor_output)
+    return tokens
   else:
     raise ValueError(f"Model {config.model_name} does not support multimodal inference.")
 
