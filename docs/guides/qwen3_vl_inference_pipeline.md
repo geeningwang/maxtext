@@ -211,16 +211,16 @@ Called automatically by `preprocess_mm_data` when both `image_path` and `video_p
 ## Module 2 — Prompt Formatter
 
 **File:** `src/maxtext/multimodal/processor_qwen3_vl.py`  
-**Function:** `reformat_prompt_qwen3_vl(prompt, image_placeholder, num_images, video_placeholder="<|video|>", num_videos=0)`
+**Function:** `reformat_prompt_qwen3_vl(prompt, num_images, num_videos=0, image_placeholder="<|image|>", video_placeholder="<|video|>")`
 
 ### Input
 | Arg | Type | Default | Description |
 |-----|------|---------|-------------|
 | `prompt` | str | — | Raw user prompt, may contain placeholders |
-| `image_placeholder` | str | — | Generic image placeholder (e.g. `"<\|image\|>"`) |
 | `num_images` | int | — | Number of images for this example |
-| `video_placeholder` | str | `"<\|video\|>"` | Generic video placeholder |
 | `num_videos` | int | `0` | Number of videos for this example |
+| `image_placeholder` | str | `"<\|image\|>"` | Generic image placeholder |
+| `video_placeholder` | str | `"<\|video\|>"` | Generic video placeholder |
 
 ### Output
 Formatted string (Qwen chat template). Examples:
@@ -409,20 +409,21 @@ Runs a dummy forward pass to trace all cache buffer shapes, then returns zeroed 
 
 | Stage | Input shape | Output shape | Notes |
 |-------|------------|-------------|-------|
-| `patch_embed` (3D conv) | `(batch, 3, 2, 448, 448)` | `(batch, 784, 1536)` | Spatial+temporal patchify |
-| Raster→block permutation | `(batch, 784, 1536)` | `(batch, 784, 1536)` | Reorder to 2×2 block order for PatchMerger |
-| Pos embed + 32 ViT blocks | `(batch, 784, 1536)` | `(batch, 784, 1536)` | Self-attention with 2D RoPE |
-| **Projector (PatchMerger)** | `(batch, 784, 1536)` | `(batch, 196, emb_dim)` | 2×2 merge → LN → Linear → GELU → Linear |
+| `patch_embed` (3D conv) | `(batch, 3, 2, 448, 448)` | `(batch, 784, hidden_size_for_vit)` | Spatial+temporal patchify |
+| Raster→block permutation | `(batch, 784, hidden_size_for_vit)` | `(batch, 784, hidden_size_for_vit)` | Reorder to 2×2 block order for PatchMerger |
+| Pos embed + ViT blocks | `(batch, 784, hidden_size_for_vit)` | `(batch, 784, hidden_size_for_vit)` | Self-attention with 2D RoPE; 24 blocks (2B) / 27 blocks (8B) |
+| **Projector (PatchMerger)** | `(batch, 784, hidden_size_for_vit)` | `(batch, 196, out_hidden_size_for_vit)` | 2×2 merge → LN → Linear → GELU → Linear |
 
-`emb_dim` = 1536 (qwen3-vl-2b) or 3584 (qwen3-vl-8b).
+`hidden_size_for_vit` = 1024 (qwen3-vl-2b) or 1152 (qwen3-vl-8b). `out_hidden_size_for_vit` = 2048 (qwen3-vl-2b) or 4096 (qwen3-vl-8b) — equals the LLM `emb_dim` (`base_emb_dim`).
 
-**PatchMerger detail:**
+**PatchMerger detail (qwen3-vl-2b; `hidden_size_for_vit`=1024, `out_hidden_size_for_vit`=2048):**
 ```
-input:  (batch, 784, 1536)
-reshape: (batch, 196, 4×1536) = (batch, 196, 6144)
-LN → Linear(6144→6144) → GELU → Linear(6144→emb_dim)
-output: (batch, 196, emb_dim)
+input:   (batch, 784, 1024)
+reshape: (batch, 196, 4×1024) = (batch, 196, 4096)
+LN → Linear(4096→4096) → GELU → Linear(4096→2048)
+output:  (batch, 196, 2048)
 ```
+For qwen3-vl-8b (`hidden_size_for_vit`=1152, `out_hidden_size_for_vit`=4096): reshape gives `(batch, 196, 4608)`; MLP is 4608→4608→4096.
 
 The `freeze_vision_encoder_params` config flag applies `jax.lax.stop_gradient` to the ViT output before the projector, keeping the ViT frozen during SFT.
 
@@ -541,14 +542,14 @@ pytest tests/integration/qwen3_vl_checkpoint_validation_test.py -k "determinism"
 
 | Config key | Typical value (2B) | Description |
 |------------|--------------------|-------------|
-| `hidden_size_for_vit` | 1536 | ViT hidden dimension |
-| `out_hidden_size_for_vit` | 1536 (2B) / 3584 (8B) | Projector output = LLM `emb_dim` |
+| `hidden_size_for_vit` | 1024 (2B) / 1152 (8B) | ViT hidden dimension |
+| `out_hidden_size_for_vit` | 2048 (2B) / 4096 (8B) | Projector output = LLM `emb_dim` |
 | `patch_size_for_vit` | 16 | Spatial patch size |
 | `temporal_patch_size_for_vit` | 2 | Temporal patch size |
 | `spatial_merge_size_for_vit` | 2 | 2×2 merge → 4× token reduction |
-| `num_hidden_layers_for_vit` | 32 | ViT depth |
-| `emb_dim` | 1536 (2B) / 3584 (8B) | LLM embedding dimension |
-| `num_decoder_layers` | 28 (2B) / 28 (8B) | LLM depth |
+| `num_hidden_layers_for_vit` | 24 (2B) / 27 (8B) | ViT depth |
+| `emb_dim` | 2048 (2B) / 4096 (8B) | LLM embedding dimension |
+| `num_decoder_layers` | 28 (2B) / 36 (8B) | LLM depth |
 
 ---
 
