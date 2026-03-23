@@ -144,16 +144,17 @@ def main(argv: Sequence[str]) -> None:
       from maxtext.multimodal import processor_qwen3_omni  # pylint: disable=import-outside-toplevel
 
       position_ids, mrope_position_deltas = processor_qwen3_omni.get_rope_index(
-          input_ids=tokens,
+          input_ids=tokens[np.newaxis].astype(np.int32),
           image_grid_thw=processor_outputs.image_grid_thw,  # pytype: disable=attribute-error
           video_grid_thw=processor_outputs.video_grid_thw,  # pytype: disable=attribute-error
-          attention_mask=np.ones_like(tokens),
+          attention_mask=np.ones_like(tokens)[np.newaxis],
           use_audio_in_video=config.use_audio and getattr(processor_outputs, 'num_videos', 0) > 0,
-          audio_lengths=processor_outputs.audio_lengths,  # pytype: disable=attribute-error
-          second_per_grids=processor_outputs.video_second_per_grid,  # pytype: disable=attribute-error
+          audio_lengths=getattr(processor_outputs, 'audio_lengths', None),
+          second_per_grids=getattr(processor_outputs, 'video_second_per_grid', None),
           spatial_merge_size=config.spatial_merge_size_for_vit,  # pytype: disable=attribute-error
           position_id_per_seconds=config.position_id_per_seconds,
       )
+      mrope_position_deltas = mrope_position_deltas.astype(np.int32)
 
   assert (
       true_length <= config.max_prefill_predict_length
