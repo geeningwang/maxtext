@@ -311,6 +311,13 @@ def run_benchmarks(config):
   text = config.prompt
   metadata = engine.get_tokenizer()
   tokenizer_model = engine.build_tokenizer(metadata)
+  # Models that use chat-template format (e.g. Qwen3) have no standard BOS token;
+  # using is_bos=True would inject a None token and cause a JAX type error.
+  try:
+    _has_chat_template = bool(getattr(tokenizer_model.tokenizer, "chat_template", False))
+  except AttributeError:
+    _has_chat_template = False
+  _use_bos = not _has_chat_template
   rng, rng_init_decode = jax.random.split(rng)
 
   generate_executable, params, decode_state_executable = engine.aot_compile(params, pass_rng_shape=True)
@@ -333,7 +340,7 @@ def run_benchmarks(config):
 
     for prefill_length in prefill_lengths:
       prefill_tokens[prefill_length], prefill_true_lengths[prefill_length] = tokenizer_model.encode(
-          text, is_bos=True, prefill_lengths=[prefill_length]
+          text, is_bos=_use_bos, prefill_lengths=[prefill_length]
       )
 
       key_shape = jax.ShapeDtypeStruct([prefill_length], jax.numpy.dtype("int32"))
