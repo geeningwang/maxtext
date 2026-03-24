@@ -35,11 +35,66 @@ from PIL import Image
 BACKEND = "engine"
 DEFAULT_CHECKPOINT = "tests/assets/qwen3_vl_2b_orbax"
 DEFAULT_TOKENIZER  = "Qwen/Qwen3-VL-2B-Instruct"
-DEFAULT_PROMPT     = "Describe what you see in the image."
+DEFAULT_PROMPT     = (
+    "There are two images and a video clip provided. "
+    "Describe what you see in each image and summarize the main scene in the video."
+)
+DEFAULT_VIDEO   = "tests/assets/video.mp4"
+_N_VIDEO_FRAMES = 2    # frames uniformly sampled from the video clip
 
-_VIT_INPUT_SIZE = 448   # images are resized to this spatial resolution
-_MAX_PREFILL    = 512   # max_prefill_predict_length; must cover the full prompt
-_MAX_TARGET     = 1024  # max_target_length  (prefill + decode steps)
+_VIT_INPUT_SIZE = 448   # all visuals are resized to this spatial resolution
+_MAX_PREFILL    = 1024  # max_prefill_predict_length; covers 4×196 visual + prompt
+_MAX_TARGET     = 1536  # max_target_length  (prefill + decode steps)
+
+
+# ---------------------------------------------------------------------------
+# Video-frame sampling helper
+# ---------------------------------------------------------------------------
+
+def _sample_video_frames(video_path: str, n_frames: int = _N_VIDEO_FRAMES) -> list:
+  """Uniformly sample *n_frames* from a video file.
+
+  Supports GIF / APNG (via PIL) and MP4 / AVI / MOV (via cv2).
+
+  Returns:
+    list of (H, W, 3) uint8 ``np.ndarray`` frames.
+  """
+  frames: list = []
+
+  # PIL handles GIF / APNG / multi-page TIFF.
+  try:
+    from PIL import ImageSequence  # pylint: disable=import-outside-toplevel
+    pil = Image.open(video_path)
+    frames = [np.array(f.convert("RGB")) for f in ImageSequence.Iterator(pil)]
+    if len(frames) <= 1:
+      frames = []
+  except Exception:  # pylint: disable=broad-except
+    frames = []
+
+  # cv2 for real video containers (MP4 / AVI / MOV / …).
+  if not frames:
+    try:
+      import cv2  # pylint: disable=import-outside-toplevel
+      cap = cv2.VideoCapture(video_path)
+      while True:
+        ret, frame = cap.read()
+        if not ret:
+          break
+        frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+      cap.release()
+    except ImportError as exc:
+      raise RuntimeError(
+          f"Cannot decode '{video_path}': install opencv-python-headless\n"
+          "  pip install opencv-python-headless"
+      ) from exc
+
+  if not frames:
+    raise RuntimeError(f"No frames decoded from: {video_path}")
+  if len(frames) == 1:
+    frames = frames * n_frames  # replicate single frame
+
+  indices = np.linspace(0, len(frames) - 1, n_frames).round().astype(int)
+  return [frames[i] for i in indices]
 
 
 # ---------------------------------------------------------------------------
@@ -59,6 +114,8 @@ def _print_result(result: dict, output_json: bool = False) -> None:
   )
   print("=" * W)
   print(f"Image(s) : {', '.join(result['image'])}")
+  if result.get("video"):
+    print(f"Video    : {result['video']}")
   print(f"Prompt   : {result['prompt']!r}")
   print("-" * W)
   print("RESPONSE")
@@ -76,19 +133,28 @@ def _print_result(result: dict, output_json: bool = False) -> None:
 # Image / tokenisation helpers  (shared with qwen3_vl_demo_jax.py)
 # ---------------------------------------------------------------------------
 
-def _build_input_ids(tokenizer, prompt: str, num_vis_tokens: int) -> list:
+def _build_input_ids(tokenizer, prompt: str, vis_token_counts: list) -> list:
   """Return the full prompt token IDs with visual placeholders embedded.
 
-  Inserts exactly *num_vis_tokens* ``<|image_pad|>`` tokens at the image
-  position inside the chat template (Qwen3-VL token ID 151655).
+  Builds one ``<|vision_start|><|image_pad|>×N<|vision_end|>`` section for
+  each entry in *vis_token_counts*.  The sections are prepended to *prompt*
+  inside the Qwen3-VL chat template.
+
+  Args:
+    tokenizer:        Qwen3-VL tokenizer.
+    prompt:           User text question / instruction.
+    vis_token_counts: List of visual token counts, one per visual section
+                      (image or video frame).  E.g. ``[196, 196, 196, 196]``
+                      for 2 images + 2 video frames at 448×448.
   """
   IMAGE_TOKEN = "<|image_pad|>"
-  image_section = (
-      "<|vision_start|>" + IMAGE_TOKEN * num_vis_tokens + "<|vision_end|>"
+  sections = "".join(
+      "<|vision_start|>" + IMAGE_TOKEN * n + "<|vision_end|>"
+      for n in vis_token_counts
   )
   messages = [
       {"role": "system", "content": "You are a helpful assistant."},
-      {"role": "user", "content": image_section + prompt},
+      {"role": "user",   "content": sections + prompt},
   ]
   text = tokenizer.apply_chat_template(
       messages, tokenize=False, add_generation_prompt=True
@@ -161,7 +227,7 @@ class Qwen3VLDemoEngine:
 
     print(
         f"[{BACKEND}] Ready.  "
-        f"(visual tokens per image: {self._num_vis_tokens}, "
+        f"(visual tokens per entry: {self._num_vis_tokens}, "
         f"prefill length: {_MAX_PREFILL}, "
         f"max target: {_MAX_TARGET})"
     )
@@ -169,78 +235,102 @@ class Qwen3VLDemoEngine:
   def run(
       self,
       image_paths: list[str],
+      video_path: str = "",
       prompt: str = DEFAULT_PROMPT,
       max_new_tokens: int = 512,
       verbose: bool = False,
   ) -> dict:
-    """Run end-to-end generation on *image_paths* with *prompt*.
+    """Run end-to-end generation on *image_paths* and optional *video_path*.
+
+    Pass two images and a video to demonstrate the full multimodal capability:
+    ``image_paths=["img1.jpg", "img2.jpg"]`` and ``video_path="clip.mp4"``.
+    Video frames are sampled uniformly and processed through the same ViT
+    backbone as images, giving the model full spatial understanding of each
+    frame.
 
     Args:
-      image_paths:    Input image paths.  Only the first image is used.
+      image_paths:    Input image paths (typically 2 for the full demo).
+      video_path:     Optional path to a video file (MP4, AVI, GIF, …).
+                      ``_N_VIDEO_FRAMES`` frames are sampled uniformly.
       prompt:         Text question / instruction.
       max_new_tokens: Maximum autoregressive steps.
       verbose:        Print progress information.
 
     Returns:
-      dict with keys ``backend``, ``model``, ``image``, ``prompt``,
-      ``response``, ``tokens``, ``elapsed``, ``tok_per_sec``.
+      dict with keys ``backend``, ``model``, ``image``, ``video``,
+      ``prompt``, ``response``, ``tokens``, ``elapsed``, ``tok_per_sec``.
     """
     from maxtext.multimodal.processor_qwen3_omni import get_rope_index
+    from maxtext.multimodal.processor_qwen3_vl import preprocess_image_qwen3_vl
 
-    image_path = image_paths[0]
-    if not os.path.exists(image_path):
-      raise FileNotFoundError(f"Image not found: {image_path}")
+    # ── 1. Load all visual inputs ───────────────────────────────────────────
+    all_frames_np: list = []
+    for p in image_paths:
+      if not os.path.exists(p):
+        raise FileNotFoundError(f"Image not found: {p}")
+      all_frames_np.append(np.array(Image.open(p).convert("RGB")))
 
-    # ── 1. Tokenise prompt with visual placeholders ─────────────────────────
-    input_ids = _build_input_ids(self._tokenizer, prompt, self._num_vis_tokens)
+    n_images = len(all_frames_np)
+
+    if video_path:
+      if not os.path.exists(video_path):
+        raise FileNotFoundError(f"Video not found: {video_path}")
+      video_frames = _sample_video_frames(video_path, n_frames=_N_VIDEO_FRAMES)
+      all_frames_np.extend(video_frames)
+
+    n_total = len(all_frames_np)
+
+    # Preprocess all visuals at a fixed 448×448 so every entry produces the
+    # same (1, 28, 28) grid and all pixel tensors can be stacked into one array.
+    mm_out = preprocess_image_qwen3_vl(
+        all_frames_np, force_size=(_VIT_INPUT_SIZE, _VIT_INPUT_SIZE)
+    )
+    pixel_values  = jnp.asarray(mm_out.pixel_values)  # (N, 3, 2, 448, 448)
+    image_grid_thw = mm_out.image_grid_thw              # (N, 3)
+
+    if verbose:
+      extra = f" + {n_total - n_images} video frame(s)" if video_path else ""
+      print(f"[{BACKEND}] Visual inputs: {n_images} image(s){extra}  "
+            f"pixel_values: {pixel_values.shape}")
+
+    # ── 2. Compute per-section visual token counts ──────────────────────────
+    merge = self._config.spatial_merge_size_for_vit  # 2
+    vis_token_counts = [
+        int(g[0] * g[1] * g[2]) // (merge ** 2)
+        for g in image_grid_thw
+    ]  # [196, 196, …] for entries at 448×448
+
+    # ── 3. Tokenise prompt with all visual sections ─────────────────────────
+    input_ids = _build_input_ids(self._tokenizer, prompt, vis_token_counts)
     seq_len   = len(input_ids)
     assert seq_len <= _MAX_PREFILL, (
         f"Prompt length {seq_len} exceeds max_prefill_predict_length {_MAX_PREFILL}. "
-        "Increase _MAX_PREFILL or shorten the prompt."
+        "Increase _MAX_PREFILL or reduce the number of visual inputs."
     )
 
-    # Pad to exactly _MAX_PREFILL for MaxEngine.
-    # MaxEngine's _prefill_jit calls jnp.expand_dims(padded_tokens, 0) internally,
-    # so we must pass a 1D array; do NOT add a batch dimension here.
     padded = np.zeros(_MAX_PREFILL, dtype=np.int32)
     padded[:seq_len] = input_ids
-    padded_tokens = jnp.asarray(padded)  # (MAX_PREFILL,)
+    padded_tokens = jnp.asarray(padded)
 
     if verbose:
       print(f"[{BACKEND}] Prompt tokens: {seq_len}  (padded to {_MAX_PREFILL})")
 
-    # ── 2. Compute mRoPE position IDs ───────────────────────────────────────
-    merge   = self._config.spatial_merge_size_for_vit   # 2
-    patch   = self._config.patch_size_for_vit            # 16
-    grid_h  = _VIT_INPUT_SIZE // patch                   # 28
-    grid_w  = _VIT_INPUT_SIZE // patch                   # 28
-    image_grid_thw = np.array([[1, grid_h, grid_w]], dtype=np.int32)  # (1, 3)
-    attn_mask      = np.zeros((1, _MAX_PREFILL), dtype=np.int32)
-    attn_mask[0, :seq_len] = 1  # 1 = real token, 0 = padding
+    # ── 4. Compute mRoPE position IDs ───────────────────────────────────────
+    attn_mask = np.zeros((1, _MAX_PREFILL), dtype=np.int32)
+    attn_mask[0, :seq_len] = 1
 
     position_ids, mrope_deltas = get_rope_index(
         input_ids=padded.reshape(1, -1).astype(np.int32),
         image_grid_thw=image_grid_thw,
         attention_mask=attn_mask,
         spatial_merge_size=merge,
-    )  # (3, 1, MAX_PREFILL), (1, 1)
-    # MaxEngine's _prefill_jit computes next_pos as int32 + mrope_deltas; cast
-    # mrope_deltas to int32 to avoid a dtype mismatch in the insert step.
+    )
     mrope_deltas = mrope_deltas.astype(np.int32)
 
     if verbose:
       print(f"[{BACKEND}] mRoPE positions computed: {position_ids.shape}")
 
-    # ── 3. Preprocess image for the vision encoder ───────────────────────────
-    import types
-    from maxtext.multimodal.processor import preprocess_mm_data
-    pixel_values = jnp.asarray(preprocess_mm_data(
-        types.SimpleNamespace(model_name=self._config.model_name, image_path=image_path)
-    ).pixel_values)  # (1,3,2,H,W)
-    if verbose:
-      print(f"[{BACKEND}] Pixel values shape: {pixel_values.shape}")
-
-    # ── 4. Prefill ───────────────────────────────────────────────────────────
+    # ── 5. Prefill ───────────────────────────────────────────────────────────
     rng = jax.random.PRNGKey(42)
     rng, rng_prefill = jax.random.split(rng)
     if verbose:
@@ -261,21 +351,18 @@ class Qwen3VLDemoEngine:
     if verbose:
       print(f"[{BACKEND}] Prefill done in {time.time()-t0:.1f}s")
 
-    # ── 5. Insert prefill into decode state ─────────────────────────────────
+    # ── 6. Insert prefill into decode state ─────────────────────────────────
     decode_state = self._engine.insert(
         prefill_result, self._decode_state_init, slot=0
     )
 
-    # ── 6. Decode loop ───────────────────────────────────────────────────────
-    EOS_ID  = self._tokenizer.eos_token_id
-
-    # First token comes from prefill
+    # ── 7. Decode loop ───────────────────────────────────────────────────────
+    EOS_ID    = self._tokenizer.eos_token_id
     first_tok = first_token.get_result_at_slot(0).tokens.item()
     generated = [first_tok]
     if verbose:
       print(f"[{BACKEND}] First token: {first_tok}")
 
-    gen_start = time.time()
     for step in range(max_new_tokens - 1):
       rng, rng_gen = jax.random.split(rng)
       decode_state, sampled = self._engine.generate(
@@ -299,6 +386,7 @@ class Qwen3VLDemoEngine:
         "backend":     BACKEND,
         "model":       "qwen3-vl-2b (MaxEngine checkpoint)",
         "image":       image_paths,
+        "video":       video_path,
         "prompt":      prompt,
         "response":    response,
         "tokens":      n_tokens,
@@ -316,7 +404,15 @@ def main() -> None:
       description="Qwen3-VL MaxEngine serving-API inference demo"
   )
   parser.add_argument(
-      "--image", nargs="+", required=True, help="Input image path(s)"
+      "--image", nargs="+", required=True,
+      help="Input image paths — provide 2 for the full demo, e.g. "
+           "--image tests/assets/image1.jpg tests/assets/image2.jpg"
+  )
+  parser.add_argument(
+      "--video", default="", metavar="PATH",
+      help=f"Optional video file (MP4 / AVI / GIF).  "
+           f"{_N_VIDEO_FRAMES} frames are sampled uniformly.  "
+           f"Example: --video {DEFAULT_VIDEO}"
   )
   parser.add_argument("--prompt", default=DEFAULT_PROMPT, help="Text prompt")
   parser.add_argument(
@@ -345,6 +441,7 @@ def main() -> None:
   )
   result = demo.run(
       image_paths=args.image,
+      video_path=args.video,
       prompt=args.prompt,
       max_new_tokens=args.max_tokens,
       verbose=args.verbose,

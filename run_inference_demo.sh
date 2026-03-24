@@ -2,10 +2,11 @@
 # Qwen3 / Qwen3-VL inference demo using decode.py
 #
 # Usage:
-#   bash run_inference_demo.sh                        # text-only Qwen3-4B
-#   bash run_inference_demo.sh --vl                   # Qwen3-VL-2B with default image
-#   bash run_inference_demo.sh --vl --image PATH      # Qwen3-VL-2B with custom image
-#   bash run_inference_demo.sh --prompt "…"           # custom prompt (works for both modes)
+#   bash run_inference_demo.sh                                          # text-only Qwen3-4B
+#   bash run_inference_demo.sh --vl                                     # Qwen3-VL-2B with default images + video
+#   bash run_inference_demo.sh --vl --image PATH1 PATH2          # custom images
+#   bash run_inference_demo.sh --vl --image PATH1 PATH2 --video PATH  # custom images + video
+#   bash run_inference_demo.sh --prompt "…"                             # custom prompt
 #
 # Prerequisites (first run only):
 #   The script will auto-convert HF weights if the checkpoint is not found in GCS.
@@ -19,7 +20,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BASE_OUTPUT_DIR="gs://jingnw_tpu"
 TOKENIZER_PATH="src/maxtext/assets/tokenizers/qwen3-tokenizer"
-DEFAULT_IMAGE="tests/assets/image1.jpg"
+DEFAULT_IMAGE1="tests/assets/image1.jpg"
+DEFAULT_IMAGE2="tests/assets/image2.jpg"
+DEFAULT_VIDEO="tests/assets/video.mp4"
 
 # Parallelism defaults (auto = use all chips via -1)
 # ICI_AR: Autoregressive (batch) parallelism — best for small models on many chips.
@@ -41,22 +44,31 @@ TEXT_MAX_TARGET=1024
 # Multimodal defaults
 VL_MODEL="qwen3-vl-2b"
 VL_CKPT="${BASE_OUTPUT_DIR}/qwen3-vl-2b-converted/0/items"
-VL_PROMPT="Describe what you see in the image."
+VL_PROMPT="There are two images and a video clip provided. Describe what you see in each image and summarize the main scene in the video."
 VL_MAX_PREFILL=1024
 VL_MAX_TARGET=1536
 
 # ── Argument parsing ─────────────────────────────────────────────────────────
 MODE="text"
-IMAGE_PATH="${DEFAULT_IMAGE}"
+IMAGE_PATHS=("${DEFAULT_IMAGE1}" "${DEFAULT_IMAGE2}")  # default: 2 images
+VIDEO_PATH="${DEFAULT_VIDEO}"
 CUSTOM_PROMPT=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --vl)        MODE="vl"         ; shift ;;
-    --image)     IMAGE_PATH="$2"   ; shift 2 ;;
-    --prompt)    CUSTOM_PROMPT="$2"; shift 2 ;;
-    --ar)        ICI_AR="$2"       ; shift 2 ;;   # e.g. --ar 4
-    --tp)        ICI_TP="$2"       ; shift 2 ;;   # e.g. --tp 4
+    --vl)   MODE="vl"; shift ;;
+    --image)
+      IMAGE_PATHS=()
+      shift
+      while [[ $# -gt 0 && "${1:0:2}" != "--" ]]; do
+        IMAGE_PATHS+=("$1")
+        shift
+      done
+      ;;
+    --video)     VIDEO_PATH="$2"    ; shift 2 ;;
+    --prompt)    CUSTOM_PROMPT="$2" ; shift 2 ;;
+    --ar)        ICI_AR="$2"        ; shift 2 ;;   # e.g. --ar 4
+    --tp)        ICI_TP="$2"        ; shift 2 ;;   # e.g. --tp 4
     *) echo "Unknown option: $1" >&2; exit 1 ;;
   esac
 done
@@ -68,7 +80,9 @@ if [[ "${MODE}" == "vl" ]]; then
   PROMPT="${CUSTOM_PROMPT:-${VL_PROMPT}}"
   MAX_PREFILL="${VL_MAX_PREFILL}"
   MAX_TARGET="${VL_MAX_TARGET}"
-  EXTRA_ARGS="image_path=\"${IMAGE_PATH}\""
+  # Comma-separated image paths; decode.py stacks them as multiple visual entries.
+  IMAGE_LIST=$(IFS=, ; echo "${IMAGE_PATHS[*]}")
+  EXTRA_ARGS="image_path=\"${IMAGE_LIST}\""
 else
   MODEL="${TEXT_MODEL}"
   CKPT="${TEXT_CKPT}"
@@ -99,7 +113,12 @@ fi
 echo ""
 echo "Running ${MODEL} inference (mode=${MODE}) …"
 echo "  Prompt  : ${PROMPT}"
-[[ "${MODE}" == "vl" ]] && echo "  Image   : ${IMAGE_PATH}"
+if [[ "${MODE}" == "vl" ]]; then
+  for p in "${IMAGE_PATHS[@]}"; do
+    echo "  Image   : ${p}"
+  done
+  echo "  Video   : ${VIDEO_PATH}"
+fi
 echo "  Ckpt    : ${CKPT}"
 echo "  ICI AR  : ${ICI_AR}  (ici_autoregressive_parallelism; set --ar -1 to use all chips)"
 echo "  ICI TP  : ${ICI_TP}  (ici_tensor_parallelism)"

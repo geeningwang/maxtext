@@ -36,6 +36,7 @@ Usage::
 """
 
 import argparse
+import json
 import os
 import sys
 import time
@@ -49,17 +50,23 @@ from PIL import Image
 # Constants
 # ---------------------------------------------------------------------------
 
+BACKEND = "sft"
 DEFAULT_CHECKPOINT = "tests/assets/qwen3_vl_2b_orbax"
-DEFAULT_TOKENIZER  = "tests/assets/qwen3_vl_2b_hf"        # local path, no HF download
-DEFAULT_IMAGE      = "tests/assets/test_image.jpg"
+DEFAULT_TOKENIZER  = "Qwen/Qwen3-VL-2B-Instruct"
+DEFAULT_PROMPT     = (
+    "There are two images and a video clip provided. "
+    "Describe what you see in each image and summarize the main scene in the video."
+)
+DEFAULT_VIDEO      = "tests/assets/video.mp4"
 
 _VIT_INPUT_SIZE = 448   # images are resized to this spatial resolution
-_MAX_PREFILL    = 512   # max_prefill_predict_length
-_MAX_TARGET     = 1024  # max_target_length (prefill + decode buffer)
+_MAX_PREFILL    = 1024  # max_prefill_predict_length (4 visuals × 196 tokens + prompt)
+_MAX_TARGET     = 1536  # max_target_length (prefill + decode buffer)
 _MAX_TRAIN_LEN  = 512   # sequence length used during training steps
+_N_VIDEO_FRAMES = 2     # frames to sample from the input video
 
-# The question the model is asked about the image.
-DEMO_QUESTION     = "What is the dominant color in this image?"
+# SFT-specific: single-image training question used to prove weight updates.
+DEMO_QUESTION = "What is the dominant color in this image?"
 
 # The deliberately *wrong* answer we fine-tune the model to produce.
 # After training on this for enough steps the model should repeat it verbatim.
@@ -70,23 +77,93 @@ _PAD_ID           = 0
 
 
 # ---------------------------------------------------------------------------
-# Image helpers (shared with other demo scripts)
+# Video / image sampling helper
 # ---------------------------------------------------------------------------
+
+def _sample_video_frames(video_path: str, n_frames: int) -> list:
+  """Return ``n_frames`` uniformly-sampled frames from *video_path*.
+
+  Supports GIF/APNG (via PIL) and MP4/AVI/MOV (via cv2).
+  Each returned element is a ``(H, W, 3)`` uint8 ``np.ndarray``.
+  """
+  path_lower = video_path.lower()
+  if path_lower.endswith(".gif") or path_lower.endswith(".apng"):
+    from PIL import Image as _PILImage  # pylint: disable=import-outside-toplevel
+    gif = _PILImage.open(video_path)
+    frames = []
+    try:
+      while True:
+        frames.append(np.array(gif.convert("RGB")))
+        gif.seek(gif.tell() + 1)
+    except EOFError:
+      pass
+  else:
+    import cv2 as _cv2  # pylint: disable=import-error,import-outside-toplevel
+    cap = _cv2.VideoCapture(video_path)
+    total   = int(cap.get(_cv2.CAP_PROP_FRAME_COUNT))
+    indices = set(np.linspace(0, max(0, total - 1), n_frames, dtype=int).tolist())
+    frames  = []
+    idx     = 0
+    while True:
+      ok, frame = cap.read()
+      if not ok:
+        break
+      if idx in indices:
+        frames.append(_cv2.cvtColor(frame, _cv2.COLOR_BGR2RGB))
+      idx += 1
+    cap.release()
+
+  if not frames:
+    raise ValueError(f"No frames extracted from {video_path!r}")
+  indices2 = np.linspace(0, len(frames) - 1, n_frames, dtype=int)
+  return [frames[i] for i in indices2]
+
+
+# ---------------------------------------------------------------------------
+# Result formatting  (shared interface with all other demo scripts)
+# ---------------------------------------------------------------------------
+
+def _print_result(result: dict, output_json: bool = False) -> None:
+  """Print *result* in the common demo output format."""
+  if output_json:
+    print(json.dumps(result, indent=2))
+    return
+  W = 80
+  print("=" * W)
+  print(
+      f"Qwen3-VL Demo  "
+      f"[backend={result['backend']}  model={result.get('model', '')}]"
+  )
+  print("=" * W)
+  print(f"Image(s) : {', '.join(result['image'])}")
+  if result.get("video"):
+    print(f"Video    : {result['video']}")
+  print(f"Prompt   : {result['prompt']!r}")
+  print("-" * W)
+  print("RESPONSE")
+  print("-" * W)
+  print(result["response"] or "(empty — model produced only special tokens)")
+  print("-" * W)
+  print(
+      f"Generated {result['tokens']} tokens "
+      f"in {result['elapsed']}s  ({result['tok_per_sec']} tok/s)"
+  )
+  print("=" * W)
+
 
 # ---------------------------------------------------------------------------
 # Tokenisation helpers for MaxEngine inference
 # ---------------------------------------------------------------------------
 
-def _build_input_ids_for_engine(tokenizer, prompt: str, num_vis_tokens: int) -> list:
-  """Return prompt token IDs with image placeholders for MaxEngine prefill."""
-  image_section = (
-      "<|vision_start|>"
-      + "<|image_pad|>" * num_vis_tokens
-      + "<|vision_end|>"
+def _build_input_ids_for_engine(tokenizer, prompt: str, vis_token_counts: list) -> list:
+  """Return prompt token IDs with N image-placeholder sections for MaxEngine prefill."""
+  vision_sections = "".join(
+      "<|vision_start|>" + "<|image_pad|>" * n + "<|vision_end|>"
+      for n in vis_token_counts
   )
   messages = [
       {"role": "system", "content": "You are a helpful assistant."},
-      {"role": "user",   "content": image_section + prompt},
+      {"role": "user",   "content": vision_sections + prompt},
   ]
   text = tokenizer.apply_chat_template(
       messages, tokenize=False, add_generation_prompt=True
@@ -101,12 +178,11 @@ def _build_input_ids_for_engine(tokenizer, prompt: str, num_vis_tokens: int) -> 
 class _EngineRunner:
   """Thin wrapper that holds the engine + params and exposes ``run()``."""
 
-  def __init__(self, engine, params, config, tokenizer, num_vis_tokens: int):
-    self.engine         = engine
-    self.params         = params          # mutable — replaced after training
-    self.config         = config
-    self.tokenizer      = tokenizer
-    self.num_vis_tokens = num_vis_tokens
+  def __init__(self, engine, params, config, tokenizer):
+    self.engine    = engine
+    self.params    = params          # mutable — replaced after training
+    self.config    = config
+    self.tokenizer = tokenizer
     # NOTE: decode state is intentionally NOT pre-allocated here.
     # The engine.insert() JIT-compiled function uses donate_argnums on its
     # decode_state argument, which would consume a cached reference.  Instead
@@ -116,17 +192,39 @@ class _EngineRunner:
 
   def run(
       self,
-      image_path: str,
-      prompt: str = DEMO_QUESTION,
-      max_new_tokens: int = 128,
+      image_paths: list,
+      video_path: str = "",
+      prompt: str = DEFAULT_PROMPT,
+      max_new_tokens: int = 512,
       verbose: bool = False,
-  ) -> str:
-    """Run MaxEngine prefill + decode and return the response string."""
+  ) -> dict:
+    """Run MaxEngine prefill + decode and return a result dict."""
     from maxtext.multimodal.processor_qwen3_omni import get_rope_index
+    from maxtext.multimodal.processor_qwen3_vl import preprocess_image_qwen3_vl
 
-    # 1. Tokenise ─────────────────────────────────────────────────────────
+    # 0. Collect all visual frames ────────────────────────────────────────
+    all_frames_np = []
+    for img_path in image_paths:
+      img = Image.open(img_path).convert("RGB")
+      all_frames_np.append(np.array(img))
+    if video_path:
+      all_frames_np.extend(_sample_video_frames(video_path, _N_VIDEO_FRAMES))
+
+    # 1. Preprocess all visual inputs ─────────────────────────────────────
+    merge = self.config.spatial_merge_size_for_vit   # 2
+    pp = preprocess_image_qwen3_vl(
+        all_frames_np, force_size=(_VIT_INPUT_SIZE, _VIT_INPUT_SIZE)
+    )
+    pixel_values   = pp.pixel_values    # (N, 3, 2, H, W)
+    image_grid_thw = pp.image_grid_thw  # (N, 3)
+    vis_token_counts = [
+        int((row[1] // merge) * (row[2] // merge))
+        for row in image_grid_thw
+    ]
+
+    # 2. Tokenise ─────────────────────────────────────────────────────────
     input_ids = _build_input_ids_for_engine(
-        self.tokenizer, prompt, self.num_vis_tokens
+        self.tokenizer, prompt, vis_token_counts
     )
     seq_len = len(input_ids)
     assert seq_len <= _MAX_PREFILL, (
@@ -137,13 +235,8 @@ class _EngineRunner:
     padded[:seq_len] = input_ids
     padded_tokens = jnp.asarray(padded)  # (MAX_PREFILL,)
 
-    # 2. mRoPE positions ──────────────────────────────────────────────────
-    merge  = self.config.spatial_merge_size_for_vit   # 2
-    patch  = self.config.patch_size_for_vit            # 16
-    grid_h = _VIT_INPUT_SIZE // patch                  # 28
-    grid_w = _VIT_INPUT_SIZE // patch                  # 28
-    image_grid_thw = np.array([[1, grid_h, grid_w]], dtype=np.int32)
-    attn_mask      = np.zeros((1, _MAX_PREFILL), dtype=np.int32)
+    # 3. mRoPE positions ──────────────────────────────────────────────────
+    attn_mask = np.zeros((1, _MAX_PREFILL), dtype=np.int32)
     attn_mask[0, :seq_len] = 1
 
     position_ids, mrope_deltas = get_rope_index(
@@ -153,13 +246,6 @@ class _EngineRunner:
         spatial_merge_size=merge,
     )
     mrope_deltas = mrope_deltas.astype(np.int32)
-
-    # 3. Pixel values ─────────────────────────────────────────────────────
-    import types
-    from maxtext.multimodal.processor import preprocess_mm_data
-    pixel_values = jnp.asarray(preprocess_mm_data(
-        types.SimpleNamespace(model_name=self.config.model_name, image_path=image_path)
-    ).pixel_values)  # (1,3,2,H,W)
 
     # 4. Prefill ──────────────────────────────────────────────────────────
     rng = jax.random.PRNGKey(42)
@@ -171,7 +257,7 @@ class _EngineRunner:
         padded_tokens=padded_tokens,
         positions=position_ids,
         mrope_deltas=mrope_deltas,
-        images=pixel_values,
+        images=jnp.asarray(pixel_values),
         true_length=seq_len,
         rng=rng_prefill,
         slot=0,
@@ -197,10 +283,21 @@ class _EngineRunner:
         break
 
     elapsed  = time.time() - t_start
+    n_tokens = len(generated)
     response = self.tokenizer.decode(generated, skip_special_tokens=True)
     if verbose:
-      print(f"  [{len(generated)} tokens, {elapsed:.1f}s]")
-    return response
+      print(f"  [{n_tokens} tokens, {elapsed:.1f}s]")
+    return {
+        "backend":     BACKEND,
+        "model":       "qwen3-vl-2b (MaxEngine/SFT checkpoint)",
+        "image":       image_paths,
+        "video":       video_path,
+        "prompt":      prompt,
+        "response":    response,
+        "tokens":      n_tokens,
+        "elapsed":     round(elapsed, 2),
+        "tok_per_sec": round(n_tokens / elapsed, 1) if elapsed > 0 else 0.0,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -393,16 +490,39 @@ def main() -> None:
   parser = argparse.ArgumentParser(
       description="Qwen3-VL SFT overfit demo (MaxEngine inference + manual training)"
   )
-  parser.add_argument("--image",          default=DEFAULT_IMAGE,      help="Input image path")
-  parser.add_argument("--question",       default=DEMO_QUESTION,      help="Question to ask the model")
-  parser.add_argument("--wrong-answer",   default=WRONG_ANSWER,       help="Deliberately wrong answer to overfit on")
-  parser.add_argument("--steps",          type=int, default=300,      help="Number of SFT gradient steps")
-  parser.add_argument("--max-new-tokens", type=int, default=64,        help="Max tokens to decode in each inference run")
-  parser.add_argument("--checkpoint-dir", default=DEFAULT_CHECKPOINT,  help="Orbax checkpoint directory")
-  parser.add_argument("--tokenizer",      default=DEFAULT_TOKENIZER,   help="HuggingFace tokenizer path/ID")
-  parser.add_argument("--lr",             type=float, default=1e-3,    help="Learning rate for vanilla-SGD training (default 1e-3)")
-  parser.add_argument("--max-grad-norm",  type=float, default=1.0,     help="Gradient clipping global L2 norm (default 1.0)")
-  parser.add_argument("--verbose",        action="store_true",         help="Print step-level progress")
+  parser.add_argument(
+      "--image", nargs="+", required=True,
+      help="Input image paths — provide 2 for the full demo, e.g. "
+           "--image tests/assets/image1.jpg tests/assets/image2.jpg"
+  )
+  parser.add_argument(
+      "--video", default="", metavar="PATH",
+      help=f"Optional video file (MP4 / AVI / GIF).  "
+           f"{_N_VIDEO_FRAMES} frames are sampled uniformly.  "
+           f"Example: --video {DEFAULT_VIDEO}"
+  )
+  parser.add_argument("--prompt", default=DEFAULT_PROMPT, help="Text prompt for inference")
+  parser.add_argument("--wrong-answer",  default=WRONG_ANSWER,      help="Deliberately wrong answer to overfit on")
+  parser.add_argument("--steps",         type=int, default=300,     help="Number of SFT gradient steps")
+  parser.add_argument(
+      "--max-tokens", type=int, default=512, help="Max new tokens to generate per inference run"
+  )
+  parser.add_argument(
+      "--checkpoint-dir",
+      default=DEFAULT_CHECKPOINT,
+      help="Orbax checkpoint directory",
+  )
+  parser.add_argument(
+      "--tokenizer",
+      default=DEFAULT_TOKENIZER,
+      help="HuggingFace tokenizer ID or local tokenizer path",
+  )
+  parser.add_argument("--lr",            type=float, default=1e-3,  help="Learning rate for vanilla-SGD training (default 1e-3)")
+  parser.add_argument("--max-grad-norm", type=float, default=1.0,   help="Gradient clipping global L2 norm (default 1.0)")
+  parser.add_argument("--output-json", action="store_true", help="Print result as JSON")
+  parser.add_argument(
+      "--verbose", action="store_true", help="Print step-level progress"
+  )
   args = parser.parse_args()
 
   sys.path.insert(0, "src")
@@ -416,8 +536,9 @@ def main() -> None:
   print("\n" + "=" * 70)
   print("Qwen3-VL SFT Overfit Demo  [MaxEngine + manual SFT]")
   print("=" * 70)
-  print(f"\nImage    : {args.image}")
-  print(f"Question : {args.question!r}")
+  print(f"\nImage(s) : {', '.join(args.image)}")
+  print(f"Video    : {args.video}")
+  print(f"Prompt   : {args.prompt!r}")
   print(f"Wrong Ans: {args.wrong_answer!r}")
   print(f"Steps    : {args.steps}")
   print()
@@ -461,22 +582,25 @@ def main() -> None:
       // config.spatial_merge_size_for_vit
   ) ** 2  # 196 for 448px / 16-patch / 2-merge
 
-  runner = _EngineRunner(engine, params, config, tokenizer, num_vis_tokens)
+  runner = _EngineRunner(engine, params, config, tokenizer)
 
   # ── 3. BEFORE inference ───────────────────────────────────────────────
+  image_paths = args.image
+
   print(f"\n[3/5] BEFORE training — running MaxEngine inference …")
-  before_response = runner.run(
-      args.image, prompt=args.question,
-      max_new_tokens=args.max_new_tokens, verbose=args.verbose,
+  before_result = runner.run(
+      image_paths=image_paths, video_path=args.video,
+      prompt=args.prompt,
+      max_new_tokens=args.max_tokens, verbose=args.verbose,
   )
-  print(f"\n  BEFORE answer: {before_response!r}")
+  _print_result(before_result, args.output_json)
 
   # ── 4. SFT training loop ──────────────────────────────────────────────
   print(f"\n[4/5] Building training batch and running {args.steps} SFT steps …")
   batch = _build_training_batch(
       tokenizer,
-      args.image,
-      args.question,
+      args.image[0],          # overfit on the first image only
+      DEMO_QUESTION,          # single-image training question (proves weight updates)
       args.wrong_answer,
       num_vis_tokens,
       max_len=_MAX_TRAIN_LEN,
@@ -519,18 +643,23 @@ def main() -> None:
   print(f"\n[5/5] AFTER training — running MaxEngine inference with fine-tuned params …")
   # Update the runner to use the new params
   runner.params = params
-  after_response = runner.run(
-      args.image, prompt=args.question,
-      max_new_tokens=args.max_new_tokens, verbose=args.verbose,
+  after_result = runner.run(
+      image_paths=image_paths, video_path=args.video,
+      prompt=args.prompt,
+      max_new_tokens=args.max_tokens, verbose=args.verbose,
   )
+  _print_result(after_result, args.output_json)
 
-  # ── Summary ──────────────────────────────────────────────────────────
+  # ── SFT comparison summary ────────────────────────────────────────────
   W = 70
+  before_response = before_result["response"]
+  after_response  = after_result["response"]
   print("\n" + "=" * W)
-  print("SFT Demo Results")
+  print("SFT Overfit Summary")
   print("=" * W)
-  print(f"Image    : {args.image}")
-  print(f"Question : {args.question!r}")
+  print(f"Image(s) : {', '.join(args.image)}")
+  print(f"Video    : {args.video}")
+  print(f"Prompt   : {args.prompt!r}")
   print("-" * W)
   print(f"BEFORE   : {before_response!r}")
   print(f"TARGET   : {args.wrong_answer!r}  (the wrong answer we fine-tuned on)")

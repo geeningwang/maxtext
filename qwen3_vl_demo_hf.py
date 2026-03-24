@@ -29,7 +29,62 @@ from transformers import AutoProcessor, AutoModelForImageTextToText
 
 BACKEND = "hf"
 DEFAULT_MODEL = "Qwen/Qwen3-VL-2B-Instruct"
-DEFAULT_PROMPT = "Describe what you see in the image."
+DEFAULT_PROMPT = (
+    "There are two images and a video clip provided. "
+    "Describe what you see in each image and summarize the main scene in the video."
+)
+DEFAULT_VIDEO   = "tests/assets/video.mp4"
+_N_VIDEO_FRAMES = 4   # frames uniformly sampled from the video clip
+
+
+# ---------------------------------------------------------------------------
+# Video-frame sampling helper
+# ---------------------------------------------------------------------------
+
+def _sample_video_frames(video_path: str, n_frames: int = _N_VIDEO_FRAMES) -> list:
+  """Uniformly sample *n_frames* from a video file.
+
+  Supports GIF / APNG (via PIL) and MP4 / AVI / MOV (via cv2).
+
+  Returns:
+    list of (H, W, 3) uint8 ``np.ndarray`` frames.
+  """
+  frames: list = []
+
+  # PIL handles GIF / APNG / multi-page TIFF.
+  try:
+    from PIL import ImageSequence  # pylint: disable=import-outside-toplevel
+    pil = Image.open(video_path)
+    frames = [np.array(f.convert("RGB")) for f in ImageSequence.Iterator(pil)]
+    if len(frames) <= 1:
+      frames = []
+  except Exception:  # pylint: disable=broad-except
+    frames = []
+
+  # cv2 for real video containers (MP4 / AVI / MOV / …).
+  if not frames:
+    try:
+      import cv2  # pylint: disable=import-outside-toplevel
+      cap = cv2.VideoCapture(video_path)
+      while True:
+        ret, frame = cap.read()
+        if not ret:
+          break
+        frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+      cap.release()
+    except ImportError as exc:
+      raise RuntimeError(
+          f"Cannot decode '{video_path}': install opencv-python-headless\n"
+          "  pip install opencv-python-headless"
+      ) from exc
+
+  if not frames:
+    raise RuntimeError(f"No frames decoded from: {video_path}")
+  if len(frames) == 1:
+    frames = frames * n_frames  # replicate single frame
+
+  indices = np.linspace(0, len(frames) - 1, n_frames).round().astype(int)
+  return [frames[i] for i in indices]
 
 
 # ---------------------------------------------------------------------------
@@ -49,6 +104,8 @@ def _print_result(result: dict, output_json: bool = False) -> None:
   )
   print("=" * W)
   print(f"Image(s) : {', '.join(result['image'])}")
+  if result.get("video"):
+    print(f"Video    : {result['video']}")
   print(f"Prompt   : {result['prompt']!r}")
   print("-" * W)
   print("RESPONSE")
@@ -93,23 +150,30 @@ class Qwen3VLDemoHF:
   def run(
       self,
       image_paths: list[str],
+      video_path: str = "",
       prompt: str = DEFAULT_PROMPT,
       max_new_tokens: int = 512,
       verbose: bool = False,
   ) -> dict:
-    """Run end-to-end inference on *image_paths* with *prompt*.
+    """Run end-to-end inference on *image_paths* and optional *video_path*.
+
+    Pass two images and a video to demonstrate the full multimodal capability
+    of Qwen3-VL: ``image_paths=["img1.jpg", "img2.jpg"]`` and
+    ``video_path="clip.mp4"``.
 
     Args:
       image_paths:    Input image file paths (all are passed to the model).
+      video_path:     Optional path to a video file (MP4, AVI, GIF, …).
+                      ``_N_VIDEO_FRAMES`` frames are sampled uniformly.
       prompt:         Text question / instruction.
       max_new_tokens: Maximum number of new tokens to generate.
       verbose:        Print extra loading / processing information.
 
     Returns:
-      dict with keys ``backend``, ``model``, ``image``, ``prompt``,
-      ``response``, ``tokens``, ``elapsed``, ``tok_per_sec``.
+      dict with keys ``backend``, ``model``, ``image``, ``video``,
+      ``prompt``, ``response``, ``tokens``, ``elapsed``, ``tok_per_sec``.
     """
-    # Load images
+    # ── 1. Load images ──────────────────────────────────────────────────────
     images = []
     for path in image_paths:
       if not os.path.exists(path):
@@ -117,10 +181,28 @@ class Qwen3VLDemoHF:
       img = Image.open(path).convert("RGB")
       images.append(img)
       if verbose:
-        print(f"[{BACKEND}]   loaded {path}  size={img.size}")
+        print(f"[{BACKEND}]   loaded image {path}  size={img.size}")
 
-    # Build chat message in Qwen3-VL format
-    content = [{"type": "image", "image": img} for img in images]
+    # ── 2. Load video frames ────────────────────────────────────────────────
+    video_frames_pil: list = []
+    if video_path:
+      if not os.path.exists(video_path):
+        raise FileNotFoundError(f"Video not found: {video_path}")
+      raw_frames = _sample_video_frames(video_path, n_frames=_N_VIDEO_FRAMES)
+      video_frames_pil = [Image.fromarray(f) for f in raw_frames]
+      if verbose:
+        print(
+            f"[{BACKEND}]   loaded video {video_path}  "
+            f"({len(video_frames_pil)} frames sampled)"
+        )
+
+    # ── 3. Build chat message: images + video + text ────────────────────────
+    # Each image gets a {"type": "image"} placeholder; the video clip gets a
+    # {"type": "video"} placeholder.  The processor expands them into the
+    # correct <|image_pad|> / <|video_pad|> token sequences.
+    content: list = [{"type": "image"} for _ in images]
+    if video_frames_pil:
+      content.append({"type": "video", "video": video_frames_pil, "fps": 1.0})
     content.append({"type": "text", "text": prompt})
     messages = [{"role": "user", "content": content}]
 
@@ -128,13 +210,17 @@ class Qwen3VLDemoHF:
         messages, tokenize=False, add_generation_prompt=True
     )
     inputs = self.processor(
-        text=[text], images=images, padding=True, return_tensors="pt"
+        text=[text],
+        images=images if images else None,
+        videos=[video_frames_pil] if video_frames_pil else None,
+        padding=True,
+        return_tensors="pt",
     ).to(self.device)
 
     if verbose:
       print(f"[{BACKEND}]   input tokens: {inputs['input_ids'].shape[1]}")
 
-    # Generate (greedy / deterministic for reproducible comparison)
+    # ── 4. Generate (greedy / deterministic) ──────────────────────────────
     t0 = time.time()
     with torch.no_grad():
       output_ids = self.model.generate(
@@ -150,13 +236,14 @@ class Qwen3VLDemoHF:
     n_tokens = int(new_ids.shape[0])
 
     return {
-        "backend": BACKEND,
-        "model": self.model_id,
-        "image": image_paths,
-        "prompt": prompt,
-        "response": response,
-        "tokens": n_tokens,
-        "elapsed": round(elapsed, 2),
+        "backend":     BACKEND,
+        "model":       self.model_id,
+        "image":       image_paths,
+        "video":       video_path,
+        "prompt":      prompt,
+        "response":    response,
+        "tokens":      n_tokens,
+        "elapsed":     round(elapsed, 2),
         "tok_per_sec": round(n_tokens / elapsed, 1) if elapsed > 0 else 0.0,
     }
 
@@ -170,7 +257,15 @@ def main() -> None:
       description="Qwen3-VL HuggingFace / PyTorch inference demo"
   )
   parser.add_argument(
-      "--image", nargs="+", required=True, help="Input image path(s)"
+      "--image", nargs="+", required=True,
+      help="Input image paths — provide 2 for the full demo, e.g. "
+           "--image tests/assets/image1.jpg tests/assets/image2.jpg"
+  )
+  parser.add_argument(
+      "--video", default="", metavar="PATH",
+      help=f"Optional video file (MP4 / AVI / GIF).  "
+           f"{_N_VIDEO_FRAMES} frames are sampled uniformly.  "
+           f"Example: --video {DEFAULT_VIDEO}"
   )
   parser.add_argument(
       "--prompt", default=DEFAULT_PROMPT, help="Text prompt"
@@ -194,6 +289,7 @@ def main() -> None:
   demo = Qwen3VLDemoHF(model_id=args.model)
   result = demo.run(
       image_paths=args.image,
+      video_path=args.video,
       prompt=args.prompt,
       max_new_tokens=args.max_tokens,
       verbose=args.verbose,
