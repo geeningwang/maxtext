@@ -2165,6 +2165,152 @@ def MIXTRAL_MAXTEXT_TO_HF_PARAM_HOOK_FN(config, maxtext_config, scan_layers=Fals
   return hooks
 
 
+# ---------------------------------------------------------------------------
+# MiMo-V2-Flash (XiaomiMiMo/MiMo-V2-Flash)
+# ---------------------------------------------------------------------------
+
+def MIMO_V2_FLASH_MAXTEXT_TO_HF_PARAM_MAPPING(config, maxtext_config, scan_layers=False):
+  """Generates the MaxText ↔ HuggingFace parameter name mapping for MiMo-V2-Flash.
+
+  MaxText parameter paths follow the module hierarchy of MiMoV2FlashDecoderLayer:
+    self_attn.q_proj  → params-decoder-layers_{i}-self_attn-q_proj-kernel
+    self_attn.k_proj  → params-decoder-layers_{i}-self_attn-k_proj-kernel
+    self_attn.v_proj  → params-decoder-layers_{i}-self_attn-v_proj-kernel
+    self_attn.o_proj  → params-decoder-layers_{i}-self_attn-o_proj-kernel
+    self_attn.sink_bias (SWA-only) → params-decoder-layers_{i}-self_attn-sink_bias
+    input_layernorm   → params-decoder-layers_{i}-input_layernorm-scale
+    post_attention_layernorm → params-decoder-layers_{i}-post_attention_layernorm-scale
+    Dense MLP (layer 0):
+      mlp.wi_0 → ...mlp-wi_0-kernel
+      mlp.wi_1 → ...mlp-wi_1-kernel
+      mlp.wo   → ...mlp-wo-kernel
+    MoE (layers 1-47):
+      mlp.gate.weight → ...mlp-gate-weight
+      mlp.gate.e_score_correction_bias → ...mlp-gate-e_score_correction_bias
+      mlp.wi_0 (stacked, shape E,H,I) → [experts.{j}.gate_proj.weight for j in E]
+      mlp.wi_1 (stacked, shape E,H,I) → [experts.{j}.up_proj.weight   for j in E]
+      mlp.wo   (stacked, shape E,I,H) → [experts.{j}.down_proj.weight  for j in E]
+  """
+  mapping = {}
+  num_layers = config["num_hidden_layers"]
+  num_experts = maxtext_config.num_experts
+
+  # Global embedding / norm / lm_head
+  mapping["params-token_embedder-embedding"] = "model.embed_tokens.weight"
+  mapping["params-decoder-decoder_norm-scale"] = "model.norm.weight"
+  mapping["params-decoder-logits_dense-kernel"] = "lm_head.weight"
+
+  # MoE layer frequency pattern;  0 = dense, 1 = MoE
+  moe_freq = list(maxtext_config.mimo_moe_layer_freq) if maxtext_config.mimo_moe_layer_freq else [1] * num_layers
+  # Hybrid attention pattern: 0 = global (no sink_bias), 1 = SWA (has sink_bias)
+  hybrid = list(maxtext_config.mimo_hybrid_layer_pattern) if maxtext_config.mimo_hybrid_layer_pattern else [1] * num_layers
+
+  for i in range(num_layers):
+    mt = f"params-decoder-layers_{i}"
+    hf = f"model.layers.{i}"
+    is_swa = (hybrid[i] == 1) if i < len(hybrid) else True
+    is_moe = (moe_freq[i] == 1) if i < len(moe_freq) else True
+
+    # Attention projections
+    mapping[f"{mt}-self_attn-q_proj-kernel"] = f"{hf}.self_attn.q_proj.weight"
+    mapping[f"{mt}-self_attn-k_proj-kernel"] = f"{hf}.self_attn.k_proj.weight"
+    mapping[f"{mt}-self_attn-v_proj-kernel"] = f"{hf}.self_attn.v_proj.weight"
+    mapping[f"{mt}-self_attn-o_proj-kernel"] = f"{hf}.self_attn.o_proj.weight"
+
+    # Attention sink bias (SWA layers only)
+    if is_swa:
+      mapping[f"{mt}-self_attn-sink_bias"] = f"{hf}.self_attn.attention_sink_bias"
+
+    # Layer norms
+    mapping[f"{mt}-input_layernorm-scale"] = f"{hf}.input_layernorm.weight"
+    mapping[f"{mt}-post_attention_layernorm-scale"] = f"{hf}.post_attention_layernorm.weight"
+
+    if is_moe:
+      # MoE gate routing weights
+      mapping[f"{mt}-mlp-gate-weight"] = f"{hf}.mlp.gate.weight"
+      mapping[f"{mt}-mlp-gate-e_score_correction_bias"] = f"{hf}.mlp.gate.e_score_correction_bias"
+
+      # Stacked expert weights (MaxText stores all E experts in one tensor)
+      gate_proj = [f"{hf}.mlp.experts.{j}.gate_proj.weight" for j in range(num_experts)]
+      up_proj = [f"{hf}.mlp.experts.{j}.up_proj.weight" for j in range(num_experts)]
+      down_proj = [f"{hf}.mlp.experts.{j}.down_proj.weight" for j in range(num_experts)]
+      mapping[f"{mt}-mlp-wi_0"] = gate_proj
+      mapping[f"{mt}-mlp-wi_1"] = up_proj
+      mapping[f"{mt}-mlp-wo"] = down_proj
+    else:
+      # Dense MLP (only layer 0 in default config)
+      mapping[f"{mt}-mlp-wi_0-kernel"] = f"{hf}.mlp.gate_proj.weight"
+      mapping[f"{mt}-mlp-wi_1-kernel"] = f"{hf}.mlp.up_proj.weight"
+      mapping[f"{mt}-mlp-wo-kernel"] = f"{hf}.mlp.down_proj.weight"
+
+  return mapping
+
+
+def MIMO_V2_FLASH_MAXTEXT_TO_HF_PARAM_HOOK_FN(config, maxtext_config, scan_layers=False, saving_to_hf=False):
+  """Bidirectional weight transformation hooks for MiMo-V2-Flash.
+
+  MiMo uses the same linear weight convention as most HF models:
+  HF stores weights as (out_features, in_features) — i.e., transposed relative
+  to MaxText's (in_features, out_features) convention for DenseGeneral.
+
+  The only asymmetry: expert weight tensors are stacked in MaxText as
+  (num_experts, dim_in, dim_out) but stored separately per expert in HF.
+  The checkpoint loader / saver handles expert stacking externally via the
+  list-valued mapping, so we only need transpose hooks here.
+  """
+  hooks = {}
+  num_layers = config["num_hidden_layers"]
+  num_experts = maxtext_config.num_experts
+  moe_freq = list(maxtext_config.mimo_moe_layer_freq) if maxtext_config.mimo_moe_layer_freq else [1] * num_layers
+  hybrid = list(maxtext_config.mimo_hybrid_layer_pattern) if maxtext_config.mimo_hybrid_layer_pattern else [1] * num_layers
+
+  def reshape_kernel(x, target_shape):
+    """Transpose weight matrix: (out, in) ↔ (in, out)."""
+    return x.transpose()
+
+  def noop(x, target_shape):
+    """No transformation needed (e.g., bias vectors, norms)."""
+    return x
+
+  # Top-level non-layer params
+  hooks["params-token_embedder-embedding"] = noop
+  hooks["params-decoder-decoder_norm-scale"] = noop
+  hooks["params-decoder-logits_dense-kernel"] = reshape_kernel
+
+  for i in range(num_layers):
+    mt = f"params-decoder-layers_{i}"
+    is_swa = (hybrid[i] == 1) if i < len(hybrid) else True
+    is_moe = (moe_freq[i] == 1) if i < len(moe_freq) else True
+
+    # Attention projections all need transpose
+    hooks[f"{mt}-self_attn-query-kernel"] = reshape_kernel
+    hooks[f"{mt}-self_attn-key-kernel"] = reshape_kernel
+    hooks[f"{mt}-self_attn-value-kernel"] = reshape_kernel
+    hooks[f"{mt}-self_attn-out-kernel"] = reshape_kernel
+
+    if is_swa:
+      hooks[f"{mt}-self_attn-sink_bias"] = noop
+
+    # Norms are 1-D scale vectors — no reshape
+    hooks[f"{mt}-input_layernorm-scale"] = noop
+    hooks[f"{mt}-post_attention_layernorm-scale"] = noop
+
+    if is_moe:
+      hooks[f"{mt}-mlp-gate-weight"] = reshape_kernel
+      hooks[f"{mt}-mlp-gate-e_score_correction_bias"] = noop
+      # Expert matrices: stacked (E, H, I) ↔ HF per-expert (I, H) each
+      # The reshape_kernel applied to the whole stack transposes axes (E, H, I) → (E, I, H).
+      hooks[f"{mt}-mlp-wi_0"] = reshape_kernel
+      hooks[f"{mt}-mlp-wi_1"] = reshape_kernel
+      hooks[f"{mt}-mlp-wo"] = reshape_kernel
+    else:
+      hooks[f"{mt}-mlp-wi_0-kernel"] = reshape_kernel
+      hooks[f"{mt}-mlp-wi_1-kernel"] = reshape_kernel
+      hooks[f"{mt}-mlp-wo-kernel"] = reshape_kernel
+
+  return hooks
+
+
 def OLMO3_MAXTEXT_TO_HF_PARAM_MAPPING(config, maxtext_config, scan_layers=False):
   """Returns mapping from MaxText to HuggingFace Olmo3 weight paths."""
 
@@ -2354,6 +2500,7 @@ PARAM_MAPPING = {
     "olmo3-7b": OLMO3_MAXTEXT_TO_HF_PARAM_MAPPING,
     "olmo3-7b-pt": OLMO3_MAXTEXT_TO_HF_PARAM_MAPPING,
     "olmo3-32b": OLMO3_MAXTEXT_TO_HF_PARAM_MAPPING,
+    "mimo-v2-flash": MIMO_V2_FLASH_MAXTEXT_TO_HF_PARAM_MAPPING,
 }
 
 # {maxtext model name: {maxtext weight name: bi-directional transform}}
@@ -2386,6 +2533,7 @@ HOOK_FNS = {
     "olmo3-7b": OLMO3_MAXTEXT_TO_HF_PARAM_HOOK_FN,
     "olmo3-7b-pt": OLMO3_MAXTEXT_TO_HF_PARAM_HOOK_FN,
     "olmo3-32b": OLMO3_MAXTEXT_TO_HF_PARAM_HOOK_FN,
+    "mimo-v2-flash": MIMO_V2_FLASH_MAXTEXT_TO_HF_PARAM_HOOK_FN,
 }
 
 VLLM_HOOK_FNS = {

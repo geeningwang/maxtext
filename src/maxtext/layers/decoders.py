@@ -49,6 +49,7 @@ from maxtext.models import (
     gpt_oss,
     llama2,
     llama4,
+    mimo_v2_flash,
     mistral,
     mixtral,
     olmo3,
@@ -481,6 +482,8 @@ class Decoder(nn.Module):
         return [llama4.Llama4ScannableBlockToLinen] if self.config.scan_layers else [llama4.Llama4DecoderLayerToLinen]
       case DecoderBlockType.OLMO3:
         return [olmo3.Olmo3ScannableBlockToLinen] if self.config.scan_layers else [olmo3.Olmo3DecoderLayerToLinen]
+      case DecoderBlockType.MIMO_V2_FLASH:
+        return [mimo_v2_flash.MiMoV2FlashScannableBlockToLinen] if self.config.scan_layers else [mimo_v2_flash.MiMoV2FlashDecoderLayerToLinen]
 
       case _:
         # Default case to handle any unknown decoder block types.
@@ -532,6 +535,7 @@ class Decoder(nn.Module):
         DecoderBlockType.SIMPLE_MLP,
         DecoderBlockType.LLAMA4,
         DecoderBlockType.OLMO3,
+        DecoderBlockType.MIMO_V2_FLASH,
     ):
       return functools.partial(rms_norm, num_features=num_features, shard_mode=self.config.shard_mode)
     elif self.config.decoder_block == DecoderBlockType.GPT3:
@@ -1019,6 +1023,8 @@ class Decoder(nn.Module):
                   "is_moe_layer": llama4.determine_is_moe_layer(lyr, self.config.interleave_moe_layer_step),
               }
             if cfg.decoder_block == DecoderBlockType.QWEN3_NEXT:
+              layer_kwargs = {"layer_idx": lyr}
+            if cfg.decoder_block == DecoderBlockType.MIMO_V2_FLASH:
               layer_kwargs = {"layer_idx": lyr}
             kv_cache = None
             if kv_caches is not None and cfg.decoder_block != DecoderBlockType.QWEN3_NEXT:

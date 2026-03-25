@@ -742,6 +742,56 @@ class Qwen3Next(BaseModel):
   )
   partial_rotary_factor: float = Field(1.0, description="The ratio of dimension to apply ROPE on")
 
+  # ---------------------------------------------------------------------------
+  # MiMo-V2-Flash specific configuration
+  # ---------------------------------------------------------------------------
+  mimo_hybrid_layer_pattern: list[int] = Field(
+      default_factory=list,
+      description=(
+          "Per-layer attention type for MiMo-V2-Flash hybrid architecture. "
+          "0 = full (global) attention, 1 = sliding-window attention (SWA). "
+          "Length must equal num_decoder_layers."
+      ),
+  )
+  mimo_moe_layer_freq: list[int] = Field(
+      default_factory=list,
+      description=(
+          "Per-layer MoE flag for MiMo-V2-Flash. "
+          "0 = dense MLP, 1 = sparse MoE. "
+          "Length must equal num_decoder_layers."
+      ),
+  )
+  mimo_v_head_dim: int = Field(
+      0,
+      description=(
+          "Value head dimension for MiMo-V2-Flash attention. "
+          "Differs from head_dim (Q/K head dimension). "
+          "Set to 0 to use head_dim for both Q/K/V (standard behaviour)."
+      ),
+  )
+  mimo_swa_num_kv_heads: int = Field(
+      0,
+      description=(
+          "Number of KV heads for SWA layers in MiMo-V2-Flash. "
+          "Set to 0 to use num_kv_heads for all attention layers."
+      ),
+  )
+  mimo_swa_rope_theta: float = Field(
+      10000.0,
+      description="RoPE theta for sliding-window attention layers in MiMo-V2-Flash.",
+  )
+  mimo_swa_window_size: int = Field(
+      128,
+      description="Sliding window size for SWA layers in MiMo-V2-Flash.",
+  )
+  mimo_attention_value_scale: float = Field(
+      1.0,
+      description=(
+          "Additional scalar multiplied into the V projection before attention "
+          "output in MiMo-V2-Flash (set to 0.707 = 1/sqrt(2))."
+      ),
+  )
+
 
 class HardwareAndMesh(BaseModel):
   """Configuration for hardware and parallelism mesh."""
@@ -2379,6 +2429,11 @@ class MaxTextConfig(
           self.base_mlp_dim = self.base_moe_mlp_dim
           _, _, mlp_dim_scale, _ = get_individual_scales(self.global_parameter_scale)
           self.mlp_dim = (2**mlp_dim_scale) * self.base_mlp_dim
+        elif self.decoder_block == DecoderBlockType.MIMO_V2_FLASH:
+          # MiMo-V2-Flash uses mimo_moe_layer_freq to select MoE vs dense layers;
+          # base_mlp_dim (dense layer 0) and base_moe_mlp_dim (MoE layers) are
+          # intentionally different, so skip the standard "fully MoE" check.
+          pass
         else:
           raise ValueError(
               "For a fully MoE model, base_mlp_dim must equal base_moe_mlp_dim. "
@@ -2455,9 +2510,10 @@ class MaxTextConfig(
             f"The number of decoder layers ({self.base_num_decoder_layers}) must be divisible by interleave moe layer step "
             f"({self.interleave_moe_layer_step})"
         )
-    if self.decoder_block == DecoderBlockType.QWEN3_NEXT:
-      if int(self.gdn_num_value_heads) % int(self.gdn_num_key_heads) != 0:
-        raise ValueError("gdn_num_value_heads must be divisible by gdn_num_key_heads")
+    if self.decoder_block in (DecoderBlockType.QWEN3_NEXT, DecoderBlockType.MIMO_V2_FLASH):
+      if self.decoder_block == DecoderBlockType.QWEN3_NEXT:
+        if int(self.gdn_num_value_heads) % int(self.gdn_num_key_heads) != 0:
+          raise ValueError("gdn_num_value_heads must be divisible by gdn_num_key_heads")
       rotary_dim = int(self.head_dim * self.partial_rotary_factor)
       if rotary_dim % 2 != 0:
         raise ValueError(f"Calculated rotary dimension ({rotary_dim}) must be a multiple of 2.")

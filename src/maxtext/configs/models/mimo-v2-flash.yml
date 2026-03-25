@@ -1,0 +1,96 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# maxtext/configs/models/mimo-v2-flash.yml
+#
+# Model: Xiaomi MiMo-V2-Flash (309B total / 15B active)
+# Reference: https://huggingface.co/XiaomiMiMo/MiMo-V2-Flash
+#
+# Architecture highlights:
+#   • 48 hybrid decoder layers (9 global attention + 39 sliding-window)
+#   • Asymmetric head dims: Q/K head_dim=192, V head_dim=128
+#   • Partial RoPE: partial_rotary_factor=0.334 → 64 dims rotated
+#   • 256 MoE experts, top-8 sigmoid routing with noaux-TC correction bias
+#   • Layer 0 is dense MLP; layers 1-47 are sparse MoE
+#   • vocab_size=152576 (Qwen2 tokenizer base)
+
+# Decoder block selector
+decoder_block: "mimo_v2_flash"
+
+# Core architectural parameters
+base_emb_dim: 4096
+base_num_decoder_layers: 48
+base_num_query_heads: 64
+base_num_kv_heads: 4          # Global-attention (GA) KV heads; SWA uses 8 (mimo_swa_num_kv_heads)
+head_dim: 192                 # Q/K head dimension
+vocab_size: 152576
+
+# FFN dimensions
+# Layer 0 (dense MLP):  intermediate = base_mlp_dim = 16384   (from HF intermediate_size)
+# Layers 1-47 (MoE):   intermediate = moe_mlp_dim  = 2048    (from HF moe_intermediate_size)
+base_mlp_dim: 16384
+base_moe_mlp_dim: 2048
+
+# MoE configuration
+num_experts: 256
+num_experts_per_tok: 8
+norm_topk_prob: true
+routed_score_func: "sigmoid"  # MiMo uses sigmoid (not softmax)
+
+# Activation function
+mlp_activations: ["silu", "linear"]
+
+# Layer normalisation
+normalization_layer_epsilon: 1.0e-5
+
+# RoPE: global attention uses rope_max_timescale; SWA uses mimo_swa_rope_theta
+rope_max_timescale: 5000000
+partial_rotary_factor: 0.334
+
+# MiMo-specific parameters (see maxtext/configs/types.py)
+mimo_v_head_dim: 128          # V projection head dimension (different from Q/K 192)
+mimo_swa_num_kv_heads: 8      # KV heads for sliding-window attention layers
+mimo_swa_rope_theta: 10000.0  # RoPE theta for SWA layers
+mimo_swa_window_size: 128     # Sliding-window size (tokens)
+mimo_attention_value_scale: 0.707  # Scale applied to V projection output
+
+# Hybrid attention layer pattern (per-layer):
+#   0 = global (full causal) attention
+#   1 = sliding-window attention (SWA)
+# 9 global layers at positions: 0, 5, 11, 17, 23, 29, 35, 41, 47
+# 39 SWA layers everywhere else.
+mimo_hybrid_layer_pattern: [0,1,1,1,1,0,1,1,1,1,1,0,1,1,1,1,1,0,1,1,1,1,1,0,1,1,1,1,1,0,1,1,1,1,1,0,1,1,1,1,1,0,1,1,1,1,1,0]
+
+# MoE frequency per layer:
+#   0 = dense MLP (only layer 0)
+#   1 = sparse MoE (layers 1-47)
+mimo_moe_layer_freq: [0,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1]
+
+# Context length
+max_target_length: 8192        # Reduced for practical TPU use; model supports up to 262144
+max_prefill_predict_length: 8192
+
+# Model outputs
+logits_via_embedding: false
+
+# Disable QK norm (MiMo does not use it)
+use_qk_norm: false
+
+# Tokenizer: HuggingFace Qwen2 tokenizer (shared with MiMo)
+tokenizer_path: "XiaomiMiMo/MiMo-V2-Flash"
+tokenizer_type: "huggingface"
+
+# Training/inference defaults
+enable_dropout: false
+scan_layers: false
