@@ -68,7 +68,6 @@ import torch
 from safetensors import safe_open
 from tqdm import tqdm
 
-from maxtext.checkpoint_conversion.standalone_scripts import llama_or_mistral_ckpt
 from maxtext.utils import max_logging
 
 # Try to use bfloat16 for memmap files to halve disk usage.
@@ -492,23 +491,143 @@ def convert_hf_to_maxtext(
         mstore.flush_shapes()
         max_logging.log(f"Shapes metadata written to {tmpdir}/shapes.json")
 
-    # ------------------------------------------------------------------
-    # 6. Unflatten dot-separated keys to the nested dict Orbax expects
-    # ------------------------------------------------------------------
-    max_logging.log(f"Converted {len(flat)} weight tensors. Building nested dict...")
-    return _unflatten(flat)
+    max_logging.log(f"Converted {len(flat)} weight tensors.")
+    return flat  # caller uses _save_zarr_direct (no unflatten needed)
 
 
-def _unflatten(flat: dict) -> dict:
-    """Convert a flat dot-key dict to the nested dict Orbax expects."""
-    nested: dict = {}
-    for flat_key, val in flat.items():
-        parts = flat_key.split(".")
-        d = nested
-        for part in parts[:-1]:
-            d = d.setdefault(part, {})
-        d[parts[-1]] = val
-    return nested
+# ---------------------------------------------------------------------------
+# Direct zarr2 checkpoint writer (bypasses Orbax pytree RAM blow-up)
+# ---------------------------------------------------------------------------
+
+def _save_zarr_direct(
+    maxtext_model_path: str,
+    flat_dict: dict[str, np.ndarray],
+    step: int = 0,
+) -> None:
+    """Write an Orbax-compatible zarr2 checkpoint one array at a time.
+
+    Peak RAM = largest single array (~4 GB for a 256-expert MoE stack).
+    Bypasses the Orbax/JAX pytree traversal that materialises all memmaps
+    into device memory before writing, which would OOM on a 172 GB VM with
+    576 GB of parameters.
+
+    The output directory structure exactly matches what
+    ``llama_or_mistral_ckpt.save_weights_to_checkpoint`` would produce with
+    ``use_ocdbt=False, use_zarr3=False``.
+    """
+    import zarr  # pylint: disable=import-outside-toplevel
+    import json  # pylint: disable=import-outside-toplevel
+    import time  # pylint: disable=import-outside-toplevel
+    import numcodecs  # pylint: disable=import-outside-toplevel
+
+    root = pathlib.Path(maxtext_model_path)
+    root.mkdir(parents=True, exist_ok=True)
+
+    step_dir = root / str(step)
+    items_dir = step_dir / "items"
+    if step_dir.exists():
+        shutil.rmtree(step_dir)
+    items_dir.mkdir(parents=True)
+
+    init_ts = time.time_ns()
+    # numcodecs.Zstd includes a "checksum" field that TensorStore rejects.
+    # Build the compressor spec manually to match what TensorStore expects.
+    compressor = numcodecs.Zstd(level=1)
+    _TS_COMPRESSOR = {"id": "zstd", "level": 1}  # no "checksum" field
+
+    # Step scalar (same format as Orbax produces)
+    z_step = zarr.open_array(
+        str(items_dir / "step"), mode="w",
+        shape=(), dtype="<i8",
+        compressor=compressor,
+        dimension_separator=".",
+    )
+    z_step[()] = step
+
+    # Parameter arrays, one at a time
+    total = len(flat_dict)
+    tree_meta: dict = {}
+    for i, (key, arr) in enumerate(flat_dict.items()):
+        zarr_name = f"params.params.{key}"
+        zarr_path = items_dir / zarr_name
+
+        # zarr v2 cannot cast ml_dtypes.bfloat16 via numpy's astype pathway.
+        # Workaround: write BF16 as uint16 (identical bytes), then patch .zarray
+        # to report the correct bfloat16 dtype.  TensorStore / Orbax reads raw
+        # bytes and interprets them correctly regardless of how they were written.
+        is_bf16 = getattr(arr.dtype, "name", "") == "bfloat16"
+        write_arr = arr.view(np.uint16) if is_bf16 else arr
+        write_dtype = np.uint16 if is_bf16 else arr.dtype
+
+        z = zarr.open_array(
+            str(zarr_path), mode="w",
+            shape=write_arr.shape,
+            dtype=write_dtype,
+            chunks=True,
+            compressor=compressor,
+            dimension_separator=".",
+        )
+        z[:] = write_arr          # pulls memmap in chunk-sized pieces
+        del z
+
+        # Strip the "checksum" field that numcodecs.Zstd adds to .zarray —
+        # TensorStore (used by Orbax internally) rejects unknown compressor fields.
+        zarray_path = zarr_path / ".zarray"
+        _meta = json.loads(zarray_path.read_text())
+        if isinstance(_meta.get("compressor"), dict):
+            _meta["compressor"].pop("checksum", None)
+            zarray_path.write_text(json.dumps(_meta))
+
+        if is_bf16:
+            zarray_file = zarr_path / ".zarray"
+            meta = json.loads(zarray_file.read_text())
+            meta["dtype"] = "bfloat16"
+            zarray_file.write_text(json.dumps(meta))
+
+        key_parts = ["params", "params"] + key.split(".")
+        tree_meta[str(tuple(key_parts))] = {
+            "key_metadata": [{"key": p, "key_type": 2} for p in key_parts],
+            "value_metadata": {"value_type": "np.ndarray", "skip_deserialize": False},
+        }
+        if (i + 1) % 50 == 0 or i + 1 == total:
+            max_logging.log(f"  [{i + 1}/{total}] wrote {key}")
+
+    # _METADATA (Orbax pytree structure descriptor)
+    metadata = {
+        "tree_metadata": {
+            "('step',)": {
+                "key_metadata": [{"key": "step", "key_type": 2}],
+                "value_metadata": {"value_type": "scalar", "skip_deserialize": False},
+            },
+            **tree_meta,
+            "('opt_state',)": {
+                "key_metadata": [{"key": "opt_state", "key_type": 2}],
+                "value_metadata": {"value_type": "Dict", "skip_deserialize": True},
+            },
+        },
+        "use_ocdbt": False,
+        "use_zarr3": False,
+        "store_array_data_equal_to_fill_value": True,
+        "custom_metadata": None,
+    }
+    (items_dir / "_METADATA").write_text(json.dumps(metadata))
+
+    # _CHECKPOINT_METADATA
+    (step_dir / "_CHECKPOINT_METADATA").write_text(json.dumps({
+        "item_handlers": {
+            "items": "orbax.checkpoint._src.handlers.pytree_checkpoint_handler.PyTreeCheckpointHandler"
+        },
+        "metrics": {},
+        "performance_metrics": {},
+        "init_timestamp_nsecs": init_ts,
+        "commit_timestamp_nsecs": time.time_ns(),
+        "custom_metadata": {},
+    }))
+
+    max_logging.log(
+        f"Checkpoint saved at {step_dir} "
+        f"({total} arrays, peak RAM bounded to largest single array)"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -532,8 +651,19 @@ def main(args):
             from huggingface_hub import snapshot_download  # pylint: disable=import-outside-toplevel
         except ImportError as exc:
             raise ImportError("Install huggingface_hub: pip install huggingface_hub") from exc
-        max_logging.log(f"Downloading '{model_path}' from HuggingFace Hub...")
-        model_path = snapshot_download(repo_id=model_path, ignore_patterns=["*.pt", "*.bin"])
+        # If tmpdir is on a large scratch disk, put the model download on the
+        # same disk (sibling directory) rather than ~/.cache (may be too small).
+        repo_local_name = model_path.split("/")[-1] + "_hf"
+        if args.tmpdir:
+            local_dir = str(pathlib.Path(args.tmpdir).parent / repo_local_name)
+        else:
+            local_dir = None  # fall back to HF cache default
+        max_logging.log(f"Downloading '{model_path}' from HuggingFace Hub to {local_dir or 'HF cache'}...")
+        model_path = snapshot_download(
+            repo_id=model_path,
+            local_dir=local_dir,
+            ignore_patterns=["*.pt", "*.bin"],
+        )
         max_logging.log(f"Downloaded to: {model_path}")
 
     # Resolve tmpdir: use the user-supplied path, auto-create a temp dir if
@@ -560,22 +690,15 @@ def main(args):
         # Skip the ~53-min conversion phase and restore memmaps from disk.
         if not tmpdir:
             raise ValueError("--resume_from_tmpdir requires --tmpdir <path>")
-        max_logging.log(f"Resuming: restoring memmaps from {tmpdir!r} (skipping conversion)")
+        max_logging.log(f"Resuming: restoring flat weight dict from {tmpdir!r} (skipping conversion)")
         _, flat = _MemmapStore.from_dir(tmpdir)
-        jax_weights = _unflatten(flat)
     else:
         params = MODEL_PARAMS[args.model_size]
         max_logging.log(f"Starting conversion for MiMo-V2-Flash ({args.model_size})")
-        jax_weights = convert_hf_to_maxtext(model_path, params, tmpdir=tmpdir)
+        flat = convert_hf_to_maxtext(model_path, params, tmpdir=tmpdir)
 
     max_logging.log(f"Saving MaxText checkpoint to: {args.maxtext_model_path}")
-    llama_or_mistral_ckpt.save_weights_to_checkpoint(
-        args.maxtext_model_path,
-        jax_weights,
-        args.simulated_cpu_devices_count,
-        args.use_ocdbt,
-        args.use_zarr3,
-    )
+    _save_zarr_direct(args.maxtext_model_path, flat)
     max_logging.log("Checkpoint saved successfully.")
 
     if _auto_tmpdir and tmpdir:
