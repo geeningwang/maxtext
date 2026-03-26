@@ -92,18 +92,21 @@ them to an Orbax checkpoint that MaxText can load.
 
 | Mode | Peak RAM | Disk (tmpdir) | Best for |
 |---|---|---|---|
-| **Streaming** (`--tmpdir`) | **~25 GB** | ~650 GB (bfloat16) | v6e-1, any low-RAM VM |
+| **Streaming** (`--tmpdir`) | **~25 GB** | ~576 GB (bfloat16) | v6e-1, any low-RAM VM |
 | In-RAM (default) | ~970 GB | none | Large multi-socket hosts |
 
 The streaming mode processes one decoder layer at a time and writes converted
 arrays to memory-mapped files so that RAM usage never exceeds approximately
-one MoE layer (~25 GB).  The only requirement is ~650 GB of free scratch space
+one MoE layer (~25 GB).  The only requirement is ~580 GB of free scratch space
 accessible from the VM (a local SSD or a mounted persistent disk).
+The output Orbax/zarr checkpoint (zstd-compressed bfloat16) takes an additional ~313 GB.
 
 ### Running on a v6e-1 (streaming mode)
 
 ```bash
-# Attach a persistent disk with ≥650 GB free, e.g. mounted at /mnt/scratch.
+# Attach a persistent disk with ≥600 GB free for the tmpdir scratch space,
+# plus ~313 GB for the output checkpoint (≥ ~920 GB total if both reside on
+# the same disk), e.g. mounted at /mnt/scratch.
 # Then run:
 python3 -m maxtext.checkpoint_conversion.standalone_scripts.convert_mimo_v2_flash \
     --base_model_path /local/path/to/MiMo-V2-Flash \
