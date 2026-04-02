@@ -544,7 +544,7 @@ def _write_one_zarr_array(
         str(zarr_path), mode="w",
         shape=write_arr.shape,
         dtype=write_dtype,
-        chunks=True,
+        chunks=write_arr.shape,  # single chunk = single GCS object; avoids 2000+ tiny HTTP requests
         compressor=compressor,
         dimension_separator=".",
     )
