@@ -610,6 +610,8 @@ def _write_checkpoint_metadata(
         "commit_timestamp_nsecs": time.time_ns(),
         "custom_metadata": {},
     }))
+    # GCS checkpoints require commit_success.txt to be considered finalized by Orbax.
+    (items_dir / "commit_success.txt").write_text("")
     max_logging.log(
         f"Checkpoint saved at {step_dir} "
         f"({total} arrays, peak RAM bounded to largest single array)"
