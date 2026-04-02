@@ -168,6 +168,7 @@ def attention_as_linen(
     mrope_section: tuple[int, int, int] | None = None,
     name: str | None = None,
     rope_type: str | None = None,
+    sink_param_name: str | None = None,
 ):
   """A factory function to create an Attention as a Linen module.
 
@@ -236,6 +237,7 @@ def attention_as_linen(
       mrope_section=mrope_section,
       name=name,
       rope_type=rope_type,
+      sink_param_name=sink_param_name,
       metadata_fn=variable_to_logically_partitioned,
       abstract_init=False,
   )
@@ -295,6 +297,7 @@ class Attention(nnx.Module):
       kv_quant: Optional[KVQuant] = None,
       v_head_dim: int | None = None,  # asymmetric V head dim (e.g., 128 for MiMo while Q/K=192)
       value_scale: float = 1.0,  # scalar applied to V projection output (e.g., 0.707 for MiMo)
+      sink_param_name: str | None = None,  # when set, creates sink with this name instead of "sinks" (e.g. "sink_bias" for MiMo SWA)
       attention_type: AttentionType = AttentionType.GLOBAL,  # Default to global attention
       attn_logits_soft_cap: float | None = None,
       sliding_window_size: int | None = None,
@@ -500,7 +503,17 @@ class Attention(nnx.Module):
 
     self._init_projections(inputs_q_shape, inputs_kv_shape)
 
-    if self.config.attention_sink:
+    # Attention sink: when sink_param_name is given, create param under that explicit name
+    # (e.g. "sink_bias" for MiMo SWA layers whose checkpoint uses that key).  Otherwise
+    # fall back to config.attention_sink → self.sinks (backward-compatible).
+    self._sink_param_name = sink_param_name
+    if sink_param_name is not None:
+      setattr(self, sink_param_name, nnx.Param(
+          default_bias_init(self.rngs.params(), (self.config.num_query_heads,), self.weight_dtype),
+          sharding=(None,),
+      ))
+      self.sinks = None  # not used when sink_param_name is set
+    elif self.config.attention_sink:
       self.sinks = nnx.Param(
           default_bias_init(self.rngs.params(), (self.config.num_query_heads,), self.weight_dtype),
           sharding=(None,),
@@ -898,6 +911,12 @@ class Attention(nnx.Module):
     else:
       return self.rotary_embedding(inputs, inputs_positions)
 
+  def _get_sinks(self):
+    """Returns the attention sink param (supporting both 'sinks' and custom-named params)."""
+    if self._sink_param_name is not None:
+      return getattr(self, self._sink_param_name, None)
+    return self.sinks
+
   def init_kv_caches(self, inputs_kv_shape: Tuple):
     """Initializes KVCache.
 
@@ -1010,7 +1029,7 @@ class Attention(nnx.Module):
         md.block_tables,
         md.query_start_loc,
         md.request_distribution,
-        self.sinks.astype(jnp.float32) if self.sinks is not None else None,
+        (lambda _s: _s.astype(jnp.float32) if _s is not None else None)(self._get_sinks()),
         1.0,
         attention_chunk_size,
         q_scale,
@@ -1186,7 +1205,7 @@ class Attention(nnx.Module):
           cached_values,
           previous_chunk,
           bidirectional_mask,
-          self.sinks,
+          self._get_sinks(),
       )
     out = jax.ad_checkpoint.checkpoint_name(out, "attention_out")
     if model_mode == MODEL_MODE_PREFILL:

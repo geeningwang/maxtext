@@ -373,6 +373,8 @@ class MiMoV2FlashDecoderLayer(nnx.Module):
         head_dim=cfg.head_dim,
         v_head_dim=cfg.mimo_v_head_dim if cfg.mimo_v_head_dim > 0 else None,
         value_scale=cfg.mimo_attention_value_scale,
+        # SWA layers have a learnable per-head sink bias in the checkpoint key "sink_bias".
+        sink_param_name="sink_bias" if is_swa else None,
         max_target_length=cfg.max_target_length,
         max_prefill_predict_length=cfg.max_prefill_predict_length,
         attention_kernel=cfg.attention,
