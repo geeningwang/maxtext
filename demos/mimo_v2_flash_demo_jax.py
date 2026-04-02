@@ -153,7 +153,8 @@ def build_decode_command(
         f"checkpoint_dir={checkpoint_path}",
         f"tokenizer_path={tokenizer_path}",
         f"tokenizer_type=huggingface",
-        f"prompt={prompt}",
+        # Wrap prompt in single quotes so OmegaConf treats colons/special chars as literals.
+        f"prompt='{prompt}'",
         f"max_prefill_predict_length={max_prefill}",
         f"max_target_length={max_target_length}",
         f"per_device_batch_size={per_device_batch_size}",
