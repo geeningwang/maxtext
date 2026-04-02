@@ -16,7 +16,8 @@
 r"""MaxText / JAX inference demo for MiMo-V2-Flash on TPU.
 
 This script demonstrates how to run the Xiaomi MiMo-V2-Flash model with
-MaxText on a single-host TPU (v4-8, v5litepod-8, Trillium, etc.).
+MaxText on a TPU.  It supports both single-host (e.g. v4-8, v5litepod-8,
+Ironwood-4) and multi-host (e.g. v6e-32 with 8 VMs) configurations.
 
 Prerequisites
 -------------
@@ -24,18 +25,34 @@ Prerequisites
 
    python3 -m maxtext.checkpoint_conversion.standalone_scripts.convert_mimo_v2_flash \
        --base_model_path XiaomiMiMo/MiMo-V2-Flash \
-       --maxtext_model_path gs://<bucket>/mimo-v2-flash/checkpoints/0/items
+       --maxtext_model_path gs://<bucket>/mimo-v2-flash/checkpoints/0/items \
+       --tmpdir /mnt/scratch/mimo_tmp \
+       --simulated_cpu_devices_count 1
 
 2. This script calls MaxText's ``maxtext.inference.decode`` module which
    requires an initialised TPU environment (jax >= 0.4.30, libtpu).
 
 Usage
 -----
-# On a TPU VM (full inference):
+# Single-host TPU (v4-8, Ironwood-4, etc.):
 python3 demos/mimo_v2_flash_demo_jax.py \
     --checkpoint_path gs://<bucket>/mimo-v2-flash/checkpoints/0/items \
     --tokenizer_path XiaomiMiMo/MiMo-V2-Flash \
+    --ici_tensor_parallelism 4 \
     --prompt "Explain the key difference between attention and cross-attention."
+
+# Multi-host TPU v6e-32 (8 VMs, 32 chips total) — MUST run on all workers:
+#
+#   IMPORTANT: For multi-host TPU slices, JAX requires all workers to start
+#   simultaneously.  Launch with --worker=all from the manager VM:
+#
+gcloud compute tpus tpu-vm ssh <tpu-name> --zone=<zone> --worker=all \
+    --command="cd maxtext && source maxtext_venv/bin/activate && \
+        python3 demos/mimo_v2_flash_demo_jax.py \
+            --checkpoint_path gs://<bucket>/mimo-v2-flash/checkpoints/0/items \
+            --tokenizer_path XiaomiMiMo/MiMo-V2-Flash \
+            --ici_tensor_parallelism 32 \
+            --prompt 'Solve step by step: A train travels at 120 km/h...'"
 
 # Dry-run on CPU (verifies config validity only, skips actual model execution):
 python3 demos/mimo_v2_flash_demo_jax.py \
@@ -114,11 +131,18 @@ def build_decode_command(
     prompt: str,
     run_name: str = "mimo_v2_flash_demo",
     max_prefill: int = DEFAULT_PREFILL_LENGTH,
-    max_target: int = DEFAULT_MAX_NEW_TOKENS,
+    max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS,
     per_device_batch_size: int = 1,
     dtype: str = "bfloat16",
+    ici_tensor_parallelism: int = 32,
 ) -> list[str]:
-    """Build the shell command for maxtext.inference.decode."""
+    """Build the shell command for maxtext.inference.decode.
+
+    Note: MaxText's ``max_target_length`` is the *total* sequence length
+    (prefill tokens + generated tokens), so it is computed as
+    ``max_prefill + max_new_tokens``.
+    """
+    max_target_length = max_prefill + max_new_tokens
     cmd = [
         sys.executable,
         "-m",
@@ -131,11 +155,12 @@ def build_decode_command(
         f"tokenizer_type=huggingface",
         f"prompt={prompt}",
         f"max_prefill_predict_length={max_prefill}",
-        f"max_target_length={max_target}",
+        f"max_target_length={max_target_length}",
         f"per_device_batch_size={per_device_batch_size}",
         f"dtype={dtype}",
-        # Do not reproduce attention sink bias variance by overriding
         f"weight_dtype={dtype}",
+        f"ici_tensor_parallelism={ici_tensor_parallelism}",
+        "scan_layers=false",
     ]
     return cmd
 
@@ -148,6 +173,7 @@ def run_inference(
     max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS,
     dtype: str = "bfloat16",
     verbose: bool = False,
+    ici_tensor_parallelism: int = 32,
 ) -> str:
     """Execute MaxText inference and return the generated text."""
     cmd = build_decode_command(
@@ -155,8 +181,9 @@ def run_inference(
         tokenizer_path=tokenizer_path,
         prompt=prompt,
         max_prefill=max_prefill,
-        max_target=max_new_tokens,
+        max_new_tokens=max_new_tokens,
         dtype=dtype,
+        ici_tensor_parallelism=ici_tensor_parallelism,
     )
     if verbose:
         print("Running command:")
@@ -182,21 +209,38 @@ def dry_run(checkpoint_path: str, tokenizer_path: str):
     """Validate that MaxText config parses correctly without running inference."""
     print("Dry-run: validating MiMo-V2-Flash MaxText config...")
     import os
+    import pathlib
     os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
-    sys.path.insert(0, str(
-        __import__("pathlib").Path(__file__).resolve().parents[1] / "src"
-    ))
+    # Locate the MaxText repo root:
+    #   • Normal invocation: __file__ = <repo>/demos/mimo_v2_flash_demo_jax.py
+    #     → parents[1] = <repo>
+    #   • Script copied elsewhere: fall back to CWD.
+    _script = pathlib.Path(__file__).resolve()
+    _candidate_root = _script.parents[1]
+    _base_yml = _candidate_root / "src/maxtext/configs/base.yml"
+    if _base_yml.exists():
+        _repo_root = _candidate_root
+    else:
+        _repo_root = pathlib.Path(os.getcwd())
+
+    base_cfg = str(_repo_root / "src/maxtext/configs/base.yml")
+    mimo_cfg = str(_repo_root / "src/maxtext/configs/models/mimo-v2-flash.yml")
+
+    sys.path.insert(0, str(_repo_root / "src"))
 
     try:
         from maxtext.configs import pyconfig  # pylint: disable=import-outside-toplevel
         argv = [
             "dry_run",
-            "src/maxtext/configs/base.yml",
-            "src/maxtext/configs/models/mimo-v2-flash.yml",
+            base_cfg,
+            mimo_cfg,
             f"run_name=mimo_dry_run",
             f"checkpoint_dir={checkpoint_path}",
             f"tokenizer_path={tokenizer_path}",
+            # max_target_length must be >= max_prefill_predict_length.
+            # Use small consistent values so the dry-run is fast.
+            "max_prefill_predict_length=64",
             "max_target_length=128",
             "per_device_batch_size=1",
         ]
@@ -299,6 +343,14 @@ def main():
         help="Print the MaxText decode command before running it.",
     )
     parser.add_argument(
+        "--ici_tensor_parallelism",
+        type=int,
+        default=32,
+        help="ICI tensor-parallel degree. Default 32 matches a v6e-32 slice "
+             "(all 32 chips, pure TP). Adjust for other topologies: "
+             "e.g. 4 for a single-host Ironwood-4.",
+    )
+    parser.add_argument(
         "--print_arch",
         action="store_true",
         default=False,
@@ -326,6 +378,7 @@ def main():
         max_new_tokens=args.max_new_tokens,
         dtype=args.dtype,
         verbose=args.verbose,
+        ici_tensor_parallelism=args.ici_tensor_parallelism,
     )
     print(f"Output:\n{output}")
 

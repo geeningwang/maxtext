@@ -161,18 +161,41 @@ per layer) are the peak allocation, at ~25 GB in float32.
 
 ## Step 2: Run Inference
 
+> **Multi-host note (v6e-32 / 8 VMs):** JAX requires *all* workers to start
+> simultaneously on a multi-host TPU slice.  Always use `--worker=all` when
+> launching from the manager VM.  Single-host examples below can be run
+> directly on the TPU VM; replace `python3 …` with the `--worker=all` form
+> for the v6e-32 cluster.
+
 ### Using the JAX demo script
+
+#### Single-host (v4-8, Ironwood-4, …)
 
 ```bash
 python3 demos/mimo_v2_flash_demo_jax.py \
     --checkpoint_path gs://<your-bucket>/mimo-v2-flash/checkpoints/0/items \
     --tokenizer_path XiaomiMiMo/MiMo-V2-Flash \
-    --prompt "Solve step by step: if a rectangle has perimeter 48 and one side 10,
-what is its area?" \
+    --ici_tensor_parallelism 4 \
+    --prompt "Solve step by step: if a rectangle has perimeter 48 and one side 10, what is its area?" \
     --max_new_tokens 256
 ```
 
+#### Multi-host v6e-32 (8 VMs, 32 chips — run from manager VM)
+
+```bash
+gcloud compute tpus tpu-vm ssh <tpu-node> --zone=<zone> --worker=all \
+    --command="cd maxtext && source maxtext_venv/bin/activate && \
+        python3 demos/mimo_v2_flash_demo_jax.py \
+            --checkpoint_path gs://<your-bucket>/mimo-v2-flash/checkpoints/0/items \
+            --tokenizer_path XiaomiMiMo/MiMo-V2-Flash \
+            --ici_tensor_parallelism 32 \
+            --prompt 'Solve step by step: if a rectangle has perimeter 48 and one side 10, what is its area?' \
+            --max_new_tokens 256"
+```
+
 ### Using `maxtext.inference.decode` directly
+
+#### Single-host
 
 ```bash
 python3 -m maxtext.inference.decode \
@@ -185,7 +208,29 @@ python3 -m maxtext.inference.decode \
     prompt="What is the capital of France?" \
     per_device_batch_size=1 \
     max_prefill_predict_length=512 \
-    max_target_length=1024
+    max_target_length=1024 \
+    ici_tensor_parallelism=4 \
+    scan_layers=false
+```
+
+#### Multi-host v6e-32 (run from manager VM)
+
+```bash
+gcloud compute tpus tpu-vm ssh <tpu-node> --zone=<zone> --worker=all \
+    --command="cd maxtext && source maxtext_venv/bin/activate && \
+        python3 -m maxtext.inference.decode \
+            src/maxtext/configs/base.yml \
+            src/maxtext/configs/models/mimo-v2-flash.yml \
+            run_name=mimo_inference_run \
+            checkpoint_dir=gs://<your-bucket>/mimo-v2-flash/checkpoints/0/items \
+            tokenizer_path=XiaomiMiMo/MiMo-V2-Flash \
+            tokenizer_type=huggingface \
+            prompt='What is the capital of France?' \
+            per_device_batch_size=1 \
+            max_prefill_predict_length=512 \
+            max_target_length=1024 \
+            ici_tensor_parallelism=32 \
+            scan_layers=false"
 ```
 
 ### HuggingFace reference baseline
