@@ -375,12 +375,14 @@ class MiMoV2FlashMoEGate(nnx.Module):
     self.weight = nnx.Param(
         jax.random.normal(rngs.params(), (num_experts, hidden_size), dtype=weight_dtype)
         * (hidden_size ** -0.5),
+        sharding=("exp", "embed_no_exp"),
     )
 
     # Correction bias for noaux-TC top-k selection: (num_experts,).
     # Initialised to zeros; loaded from checkpoint at inference time.
     self.e_score_correction_bias = nnx.Param(
         jnp.zeros((num_experts,), dtype=weight_dtype),
+        sharding=("exp",),
     )
 
   def __call__(self, hidden_states: Array):
@@ -475,12 +477,15 @@ class MiMoV2FlashSparseMoeBlock(nnx.Module):
 
     self.wi_0 = nnx.Param(  # gate projection
         ki(rngs.params(), wi_shape, cfg.weight_dtype, 1, 2),
+        sharding=("exp", "embed_no_exp", "mlp"),
     )
     self.wi_1 = nnx.Param(  # up projection
         ki(rngs.params(), wi_shape, cfg.weight_dtype, 1, 2),
+        sharding=("exp", "embed_no_exp", "mlp"),
     )
     self.wo = nnx.Param(   # down projection
         ki(rngs.params(), wo_shape, cfg.weight_dtype, 1, 2),
+        sharding=("exp", "mlp", "embed_no_exp"),
     )
 
   def __call__(self, hidden_states: Array, deterministic: bool) -> Array:
