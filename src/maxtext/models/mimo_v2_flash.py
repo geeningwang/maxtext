@@ -50,9 +50,6 @@ from maxtext.common.common_types import (
     Config,
     DType,
     Array,
-    BATCH,
-    LENGTH_NO_EXP,
-    EMBED,
 )
 from maxtext.layers import initializers as max_initializers
 from maxtext.layers import nnx_wrappers
@@ -60,278 +57,10 @@ from maxtext.layers import quantizations
 from maxtext.layers.normalizations import RMSNorm
 from maxtext.layers.initializers import variable_to_logically_partitioned
 from maxtext.layers.quantizations import AqtQuantization as Quant
-from maxtext.layers.linears import DenseGeneral, MlpBlock
-from maxtext.layers.embeddings import PartialRotaryEmbedding, LLaMARotaryEmbedding
-from maxtext.layers.initializers import nd_dense_init
+from maxtext.layers.linears import MlpBlock
+from maxtext.layers.attentions import Attention, AttentionType
 from maxtext.utils import max_utils
 
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _repeat_kv(x: Array, n_rep: int) -> Array:
-  """Repeat KV heads to match Q heads for grouped-query attention.
-
-  Args:
-    x: Shape (batch, seq_len, kv_heads, head_dim).
-    n_rep: Number of times to repeat each KV head.
-
-  Returns:
-    Shape (batch, seq_len, kv_heads * n_rep, head_dim).
-  """
-  if n_rep == 1:
-    return x
-  batch, seq, h, d = x.shape
-  x = jnp.broadcast_to(x[:, :, :, jnp.newaxis, :], (batch, seq, h, n_rep, d))
-  return x.reshape(batch, seq, h * n_rep, d)
-
-
-def _make_causal_mask(q_len: int, kv_len: int, dtype: DType) -> Array:
-  """Lower-triangular causal mask of shape (1, 1, q_len, kv_len)."""
-  mask = jnp.tril(jnp.ones((q_len, kv_len), dtype=jnp.bool_))
-  return jnp.where(mask, jnp.zeros((1, 1, q_len, kv_len), dtype=dtype),
-                   jnp.full((1, 1, q_len, kv_len), jnp.finfo(dtype).min, dtype=dtype))
-
-
-def _make_sliding_window_mask(q_len: int, kv_len: int, window: int, dtype: DType) -> Array:
-  """Causal + sliding-window mask.
-
-  Each query position attends only to the ``window`` most-recent key positions
-  that are ≤ its own position.
-  """
-  q_idx = jnp.arange(q_len)[:, jnp.newaxis]   # (q_len, 1)
-  k_idx = jnp.arange(kv_len)[jnp.newaxis, :]  # (1, kv_len)
-  causal = k_idx <= q_idx
-  window_ok = k_idx > (q_idx - window)
-  mask = causal & window_ok
-  return jnp.where(mask, jnp.zeros((1, 1, q_len, kv_len), dtype=dtype),
-                   jnp.full((1, 1, q_len, kv_len), jnp.finfo(dtype).min, dtype=dtype))
-
-
-# ---------------------------------------------------------------------------
-# MiMoV2FlashAttention
-# ---------------------------------------------------------------------------
-
-class MiMoV2FlashAttention(nnx.Module):
-  """MiMo-V2-Flash attention layer.
-
-  Supports both global (full causal) and sliding-window attention as
-  determined by ``is_swa``.
-
-  Key differences from standard attention:
-  * Q/K head dim (192) ≠ V head dim (128) — output projection operates on
-    ``num_q_heads × v_head_dim``, not ``num_q_heads × head_dim``.
-  * Partial RoPE: only the first ``rope_dim = int(head_dim * partial_rotary_factor)``
-    dimensions of each Q/K head are rotated; the rest are passed through unchanged.
-  * Two sets of RoPE parameters: ``rope_theta`` for global layers, ``swa_rope_theta``
-    for SWA layers (each is 1 RoPE instance; whichever applies is constructed here).
-  * Optional per-head attention sink bias added to logits (SWA layers by default).
-  * GQA with ``num_kv_heads`` (4 for GA, 8 for SWA) shared KV heads for 64 Q heads.
-
-  Args:
-    config: MaxText configuration object.
-    mesh: The device mesh for sharding.
-    is_swa: If True, this is a sliding-window attention layer.
-    layer_idx: Index of the layer in the transformer stack.
-    quant: Optional quantization configuration.
-    rngs: PRNG keys for parameter initialisation.
-  """
-
-  def __init__(
-      self,
-      config: Config,
-      mesh: Mesh,
-      is_swa: bool,
-      layer_idx: int,
-      quant: None | Quant = None,
-      *,
-      rngs: nnx.Rngs,
-  ):
-    self.config = config
-    self.mesh = mesh
-    self.is_swa = is_swa
-    self.layer_idx = layer_idx
-    self.quant = quant
-
-    cfg = self.config
-    dtype: DType = cfg.dtype
-    weight_dtype: DType = cfg.weight_dtype
-
-    self.head_dim: int = cfg.head_dim                         # Q/K head dim = 192
-    self.v_head_dim: int = cfg.mimo_v_head_dim if cfg.mimo_v_head_dim > 0 else cfg.head_dim  # V head dim = 128
-    self.num_q_heads: int = cfg.num_query_heads               # 64
-    self.num_kv_heads: int = (
-        cfg.mimo_swa_num_kv_heads if (is_swa and cfg.mimo_swa_num_kv_heads > 0)
-        else cfg.num_kv_heads
-    )                                                          # 8 (SWA) or 4 (GA)
-    self.n_kv_groups: int = self.num_q_heads // self.num_kv_heads
-
-    # Partial RoPE: rotate the first rope_dim dimensions of Q/K.
-    self.partial_rotary_factor: float = cfg.partial_rotary_factor
-    self.rope_dim: int = int(self.head_dim * self.partial_rotary_factor)
-
-    # Choose RoPE theta according to attention type.
-    rope_theta = cfg.mimo_swa_rope_theta if is_swa else cfg.rope_max_timescale
-
-    self.rotary_embedding = PartialRotaryEmbedding(
-        min_timescale=1,
-        max_timescale=int(rope_theta),
-        mesh=mesh,
-        embedding_dims=self.head_dim,
-        fprop_dtype=dtype,
-        partial_rotary_factor=self.partial_rotary_factor,
-        rngs=rngs,
-    )
-
-    # Per-layer attention scale: 1 / sqrt(head_dim).
-    self.attn_scale: float = self.head_dim ** -0.5
-
-    # Optional attention sink bias (learnable, per Q-head).
-    add_sink = is_swa  # SWA layers use sink bias; GA layers do not by default
-    if add_sink:
-      self.sink_bias = nnx.Param(
-          jnp.zeros((self.num_q_heads,), dtype=weight_dtype),
-      )
-    else:
-      self.sink_bias = None
-
-    # Q projection: hidden → (num_q_heads, head_dim).
-    self.query = DenseGeneral(
-        in_features_shape=cfg.emb_dim,
-        out_features_shape=(self.num_q_heads, self.head_dim),
-        use_bias=False,
-        dtype=dtype,
-        weight_dtype=weight_dtype,
-        kernel_init=nd_dense_init(1.0, "fan_in", "truncated_normal"),
-        kernel_axes=("embed", "heads", "kv_head_dim"),
-        matmul_precision=cfg.matmul_precision,
-        rngs=rngs,
-    )
-
-    # K projection: hidden → (num_kv_heads, head_dim).
-    self.key = DenseGeneral(
-        in_features_shape=cfg.emb_dim,
-        out_features_shape=(self.num_kv_heads, self.head_dim),
-        use_bias=False,
-        dtype=dtype,
-        weight_dtype=weight_dtype,
-        kernel_init=nd_dense_init(1.0, "fan_in", "truncated_normal"),
-        kernel_axes=("embed", "kv_heads", "kv_head_dim"),
-        matmul_precision=cfg.matmul_precision,
-        rngs=rngs,
-    )
-
-    # V projection: hidden → (num_kv_heads, v_head_dim).
-    self.value = DenseGeneral(
-        in_features_shape=cfg.emb_dim,
-        out_features_shape=(self.num_kv_heads, self.v_head_dim),
-        use_bias=False,
-        dtype=dtype,
-        weight_dtype=weight_dtype,
-        kernel_init=nd_dense_init(1.0, "fan_in", "truncated_normal"),
-        kernel_axes=("embed", "kv_heads", "kv_head_dim"),
-        matmul_precision=cfg.matmul_precision,
-        rngs=rngs,
-    )
-
-    # Output projection: (num_q_heads × v_head_dim) → hidden.
-    self.out = DenseGeneral(
-        in_features_shape=(self.num_q_heads, self.v_head_dim),
-        out_features_shape=cfg.emb_dim,
-        axis=(-2, -1),
-        use_bias=False,
-        dtype=dtype,
-        weight_dtype=weight_dtype,
-        kernel_init=nd_dense_init(1.0, "fan_in", "truncated_normal"),
-        kernel_axes=("heads", "kv_head_dim", "embed"),
-        matmul_precision=cfg.matmul_precision,
-        rngs=rngs,
-    )
-
-  def __call__(
-      self,
-      inputs: Array,
-      decoder_positions: None | Array,
-      decoder_segment_ids: None | Array,
-      deterministic: bool,
-      model_mode: str,
-  ) -> Array:
-    """Forward pass.
-
-    Args:
-      inputs: Shape (batch, seq_len, emb_dim).
-      decoder_positions: Integer positions for RoPE, shape (batch, seq_len).
-      decoder_segment_ids: Optional segment IDs for packed sequences.
-      deterministic: Disables dropout when True.
-      model_mode: One of 'train', 'prefill', 'autoregressive'.
-
-    Returns:
-      Output tensor of shape (batch, seq_len, emb_dim).
-    """
-    cfg = self.config
-    batch, q_len, _ = inputs.shape
-
-    # Projections ---------------------------------------------------------
-
-    # query: (B, S, H_q, D_qk)
-    query = self.query(inputs)
-    # key:   (B, S, H_kv, D_qk)
-    key = self.key(inputs)
-    # value: (B, S, H_kv, D_v)
-    value = self.value(inputs)
-
-    # Optional value scaling (attention_value_scale = 0.707 for MiMo).
-    if cfg.mimo_attention_value_scale != 1.0:
-      value = value * cfg.mimo_attention_value_scale
-
-    # Partial RoPE --------------------------------------------------------
-    # Apply separately to Q and K; V is never rotated.
-    query = self.rotary_embedding(query, decoder_positions)
-    key = self.rotary_embedding(key, decoder_positions)
-
-    # GQA: repeat K/V to match Q heads ------------------------------------
-    key_full = _repeat_kv(key, self.n_kv_groups)     # (B, S, H_q, D_qk)
-    value_full = _repeat_kv(value, self.n_kv_groups)  # (B, S, H_q, D_v)
-
-    # Attention computation -----------------------------------------------
-    # Transpose to (B, H, S, D) layout for einsum.
-    q = jnp.transpose(query, (0, 2, 1, 3))       # (B, H_q, S, D_qk)
-    k = jnp.transpose(key_full, (0, 2, 1, 3))   # (B, H_q, S, D_qk)
-    v = jnp.transpose(value_full, (0, 2, 1, 3)) # (B, H_q, S, D_v)
-
-    # Scaled dot-product: (B, H, S_q, S_k)
-    attn_weights = jnp.einsum("bHqd,bHkd->bHqk", q, k, precision=lax.Precision.DEFAULT)
-    attn_weights = attn_weights * self.attn_scale
-
-    # Causal (+ sliding-window) mask.
-    kv_len = k.shape[2]
-    if self.is_swa and cfg.mimo_swa_window_size > 0:
-      mask = _make_sliding_window_mask(q_len, kv_len, cfg.mimo_swa_window_size,
-                                       attn_weights.dtype)
-    else:
-      mask = _make_causal_mask(q_len, kv_len, attn_weights.dtype)
-    attn_weights = attn_weights + mask
-
-    # Attention sink bias: add a learned scalar per Q-head as an extra "sink"
-    # logit *before* softmax so the model can ignore positions it doesn't need.
-    if self.sink_bias is not None:
-      # sink is shape (H_q,); reshape to (1, H_q, 1, 1) for broadcasting.
-      sink = self.sink_bias[...].reshape(1, self.num_q_heads, 1, 1).astype(jnp.float32)
-      attn_weights = attn_weights + sink
-
-    # Softmax in float32 for numerical stability.
-    attn_weights = jax.nn.softmax(attn_weights.astype(jnp.float32), axis=-1).astype(cfg.dtype)
-
-    # Context: (B, H, S_q, D_v)
-    context = jnp.einsum("bHqk,bHkd->bHqd", attn_weights, v, precision=lax.Precision.DEFAULT)
-
-    # Output projection ---------------------------------------------------
-    # Transpose back to (B, S, H, D_v) then project.
-    context = jnp.transpose(context, (0, 2, 1, 3))  # (B, S, H_q, D_v)
-    output = self.out(context)                       # (B, S, emb_dim)
-
-    return output
 
 
 # ---------------------------------------------------------------------------
@@ -626,13 +355,46 @@ class MiMoV2FlashDecoderLayer(nnx.Module):
         rngs=rngs,
     )
 
-    # Self-attention (global or SWA).
-    self.self_attn = MiMoV2FlashAttention(
+    # Self-attention: uses MaxText standard Attention NNX module with KV caching.
+    # MiMo-specific params: v_head_dim=128, value_scale=0.707, partial RoPE (factor=0.334),
+    # SWA layers use AttentionType.LOCAL_SLIDING with local_rope_max_timescale (= mimo_swa_rope_theta).
+    num_kv_heads = (
+        cfg.mimo_swa_num_kv_heads if (is_swa and cfg.mimo_swa_num_kv_heads > 0)
+        else cfg.num_kv_heads
+    )
+    attn_type = AttentionType.LOCAL_SLIDING if is_swa else AttentionType.GLOBAL
+    sliding_window = cfg.mimo_swa_window_size if is_swa else None
+    batch_size, seq_len = max_utils.get_batch_seq_len_for_mode(cfg, model_mode)
+    dummy_inputs_shape = (batch_size, seq_len, cfg.emb_dim)
+    self.self_attn = Attention(
         config=cfg,
+        num_query_heads=cfg.num_query_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=cfg.head_dim,
+        v_head_dim=cfg.mimo_v_head_dim if cfg.mimo_v_head_dim > 0 else None,
+        value_scale=cfg.mimo_attention_value_scale,
+        max_target_length=cfg.max_target_length,
+        max_prefill_predict_length=cfg.max_prefill_predict_length,
+        attention_kernel=cfg.attention,
+        inputs_q_shape=dummy_inputs_shape,
+        inputs_kv_shape=dummy_inputs_shape,
         mesh=mesh,
-        is_swa=is_swa,
-        layer_idx=layer_idx,
+        dtype=cfg.dtype,
+        weight_dtype=cfg.weight_dtype,
+        dropout_rate=cfg.dropout_rate,
+        float32_qk_product=cfg.float32_qk_product,
+        float32_logits=cfg.float32_logits,
         quant=quant,
+        kv_quant=quantizations.configure_kv_quant(cfg),
+        attention_type=attn_type,
+        sliding_window_size=sliding_window,
+        prefill_cache_axis_order=tuple(map(int, cfg.prefill_cache_axis_order.split(","))),
+        ar_cache_axis_order=tuple(map(int, cfg.ar_cache_axis_order.split(","))),
+        compute_axis_order=tuple(map(int, cfg.compute_axis_order.split(","))),
+        reshape_q=cfg.reshape_q,
+        use_ragged_attention=cfg.use_ragged_attention,
+        ragged_block_size=cfg.ragged_block_size,
+        model_mode=model_mode,
         rngs=rngs,
     )
 
@@ -700,11 +462,11 @@ class MiMoV2FlashDecoderLayer(nnx.Module):
     hidden_states = self.input_layernorm(inputs)
     hidden_states = nn.with_logical_constraint(hidden_states, self.activation_axis_names)
 
-    attn_output = self.self_attn(
-        inputs=hidden_states,
-        decoder_positions=decoder_positions,
-        decoder_segment_ids=decoder_segment_ids,
-        deterministic=deterministic,
+    attn_output, _ = self.self_attn(
+        hidden_states,
+        hidden_states,
+        decoder_positions,
+        decoder_segment_ids,
         model_mode=model_mode,
     )
 

@@ -62,6 +62,7 @@ partial_rotary_factor: 0.334
 mimo_v_head_dim: 128          # V projection head dimension (different from Q/K 192)
 mimo_swa_num_kv_heads: 8      # KV heads for sliding-window attention layers
 mimo_swa_rope_theta: 10000.0  # RoPE theta for SWA layers
+local_rope_max_timescale: 10000  # = mimo_swa_rope_theta; used by Attention for LOCAL_SLIDING layers
 mimo_swa_window_size: 128     # Sliding-window size (tokens)
 mimo_attention_value_scale: 0.707  # Scale applied to V projection output
 

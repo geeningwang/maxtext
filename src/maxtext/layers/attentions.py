@@ -122,6 +122,8 @@ def attention_as_linen(
     float32_logits: bool = False,  # cast logits in float32 for stability.
     quant: Optional[Quant] = None,
     kv_quant: Optional[KVQuant] = None,
+    v_head_dim: int | None = None,  # asymmetric V head dim (e.g., 128 for MiMo while Q/K=192)
+    value_scale: float = 1.0,  # scalar applied to V projection output
     attention_type: AttentionType = AttentionType.GLOBAL,  # Default to global attention
     attn_logits_soft_cap: float | None = None,
     sliding_window_size: int | None = None,
@@ -192,6 +194,8 @@ def attention_as_linen(
       float32_logits=float32_logits,
       quant=quant,
       kv_quant=kv_quant,
+      v_head_dim=v_head_dim,
+      value_scale=value_scale,
       attention_type=attention_type,
       attn_logits_soft_cap=attn_logits_soft_cap,
       sliding_window_size=sliding_window_size,
@@ -289,6 +293,8 @@ class Attention(nnx.Module):
       float32_logits: bool = False,  # cast logits in float32 for stability.
       quant: Optional[Quant] = None,
       kv_quant: Optional[KVQuant] = None,
+      v_head_dim: int | None = None,  # asymmetric V head dim (e.g., 128 for MiMo while Q/K=192)
+      value_scale: float = 1.0,  # scalar applied to V projection output (e.g., 0.707 for MiMo)
       attention_type: AttentionType = AttentionType.GLOBAL,  # Default to global attention
       attn_logits_soft_cap: float | None = None,
       sliding_window_size: int | None = None,
@@ -382,6 +388,8 @@ class Attention(nnx.Module):
     self.num_query_heads = num_query_heads
     self.num_kv_heads = num_kv_heads
     self.head_dim = head_dim
+    self.v_head_dim = v_head_dim if v_head_dim is not None else head_dim
+    self.value_scale = value_scale
     self.max_target_length = max_target_length
     self.mesh = mesh
     self.attention_kernel = attention_kernel
@@ -564,7 +572,7 @@ class Attention(nnx.Module):
       self.query = self.init_query_w(inputs_q_shape=inputs_q_shape)
       self.key = self.init_kv_w(inputs_kv_shape=inputs_kv_shape)
       if not self.share_kv_projections:
-        self.value = self.init_kv_w(inputs_kv_shape=inputs_kv_shape)
+        self.value = self.init_kv_w(inputs_kv_shape=inputs_kv_shape, head_size=self.v_head_dim)
     self.out = self.init_out_w(output_dim=inputs_q_shape[-1])
 
   def init_query_w(self, inputs_q_shape: Tuple) -> nnx.Module:
@@ -613,11 +621,12 @@ class Attention(nnx.Module):
 
     return self.query(inputs_q, out_sharding=out_sharding)
 
-  def init_kv_w(self, inputs_kv_shape: Tuple) -> nnx.Module:
+  def init_kv_w(self, inputs_kv_shape: Tuple, head_size: int | None = None) -> nnx.Module:
     """Initializes the key or value projection.
 
     Args:
       inputs_kv_shape: Key/value inputs shape for initialization.
+      head_size: Override the head size for this projection. Defaults to self.head_dim.
 
     Returns:
       A DenseGeneral module that performs the key or value projection.
@@ -633,10 +642,11 @@ class Attention(nnx.Module):
         if self.config.ici_context_autoregressive_parallelism > 1
         else ("embed", "kv_heads", "kv_head_dim")
     )
+    out_head_size = head_size if head_size is not None else self.head_dim
 
     return DenseGeneral(
         in_features_shape=self.convert_dense_general_inputs_shape(inputs_kv_shape),
-        out_features_shape=(self.num_kv_heads, self.head_dim),
+        out_features_shape=(self.num_kv_heads, out_head_size),
         axis=-1,
         kernel_init=self.kernel_init,
         kernel_axes=kernel_axes,
@@ -697,7 +707,7 @@ class Attention(nnx.Module):
 
   def init_out_w(self, output_dim: int) -> nnx.Module:
     """out projection"""
-    in_features = (self.num_query_heads, self.head_dim)
+    in_features = (self.num_query_heads, self.v_head_dim)
     out_features = output_dim
     out_kernel_axis = (
         (None, None, None) if self.config.ici_context_autoregressive_parallelism > 1 else ("heads", "kv", "embed")
@@ -825,6 +835,23 @@ class Attention(nnx.Module):
           shard_mode=self.config.shard_mode,
           rngs=self.rngs,
       )
+    elif self.config.partial_rotary_factor < 1.0:
+      # Partial RoPE: only the first `int(head_dim * partial_rotary_factor)` dims are rotated.
+      # Supports per-layer theta via local_rope_max_timescale (e.g., MiMo SWA layers).
+      max_timescale = self.config.rope_max_timescale
+      if self.attention_type == AttentionType.LOCAL_SLIDING and self.config.local_rope_max_timescale > 0:
+        max_timescale = self.config.local_rope_max_timescale
+      rotary_embedding = PartialRotaryEmbedding(
+          min_timescale=self.config.rope_min_timescale,
+          max_timescale=max_timescale,
+          mesh=self.mesh,
+          embedding_dims=self.head_dim,
+          partial_rotary_factor=self.config.partial_rotary_factor,
+          cast_as_fprop_dtype=True,
+          fprop_dtype=self.dtype,
+          shard_mode=self.config.shard_mode,
+          rngs=self.rngs,
+      )
     else:
       max_timescale = self.config.rope_max_timescale
       # For local attention use local_rope_max_timescale if it's is positive
@@ -899,7 +926,7 @@ class Attention(nnx.Module):
         key_heads=self.num_kv_heads,
         value_heads=self.num_kv_heads,
         key_head_size=self.head_dim,
-        value_head_size=self.head_dim,
+        value_head_size=self.v_head_dim,
         dtype=self.dtype,
         kv_quant=self.kv_quant,
         prefill_cache_axis_order=self.prefill_cache_axis_order,
@@ -1065,6 +1092,10 @@ class Attention(nnx.Module):
         value = key
       else:
         value = self.kv_projection(inputs_kv, proj_name="value", out_sharding=qkv_sharding)
+
+    # Apply optional value scaling (e.g., mimo_attention_value_scale=0.707 for MiMo-V2-Flash).
+    if self.value_scale != 1.0:
+      value = value * self.value_scale
 
     gate = None
     if self.is_qwen3_next:
