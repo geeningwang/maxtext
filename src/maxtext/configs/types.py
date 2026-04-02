@@ -252,6 +252,7 @@ ModelName = Literal[
     "olmo3-7b",
     "olmo3-7b-pt",
     "olmo3-32b",
+    "mimo-v2-flash",
 ]
 
 
