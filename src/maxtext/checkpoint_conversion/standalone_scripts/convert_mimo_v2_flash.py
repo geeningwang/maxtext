@@ -642,14 +642,16 @@ def convert_and_save_streaming(
     root.mkdir(parents=True, exist_ok=True)
     step_dir = root / str(step)
     items_dir = step_dir / "items"
-    if step_dir.exists():
-        shutil.rmtree(step_dir)
-    items_dir.mkdir(parents=True)
+    try:
+        if step_dir.exists():
+            shutil.rmtree(step_dir)
+    except OSError as _e:
+        # gcsfuse does not support rmdir; zarr mode="w" will overwrite existing files.
+        max_logging.log(f"Note: could not remove {step_dir} ({_e}); zarr will overwrite in place.")
+    items_dir.mkdir(parents=True, exist_ok=True)
 
     init_ts = time.time_ns()
     compressor = numcodecs.Zstd(level=1)
-
-    # Write the step scalar first.
     z_step = zarr.open_array(
         str(items_dir / "step"), mode="w",
         shape=(), dtype="<i8",
@@ -719,9 +721,12 @@ def _save_zarr_direct(
 
     step_dir = root / str(step)
     items_dir = step_dir / "items"
-    if step_dir.exists():
-        shutil.rmtree(step_dir)
-    items_dir.mkdir(parents=True)
+    try:
+        if step_dir.exists():
+            shutil.rmtree(step_dir)
+    except OSError as _e:
+        max_logging.log(f"Note: could not remove {step_dir} ({_e}); zarr will overwrite in place.")
+    items_dir.mkdir(parents=True, exist_ok=True)
 
     init_ts = time.time_ns()
     # numcodecs.Zstd includes a "checksum" field that TensorStore rejects.
