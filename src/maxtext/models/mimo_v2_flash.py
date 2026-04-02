@@ -197,7 +197,7 @@ class MiMoV2FlashAttention(nnx.Module):
       self.sink_bias = None
 
     # Q projection: hidden → (num_q_heads, head_dim).
-    self.q_proj = DenseGeneral(
+    self.query = DenseGeneral(
         in_features_shape=cfg.emb_dim,
         out_features_shape=(self.num_q_heads, self.head_dim),
         use_bias=False,
@@ -210,7 +210,7 @@ class MiMoV2FlashAttention(nnx.Module):
     )
 
     # K projection: hidden → (num_kv_heads, head_dim).
-    self.k_proj = DenseGeneral(
+    self.key = DenseGeneral(
         in_features_shape=cfg.emb_dim,
         out_features_shape=(self.num_kv_heads, self.head_dim),
         use_bias=False,
@@ -223,7 +223,7 @@ class MiMoV2FlashAttention(nnx.Module):
     )
 
     # V projection: hidden → (num_kv_heads, v_head_dim).
-    self.v_proj = DenseGeneral(
+    self.value = DenseGeneral(
         in_features_shape=cfg.emb_dim,
         out_features_shape=(self.num_kv_heads, self.v_head_dim),
         use_bias=False,
@@ -236,7 +236,7 @@ class MiMoV2FlashAttention(nnx.Module):
     )
 
     # Output projection: (num_q_heads × v_head_dim) → hidden.
-    self.o_proj = DenseGeneral(
+    self.out = DenseGeneral(
         in_features_shape=(self.num_q_heads, self.v_head_dim),
         out_features_shape=cfg.emb_dim,
         axis=(-2, -1),
@@ -275,11 +275,11 @@ class MiMoV2FlashAttention(nnx.Module):
     # Projections ---------------------------------------------------------
 
     # query: (B, S, H_q, D_qk)
-    query = self.q_proj(inputs)
+    query = self.query(inputs)
     # key:   (B, S, H_kv, D_qk)
-    key = self.k_proj(inputs)
+    key = self.key(inputs)
     # value: (B, S, H_kv, D_v)
-    value = self.v_proj(inputs)
+    value = self.value(inputs)
 
     # Optional value scaling (attention_value_scale = 0.707 for MiMo).
     if cfg.mimo_attention_value_scale != 1.0:
@@ -329,7 +329,7 @@ class MiMoV2FlashAttention(nnx.Module):
     # Output projection ---------------------------------------------------
     # Transpose back to (B, S, H, D_v) then project.
     context = jnp.transpose(context, (0, 2, 1, 3))  # (B, S, H_q, D_v)
-    output = self.o_proj(context)                     # (B, S, emb_dim)
+    output = self.out(context)                       # (B, S, emb_dim)
 
     return output
 

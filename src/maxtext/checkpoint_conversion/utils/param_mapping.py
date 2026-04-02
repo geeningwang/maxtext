@@ -2173,10 +2173,10 @@ def MIMO_V2_FLASH_MAXTEXT_TO_HF_PARAM_MAPPING(config, maxtext_config, scan_layer
   """Generates the MaxText ↔ HuggingFace parameter name mapping for MiMo-V2-Flash.
 
   MaxText parameter paths follow the module hierarchy of MiMoV2FlashDecoderLayer:
-    self_attn.q_proj  → params-decoder-layers_{i}-self_attn-q_proj-kernel
-    self_attn.k_proj  → params-decoder-layers_{i}-self_attn-k_proj-kernel
-    self_attn.v_proj  → params-decoder-layers_{i}-self_attn-v_proj-kernel
-    self_attn.o_proj  → params-decoder-layers_{i}-self_attn-o_proj-kernel
+    self_attn.query → params-decoder-layers_{i}-self_attn-query-kernel
+    self_attn.key   → params-decoder-layers_{i}-self_attn-key-kernel
+    self_attn.value → params-decoder-layers_{i}-self_attn-value-kernel
+    self_attn.out   → params-decoder-layers_{i}-self_attn-out-kernel
     self_attn.sink_bias (SWA-only) → params-decoder-layers_{i}-self_attn-sink_bias
     input_layernorm   → params-decoder-layers_{i}-input_layernorm-scale
     post_attention_layernorm → params-decoder-layers_{i}-post_attention_layernorm-scale
@@ -2212,10 +2212,10 @@ def MIMO_V2_FLASH_MAXTEXT_TO_HF_PARAM_MAPPING(config, maxtext_config, scan_layer
     is_moe = (moe_freq[i] == 1) if i < len(moe_freq) else True
 
     # Attention projections
-    mapping[f"{mt}-self_attn-q_proj-kernel"] = f"{hf}.self_attn.q_proj.weight"
-    mapping[f"{mt}-self_attn-k_proj-kernel"] = f"{hf}.self_attn.k_proj.weight"
-    mapping[f"{mt}-self_attn-v_proj-kernel"] = f"{hf}.self_attn.v_proj.weight"
-    mapping[f"{mt}-self_attn-o_proj-kernel"] = f"{hf}.self_attn.o_proj.weight"
+    mapping[f"{mt}-self_attn-query-kernel"] = f"{hf}.self_attn.q_proj.weight"
+    mapping[f"{mt}-self_attn-key-kernel"] = f"{hf}.self_attn.k_proj.weight"
+    mapping[f"{mt}-self_attn-value-kernel"] = f"{hf}.self_attn.v_proj.weight"
+    mapping[f"{mt}-self_attn-out-kernel"] = f"{hf}.self_attn.o_proj.weight"
 
     # Attention sink bias (SWA layers only)
     if is_swa:
