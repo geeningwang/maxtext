@@ -148,7 +148,7 @@ def build_decode_command(
         "-m",
         "maxtext.inference.decode",
         "src/maxtext/configs/base.yml",
-        f"src/maxtext/configs/models/mimo-v2-flash.yml",
+        f"model_name=mimo-v2-flash",
         f"run_name={run_name}",
         f"checkpoint_dir={checkpoint_path}",
         f"tokenizer_path={tokenizer_path}",
@@ -225,7 +225,6 @@ def dry_run(checkpoint_path: str, tokenizer_path: str):
         _repo_root = pathlib.Path(os.getcwd())
 
     base_cfg = str(_repo_root / "src/maxtext/configs/base.yml")
-    mimo_cfg = str(_repo_root / "src/maxtext/configs/models/mimo-v2-flash.yml")
 
     sys.path.insert(0, str(_repo_root / "src"))
 
@@ -234,7 +233,7 @@ def dry_run(checkpoint_path: str, tokenizer_path: str):
         argv = [
             "dry_run",
             base_cfg,
-            mimo_cfg,
+            "model_name=mimo-v2-flash",
             f"run_name=mimo_dry_run",
             f"checkpoint_dir={checkpoint_path}",
             f"tokenizer_path={tokenizer_path}",
