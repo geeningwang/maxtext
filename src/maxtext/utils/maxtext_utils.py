@@ -1257,11 +1257,15 @@ def get_prefill_kv_cache_annotations(model, config, rng, mesh, page_state: None 
         slot=0,
         page_state=page_state,
     )
+    if "cache" not in model_vars:
+      return None
     return model_vars["cache"]
 
   with nn_partitioning.axis_rules(config.logical_axis_rules):
     init_kv_cache_partial = functools.partial(init_kv_cache, model, config)
     abstract_state = jax.eval_shape(init_kv_cache_partial)
+  if abstract_state is None:
+    return None
   state_logical_annotations = nn.get_partition_spec(abstract_state)
   with jax.set_mesh(mesh), nn_partitioning.axis_rules(config.logical_axis_rules):
     state_mesh_annotations = nn.logical_to_mesh(state_logical_annotations)
@@ -1288,11 +1292,15 @@ def get_kv_cache_annotations(model, config, rng, mesh, page_state: None | PageSt
         slot=0,
         page_state=page_state,
     )
+    if "cache" not in model_vars:
+      return None
     return model_vars["cache"]
 
   with nn_partitioning.axis_rules(config.logical_axis_rules):
     init_kv_cache_partial = functools.partial(init_kv_cache, model, config)
     abstract_state = jax.eval_shape(init_kv_cache_partial)
+  if abstract_state is None:
+    return None
   state_logical_annotations = nn.get_partition_spec(abstract_state)
   with jax.set_mesh(mesh), nn_partitioning.axis_rules(config.logical_axis_rules):
     state_mesh_annotations = nn.logical_to_mesh(state_logical_annotations)
