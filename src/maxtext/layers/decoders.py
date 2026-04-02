@@ -1008,6 +1008,44 @@ class Decoder(nn.Module):
               if kv_caches is not None and kv_cache is not None:
                 kv_caches[index] = kv_cache
             global_layer_idx_offset += num_layers
+        elif cfg.decoder_block == DecoderBlockType.MIMO_V2_FLASH:
+          # MIMO_V2_FLASH checkpoint uses "layers/{i}" key structure (e.g.
+          # params.params.decoder.layers.0.*) rather than "layers_{i}".
+          # We replicate that by naming each layer module str(lyr) and wrapping
+          # them inside a Linen module called "layers".
+          RemattedBlockLayer = RemattedBlockLayers[0]
+
+          class _MiMoLayersScope(nn.Module):
+            """Thin wrapper that creates all MiMo decoder layers under 'layers/{i}' names."""
+
+            @nn.compact
+            def __call__(self_inner, inp, seg_ids, positions, det, m_mode):  # pylint: disable=no-self-argument
+              for lyr in range(cfg.num_decoder_layers):
+                layer = RemattedBlockLayer(
+                    config=cfg,
+                    mesh=mesh,
+                    name=str(lyr),
+                    quant=self.quant,
+                    model_mode=self.model_mode,
+                    layer_idx=lyr,
+                )
+                inp, _ = layer(
+                    inp,
+                    seg_ids,
+                    positions,
+                    det,
+                    m_mode,
+                    previous_chunk=previous_chunk,
+                    page_state=page_state,
+                    slot=slot,
+                    kv_cache=None,
+                    attention_metadata=attention_metadata,
+                )
+              return inp, None
+
+          y, _ = _MiMoLayersScope(name="layers")(
+              y, decoder_segment_ids, decoder_positions, deterministic, model_mode
+          )
         else:
           for lyr in range(cfg.num_decoder_layers):
             RemattedBlockLayer = RemattedBlockLayers[0]
@@ -1023,8 +1061,6 @@ class Decoder(nn.Module):
                   "is_moe_layer": llama4.determine_is_moe_layer(lyr, self.config.interleave_moe_layer_step),
               }
             if cfg.decoder_block == DecoderBlockType.QWEN3_NEXT:
-              layer_kwargs = {"layer_idx": lyr}
-            if cfg.decoder_block == DecoderBlockType.MIMO_V2_FLASH:
               layer_kwargs = {"layer_idx": lyr}
             kv_cache = None
             if kv_caches is not None and cfg.decoder_block != DecoderBlockType.QWEN3_NEXT:
