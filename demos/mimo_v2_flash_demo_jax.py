@@ -51,7 +51,8 @@ gcloud compute tpus tpu-vm ssh <tpu-name> --zone=<zone> --worker=all \
         python3 demos/mimo_v2_flash_demo_jax.py \
             --checkpoint_path gs://<bucket>/mimo-v2-flash/checkpoints/0/items \
             --tokenizer_path XiaomiMiMo/MiMo-V2-Flash \
-            --ici_tensor_parallelism 32 \
+            --ici_tensor_parallelism 4 \
+            --ici_expert_parallelism 8 \
             --prompt 'Solve step by step: A train travels at 120 km/h...'"
 
 # Dry-run on CPU (verifies config validity only, skips actual model execution):
@@ -134,7 +135,8 @@ def build_decode_command(
     max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS,
     per_device_batch_size: int = 1,
     dtype: str = "bfloat16",
-    ici_tensor_parallelism: int = 32,
+    ici_tensor_parallelism: int = 4,
+    ici_expert_parallelism: int = 8,
 ) -> list[str]:
     """Build the shell command for maxtext.inference.decode.
 
@@ -160,7 +162,10 @@ def build_decode_command(
         f"per_device_batch_size={per_device_batch_size}",
         f"dtype={dtype}",
         f"weight_dtype={dtype}",
+        # MiMo-V2-Flash has only 4 global-attention KV heads, so tensor parallelism
+        # must not exceed 4.  Use expert parallelism for the 256 MoE experts instead.
         f"ici_tensor_parallelism={ici_tensor_parallelism}",
+        f"ici_expert_parallelism={ici_expert_parallelism}",
         "scan_layers=false",
     ]
     return cmd
@@ -174,7 +179,8 @@ def run_inference(
     max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS,
     dtype: str = "bfloat16",
     verbose: bool = False,
-    ici_tensor_parallelism: int = 32,
+    ici_tensor_parallelism: int = 4,
+    ici_expert_parallelism: int = 8,
 ) -> str:
     """Execute MaxText inference and return the generated text."""
     cmd = build_decode_command(
@@ -185,6 +191,7 @@ def run_inference(
         max_new_tokens=max_new_tokens,
         dtype=dtype,
         ici_tensor_parallelism=ici_tensor_parallelism,
+        ici_expert_parallelism=ici_expert_parallelism,
     )
     if verbose:
         print("Running command:")
@@ -345,10 +352,17 @@ def main():
     parser.add_argument(
         "--ici_tensor_parallelism",
         type=int,
-        default=32,
-        help="ICI tensor-parallel degree. Default 32 matches a v6e-32 slice "
-             "(all 32 chips, pure TP). Adjust for other topologies: "
-             "e.g. 4 for a single-host Ironwood-4.",
+        default=4,
+        help="ICI tensor-parallel degree. Must evenly divide the number of KV heads (4 for "
+             "global-attention layers). Default 4 works on v6e-32 combined with "
+             "ici_expert_parallelism=8 (4×8=32 chips).",
+    )
+    parser.add_argument(
+        "--ici_expert_parallelism",
+        type=int,
+        default=8,
+        help="ICI expert-parallel degree. 256 experts / 8 = 32 experts per chip. "
+             "Combined with ici_tensor_parallelism=4 gives 4×8=32 chips total on v6e-32.",
     )
     parser.add_argument(
         "--print_arch",
@@ -379,6 +393,7 @@ def main():
         dtype=args.dtype,
         verbose=args.verbose,
         ici_tensor_parallelism=args.ici_tensor_parallelism,
+        ici_expert_parallelism=args.ici_expert_parallelism,
     )
     print(f"Output:\n{output}")
 
