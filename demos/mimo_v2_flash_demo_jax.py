@@ -152,7 +152,7 @@ def build_decode_command(
         "src/maxtext/configs/base.yml",
         f"model_name=mimo-v2-flash",
         f"run_name={run_name}",
-        f"checkpoint_dir={checkpoint_path}",
+        f"load_parameters_path={checkpoint_path}",
         f"tokenizer_path={tokenizer_path}",
         f"tokenizer_type=huggingface",
         # Wrap prompt in single quotes so OmegaConf treats colons/special chars as literals.
@@ -167,6 +167,9 @@ def build_decode_command(
         f"ici_tensor_parallelism={ici_tensor_parallelism}",
         f"ici_expert_parallelism={ici_expert_parallelism}",
         "scan_layers=false",
+        # Checkpoint format: zarr2 (no OCDBT, no zarr3)
+        "checkpoint_storage_use_ocdbt=false",
+        "checkpoint_storage_use_zarr3=false",
     ]
     return cmd
 
@@ -243,7 +246,7 @@ def dry_run(checkpoint_path: str, tokenizer_path: str):
             base_cfg,
             "model_name=mimo-v2-flash",
             f"run_name=mimo_dry_run",
-            f"checkpoint_dir={checkpoint_path}",
+            f"load_parameters_path={checkpoint_path}",
             f"tokenizer_path={tokenizer_path}",
             # max_target_length must be >= max_prefill_predict_length.
             # Use small consistent values so the dry-run is fast.
