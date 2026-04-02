@@ -249,6 +249,7 @@ def convert_hf_to_maxtext(
     base_model_path: str,
     params: dict,
     tmpdir: str | None = None,
+    on_layer_complete: "callable | None" = None,
 ) -> dict:
     """Load and convert HF safetensors weights to a nested MaxText dict.
 
@@ -482,6 +483,24 @@ def convert_hf_to_maxtext(
 
         # Release this layer's raw tensors before moving to the next layer.
         del lt
+
+        # Streaming-save: flush this layer's keys to the checkpoint immediately
+        # and free the memmaps + dat files so RAM stays bounded to ~one layer.
+        if on_layer_complete is not None:
+            layer_prefix = f"decoder.layers.{i}."
+            layer_keys = {k: v for k, v in flat.items() if k.startswith(layer_prefix)}
+            on_layer_complete(i, layer_keys)
+            for k in layer_keys:
+                arr = flat.pop(k)
+                del arr
+                if mstore is not None:
+                    safe_name = k.replace("/", "__").replace(".", "_") + ".dat"
+                    dat_path = os.path.join(tmpdir, safe_name)  # type: ignore[arg-type]
+                    try:
+                        os.remove(dat_path)
+                    except OSError:
+                        pass
+
         gc.collect()
 
     # ------------------------------------------------------------------
@@ -498,6 +517,181 @@ def convert_hf_to_maxtext(
 # ---------------------------------------------------------------------------
 # Direct zarr2 checkpoint writer (bypasses Orbax pytree RAM blow-up)
 # ---------------------------------------------------------------------------
+
+def _write_one_zarr_array(
+    items_dir: pathlib.Path,
+    key: str,
+    arr: np.ndarray,
+    compressor,
+) -> dict:
+    """Write one parameter array to a zarr sub-directory under items_dir.
+
+    Returns the tree_meta entry dict for this key.  Called by both
+    ``_save_zarr_direct`` (batch mode) and ``convert_and_save_streaming``
+    (per-layer mode).
+    """
+    import zarr  # pylint: disable=import-outside-toplevel
+    import json  # pylint: disable=import-outside-toplevel
+
+    zarr_name = f"params.params.{key}"
+    zarr_path = items_dir / zarr_name
+
+    is_bf16 = getattr(arr.dtype, "name", "") == "bfloat16"
+    write_arr = arr.view(np.uint16) if is_bf16 else arr
+    write_dtype = np.uint16 if is_bf16 else arr.dtype
+
+    z = zarr.open_array(
+        str(zarr_path), mode="w",
+        shape=write_arr.shape,
+        dtype=write_dtype,
+        chunks=True,
+        compressor=compressor,
+        dimension_separator=".",
+    )
+    z[:] = write_arr
+    del z
+
+    zarray_path = zarr_path / ".zarray"
+    _meta = json.loads(zarray_path.read_text())
+    if isinstance(_meta.get("compressor"), dict):
+        _meta["compressor"].pop("checksum", None)
+        zarray_path.write_text(json.dumps(_meta))
+
+    if is_bf16:
+        meta = json.loads(zarray_path.read_text())
+        meta["dtype"] = "bfloat16"
+        zarray_path.write_text(json.dumps(meta))
+
+    key_parts = ["params", "params"] + key.split(".")
+    return {
+        str(tuple(key_parts)): {
+            "key_metadata": [{"key": p, "key_type": 2} for p in key_parts],
+            "value_metadata": {"value_type": "np.ndarray", "skip_deserialize": False},
+        }
+    }
+
+
+def _write_checkpoint_metadata(
+    step_dir: pathlib.Path,
+    items_dir: pathlib.Path,
+    tree_meta: dict,
+    init_ts: int,
+    total: int,
+) -> None:
+    """Write _METADATA and _CHECKPOINT_METADATA to finalise the checkpoint."""
+    import json  # pylint: disable=import-outside-toplevel
+    import time  # pylint: disable=import-outside-toplevel
+
+    metadata = {
+        "tree_metadata": {
+            "('step',)": {
+                "key_metadata": [{"key": "step", "key_type": 2}],
+                "value_metadata": {"value_type": "scalar", "skip_deserialize": False},
+            },
+            **tree_meta,
+            "('opt_state',)": {
+                "key_metadata": [{"key": "opt_state", "key_type": 2}],
+                "value_metadata": {"value_type": "Dict", "skip_deserialize": True},
+            },
+        },
+        "use_ocdbt": False,
+        "use_zarr3": False,
+        "store_array_data_equal_to_fill_value": True,
+        "custom_metadata": None,
+    }
+    (items_dir / "_METADATA").write_text(json.dumps(metadata))
+    (step_dir / "_CHECKPOINT_METADATA").write_text(json.dumps({
+        "item_handlers": {
+            "items": "orbax.checkpoint._src.handlers.pytree_checkpoint_handler.PyTreeCheckpointHandler"
+        },
+        "metrics": {},
+        "performance_metrics": {},
+        "init_timestamp_nsecs": init_ts,
+        "commit_timestamp_nsecs": time.time_ns(),
+        "custom_metadata": {},
+    }))
+    max_logging.log(
+        f"Checkpoint saved at {step_dir} "
+        f"({total} arrays, peak RAM bounded to largest single array)"
+    )
+
+
+def convert_and_save_streaming(
+    base_model_path: str,
+    maxtext_model_path: str,
+    params: dict,
+    step: int = 0,
+) -> None:
+    """Convert HF weights and write the zarr checkpoint in a single pass.
+
+    Unlike the two-phase (convert-all → save-all) approach, this function
+    writes each decoder layer's zarr arrays **immediately** after conversion
+    and frees the working buffers.  Peak RAM is bounded to approximately one
+    decoder layer (~25–50 GB) regardless of total model size, making it safe
+    on a 708 GB machine for the full 309B MiMo-V2-Flash model.
+
+    No ``--tmpdir`` is needed; all intermediates live in local RAM only for
+    the duration of a single layer.
+    """
+    import zarr  # pylint: disable=import-outside-toplevel
+    import json  # pylint: disable=import-outside-toplevel
+    import time  # pylint: disable=import-outside-toplevel
+    import numcodecs  # pylint: disable=import-outside-toplevel
+
+    root = pathlib.Path(maxtext_model_path)
+    root.mkdir(parents=True, exist_ok=True)
+    step_dir = root / str(step)
+    items_dir = step_dir / "items"
+    if step_dir.exists():
+        shutil.rmtree(step_dir)
+    items_dir.mkdir(parents=True)
+
+    init_ts = time.time_ns()
+    compressor = numcodecs.Zstd(level=1)
+
+    # Write the step scalar first.
+    z_step = zarr.open_array(
+        str(items_dir / "step"), mode="w",
+        shape=(), dtype="<i8",
+        compressor=compressor,
+        dimension_separator=".",
+    )
+    z_step[()] = step
+
+    tree_meta: dict = {}
+    arrays_written = [0]  # mutable counter accessible inside callback
+
+    def _on_layer_complete(layer_idx: int, layer_flat: dict) -> None:
+        """Callback: write layer_idx's arrays to zarr immediately."""
+        for key, arr in sorted(layer_flat.items()):
+            tree_meta.update(_write_one_zarr_array(items_dir, key, arr, compressor))
+            arrays_written[0] += 1
+        max_logging.log(
+            f"  Streaming-saved layer {layer_idx} "
+            f"({len(layer_flat)} arrays, total so far: {arrays_written[0]})"
+        )
+
+    # Run conversion; the callback writes + frees each decoder layer in turn.
+    # Global weights (embeddings, norm, logits) are returned in `flat` after
+    # all layers are done.
+    flat = convert_hf_to_maxtext(
+        base_model_path,
+        params,
+        tmpdir=None,           # no tmpdir — arrays stay in RAM only transiently
+        on_layer_complete=_on_layer_complete,
+    )
+
+    # Write remaining global weights (returned in flat after layer loop).
+    total_global = len(flat)
+    max_logging.log(f"Writing {total_global} global weight arrays to checkpoint...")
+    for key, arr in sorted(flat.items()):
+        tree_meta.update(_write_one_zarr_array(items_dir, key, arr, compressor))
+        arrays_written[0] += 1
+    del flat
+    gc.collect()
+
+    _write_checkpoint_metadata(step_dir, items_dir, tree_meta, init_ts, arrays_written[0])
+
 
 def _save_zarr_direct(
     maxtext_model_path: str,
@@ -548,86 +742,11 @@ def _save_zarr_direct(
     total = len(flat_dict)
     tree_meta: dict = {}
     for i, (key, arr) in enumerate(flat_dict.items()):
-        zarr_name = f"params.params.{key}"
-        zarr_path = items_dir / zarr_name
-
-        # zarr v2 cannot cast ml_dtypes.bfloat16 via numpy's astype pathway.
-        # Workaround: write BF16 as uint16 (identical bytes), then patch .zarray
-        # to report the correct bfloat16 dtype.  TensorStore / Orbax reads raw
-        # bytes and interprets them correctly regardless of how they were written.
-        is_bf16 = getattr(arr.dtype, "name", "") == "bfloat16"
-        write_arr = arr.view(np.uint16) if is_bf16 else arr
-        write_dtype = np.uint16 if is_bf16 else arr.dtype
-
-        z = zarr.open_array(
-            str(zarr_path), mode="w",
-            shape=write_arr.shape,
-            dtype=write_dtype,
-            chunks=True,
-            compressor=compressor,
-            dimension_separator=".",
-        )
-        z[:] = write_arr          # pulls memmap in chunk-sized pieces
-        del z
-
-        # Strip the "checksum" field that numcodecs.Zstd adds to .zarray —
-        # TensorStore (used by Orbax internally) rejects unknown compressor fields.
-        zarray_path = zarr_path / ".zarray"
-        _meta = json.loads(zarray_path.read_text())
-        if isinstance(_meta.get("compressor"), dict):
-            _meta["compressor"].pop("checksum", None)
-            zarray_path.write_text(json.dumps(_meta))
-
-        if is_bf16:
-            zarray_file = zarr_path / ".zarray"
-            meta = json.loads(zarray_file.read_text())
-            meta["dtype"] = "bfloat16"
-            zarray_file.write_text(json.dumps(meta))
-
-        key_parts = ["params", "params"] + key.split(".")
-        tree_meta[str(tuple(key_parts))] = {
-            "key_metadata": [{"key": p, "key_type": 2} for p in key_parts],
-            "value_metadata": {"value_type": "np.ndarray", "skip_deserialize": False},
-        }
+        tree_meta.update(_write_one_zarr_array(items_dir, key, arr, compressor))
         if (i + 1) % 50 == 0 or i + 1 == total:
             max_logging.log(f"  [{i + 1}/{total}] wrote {key}")
 
-    # _METADATA (Orbax pytree structure descriptor)
-    metadata = {
-        "tree_metadata": {
-            "('step',)": {
-                "key_metadata": [{"key": "step", "key_type": 2}],
-                "value_metadata": {"value_type": "scalar", "skip_deserialize": False},
-            },
-            **tree_meta,
-            "('opt_state',)": {
-                "key_metadata": [{"key": "opt_state", "key_type": 2}],
-                "value_metadata": {"value_type": "Dict", "skip_deserialize": True},
-            },
-        },
-        "use_ocdbt": False,
-        "use_zarr3": False,
-        "store_array_data_equal_to_fill_value": True,
-        "custom_metadata": None,
-    }
-    (items_dir / "_METADATA").write_text(json.dumps(metadata))
-
-    # _CHECKPOINT_METADATA
-    (step_dir / "_CHECKPOINT_METADATA").write_text(json.dumps({
-        "item_handlers": {
-            "items": "orbax.checkpoint._src.handlers.pytree_checkpoint_handler.PyTreeCheckpointHandler"
-        },
-        "metrics": {},
-        "performance_metrics": {},
-        "init_timestamp_nsecs": init_ts,
-        "commit_timestamp_nsecs": time.time_ns(),
-        "custom_metadata": {},
-    }))
-
-    max_logging.log(
-        f"Checkpoint saved at {step_dir} "
-        f"({total} arrays, peak RAM bounded to largest single array)"
-    )
+    _write_checkpoint_metadata(step_dir, items_dir, tree_meta, init_ts, total)
 
 
 # ---------------------------------------------------------------------------
@@ -686,20 +805,33 @@ def main(args):
             "Use --tmpdir <path> or --streaming to enable low-RAM streaming mode."
         )
 
-    if getattr(args, "resume_from_tmpdir", False):
+    if args.streaming_save:
+        # Streaming mode: convert + save one decoder layer at a time.
+        # Peak RAM ≈ one MoE layer (~50 GB) regardless of total model size.
+        # No --tmpdir needed; use --streaming_save instead of --tmpdir.
+        params = MODEL_PARAMS[args.model_size]
+        max_logging.log(
+            f"Streaming-save mode: converting and saving layer by layer "
+            f"(peak RAM ~50 GB). Output: {args.maxtext_model_path}"
+        )
+        convert_and_save_streaming(model_path, args.maxtext_model_path, params)
+        max_logging.log("Streaming conversion + save complete.")
+    elif getattr(args, "resume_from_tmpdir", False):
         # Skip the ~53-min conversion phase and restore memmaps from disk.
         if not tmpdir:
             raise ValueError("--resume_from_tmpdir requires --tmpdir <path>")
         max_logging.log(f"Resuming: restoring flat weight dict from {tmpdir!r} (skipping conversion)")
         _, flat = _MemmapStore.from_dir(tmpdir)
+        max_logging.log(f"Saving MaxText checkpoint to: {args.maxtext_model_path}")
+        _save_zarr_direct(args.maxtext_model_path, flat)
+        max_logging.log("Checkpoint saved successfully.")
     else:
         params = MODEL_PARAMS[args.model_size]
         max_logging.log(f"Starting conversion for MiMo-V2-Flash ({args.model_size})")
         flat = convert_hf_to_maxtext(model_path, params, tmpdir=tmpdir)
-
-    max_logging.log(f"Saving MaxText checkpoint to: {args.maxtext_model_path}")
-    _save_zarr_direct(args.maxtext_model_path, flat)
-    max_logging.log("Checkpoint saved successfully.")
+        max_logging.log(f"Saving MaxText checkpoint to: {args.maxtext_model_path}")
+        _save_zarr_direct(args.maxtext_model_path, flat)
+        max_logging.log("Checkpoint saved successfully.")
 
     if _auto_tmpdir and tmpdir:
         max_logging.log(f"Removing auto tmpdir: {tmpdir}")
@@ -796,6 +928,18 @@ if __name__ == "__main__":
             "Skip the layer-conversion phase and restore memmaps from --tmpdir directly. "
             "Requires a previous run with --tmpdir that completed conversion (shapes.json present). "
             "Useful for retrying a failed checkpoint save without repeating the ~53 min conversion."
+        ),
+    )
+    parser.add_argument(
+        "--streaming_save",
+        action="store_true",
+        default=False,
+        help=(
+            "Convert and save one decoder layer at a time, freeing each layer's buffers before "
+            "moving to the next.  Peak RAM is bounded to approximately one MoE layer (~50 GB) "
+            "regardless of total model size.  No --tmpdir is required in this mode.  "
+            "Use this flag when the full model is too large to hold in RAM simultaneously "
+            "(e.g. 309B MiMo-V2-Flash on a 708 GB host)."
         ),
     )
 
