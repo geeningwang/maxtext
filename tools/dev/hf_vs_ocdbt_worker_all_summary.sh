@@ -80,6 +80,11 @@ print(
 PY
 }
 
+# NOTE: Do NOT add any kill/pkill commands to the remote --command string in this script.
+# Any form of kill (pkill -f, kill -9, ps|awk|xargs kill, Python os.kill) issued through
+# gcloud compute tpus tpu-vm ssh causes SSH return code 255 in this environment.
+# To restart the validator cleanly, reboot the TPU worker VM instead.
+
 respawn_ssh
 TMP_OUT="$(mktemp)"
 

@@ -39,7 +39,13 @@ Conclusion: direct HF values and OCDBT values are equivalent for all validated t
 ## Operational Notes
 
 1. Prefer `--worker=all` for polling/summary commands.
-2. Avoid `pkill -f validate_hf_vs_ocdbt_distributed.py` in remote SSH command strings.
+2. **Do NOT use any form of `kill` or `pkill` in remote SSH commands** (`--command=...`).
+   Any kill/pkill signal sent through `gcloud compute tpus tpu-vm ssh` in this environment
+   consistently triggers SSH return code `255`, causing the connection to fail.
+   This applies to `pkill -f`, `kill -9 $pid`, `ps|awk|xargs kill`, Python `os.kill()`,
+   and any other variant confirmed during A/B testing on 2026-04-03.
+   **To stop a background validator process: simply launch a fresh one without trying to
+   stop the old one first — or reboot the worker VM if a clean state is required.**
 3. If `ssh` returns code `255`, respawn ssh-agent and re-add key:
 
 ```bash
