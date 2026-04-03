@@ -691,8 +691,19 @@ class AttentionOp(nnx.Module):
       if mask is not None:
         mask = mask[:, :, :, next_pos : next_pos + q_seq_len, :]
     elif model_mode == MODEL_MODE_AUTOREGRESSIVE and q_seq_len == 1:
-      # In autoregression, the query position is the last position in the KV sequence.
-      next_pos = kv_seq_len - 1
+      if self.attention_type == AttentionType.LOCAL_SLIDING and decoder_segment_ids is not None:
+        # For sliding window attention, use the actual number of filled cache slots
+        # rather than kv_seq_len - 1.  With the split prefill/AR cache architecture,
+        # kv_seq_len is always max_prefill or max_decode (fully padded sizes), so
+        # kv_seq_len - 1 points to the last cache *slot* rather than the last *token*.
+        # For the AR cache:   segment count - 1  ==  decode_step  (correct local pos)
+        # For the prefill cache: segment count - 1 == true_length - 1  (≈ correct)
+        next_pos = (
+            jnp.sum(decoder_segment_ids[0] == DECODING_ACTIVE_SEQUENCE_INDICATOR).astype(jnp.int32) - 1
+        )
+      else:
+        # In autoregression, the query position is the last position in the KV sequence.
+        next_pos = kv_seq_len - 1
 
     causal_mask = None
     # We enforce causality except for AUTOREGRESSION
