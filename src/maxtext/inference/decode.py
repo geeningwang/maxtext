@@ -15,6 +15,8 @@
 """CLI utility for running inference on a single/multi stream(s)."""
 
 import os
+import socket
+import time
 from typing import Sequence, Any
 import numpy as np
 import jax
@@ -86,7 +88,6 @@ def _batch_first_result_token(first_tokens: list[Any], batch_size: int):
 
 def _probe_hbm(label: str) -> None:
   """Print per-device HBM memory stats for diagnostics. No logic change."""
-  import socket  # already in stdlib
   host = socket.gethostname()
   for d in jax.local_devices():
     try:
@@ -116,8 +117,10 @@ def main(argv: Sequence[str]) -> None:
   engine = maxengine.MaxEngine(config)
   rng = jax.random.PRNGKey(1234)
   rng, rng_load_params = jax.random.split(rng)
+  _t_load = time.perf_counter()
   params = engine.load_params(rng_load_params)
   _probe_hbm("after_load_params")
+  print(f"[TIME] load_params                       host={socket.gethostname()} elapsed={time.perf_counter()-_t_load:.1f}s", flush=True)
   prof = profiler.Profiler(config)
 
   text = config.prompt
@@ -194,6 +197,7 @@ def main(argv: Sequence[str]) -> None:
   prof.activate(optional_postfix="trace")
 
   # Prefill
+  _t_prefill = time.perf_counter()
   rng, rng_prefill = jax.random.split(rng)  # Split RNG before calling prefill
   for i in range(_NUM_STREAMS):
     with jax.profiler.StepTraceAnnotation("prefill", stream=i):
@@ -213,6 +217,7 @@ def main(argv: Sequence[str]) -> None:
     prefill_result_list.append(prefill_result)
     first_token_list.append(first_token)
   _probe_hbm("after_prefill")
+  print(f"[TIME] prefill                           host={socket.gethostname()} elapsed={(time.perf_counter()-_t_prefill)*1000:.0f}ms", flush=True)
 
   # Insert
   rng, rng_init_decode = jax.random.split(rng)
@@ -225,11 +230,17 @@ def main(argv: Sequence[str]) -> None:
   prof_deactivated = False
   steps = range(config.max_prefill_predict_length, config.max_target_length)
   sampled_tokens_list.append(_batch_first_result_token(first_token_list, batch_size))
+  _t_gen_start = time.perf_counter()
   for i in steps:
     rng, rng_generate = jax.random.split(rng)
     with jax.profiler.StepTraceAnnotation("generate", step=i):
+      _t_step = time.perf_counter()
       decode_state, sampled_tokens = engine.generate(params, decode_state, rng=rng_generate)
-    _probe_hbm(f"generate_step_{i:04d}")
+      jax.effects_barrier()
+      _step_ms = (time.perf_counter() - _t_step) * 1000
+    print(f"[TIME] generate_step_{i:04d}              host={socket.gethostname()} step_ms={_step_ms:.1f}", flush=True)
+    if i == steps[0] or (i - steps[0]) % 50 == 0:
+      _probe_hbm(f"generate_step_{i:04d}")
 
     # Automatically deactivate profiler after profiler_steps steps
     if i > config.max_prefill_predict_length + config.profiler_steps:
@@ -237,6 +248,14 @@ def main(argv: Sequence[str]) -> None:
       prof_deactivated = True
 
     sampled_tokens_list.append(sampled_tokens)
+
+  _gen_total_s = time.perf_counter() - _t_gen_start
+  print(
+      f"[TIME] generate_total                    host={socket.gethostname()}"
+      f" total={_gen_total_s:.1f}s steps={len(steps)}"
+      f" avg_ms={_gen_total_s/len(steps)*1000:.1f}",
+      flush=True,
+  )
 
   # Get results
   for i in range(_NUM_STREAMS):
