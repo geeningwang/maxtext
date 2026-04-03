@@ -69,7 +69,10 @@ def main(argv: Sequence[str]) -> None:
           save_concurrent_gb=96,
       )
   )
-  save_ckptr.save(_OCDBT_OUTPUT_PATH, args=ocp.args.PyTreeSave(params))
+  # Preserve the original MaxText checkpoint layout: params.params.*
+  # `params` here is already the model vars dict {"params": {...}}, and
+  # load_params_from_path restores with item={"params": abstract_unboxed_params}.
+  save_ckptr.save(_OCDBT_OUTPUT_PATH, args=ocp.args.PyTreeSave({"params": params}))
   jax.effects_barrier()
   max_logging.log(f"Conversion complete. New checkpoint at: {_OCDBT_OUTPUT_PATH}")
 
