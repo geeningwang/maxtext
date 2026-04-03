@@ -44,7 +44,7 @@ from jax import lax
 
 from flax import linen as nn
 from flax import nnx
-from jax.sharding import Mesh
+from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
 from maxtext.common.common_types import (
     Config,
@@ -92,6 +92,7 @@ class MiMoV2FlashMoEGate(nnx.Module):
       num_experts_per_tok: int,
       dtype: DType,
       weight_dtype: DType,
+      mesh: Mesh,
       *,
       rngs: nnx.Rngs,
   ):
@@ -99,6 +100,7 @@ class MiMoV2FlashMoEGate(nnx.Module):
     self.num_experts_per_tok = num_experts_per_tok
     self.dtype = dtype
     self.weight_dtype = weight_dtype
+    self.mesh = mesh
 
     # Routing weight matrix: (num_experts, hidden_size).
     self.weight = nnx.Param(
@@ -109,9 +111,11 @@ class MiMoV2FlashMoEGate(nnx.Module):
 
     # Correction bias for noaux-TC top-k selection: (num_experts,).
     # Initialised to zeros; loaded from checkpoint at inference time.
+    # Replicated (not sharded) so that top-k selection sees all expert biases
+    # regardless of ici_expert_parallelism.
     self.e_score_correction_bias = nnx.Param(
         jnp.zeros((num_experts,), dtype=weight_dtype),
-        sharding=("exp",),
+        sharding=(None,),
     )
 
   def __call__(self, hidden_states: Array):
@@ -130,6 +134,14 @@ class MiMoV2FlashMoEGate(nnx.Module):
         hidden_states.astype(jnp.float32),
         self.weight[...].astype(jnp.float32).T,
     )
+    # With ici_expert_parallelism > 1, the gate weight is sharded across the
+    # expert axis, so each device computes logits for only E/EP experts.  Force
+    # the full (tokens, num_experts) tensor to be replicated on all devices so
+    # that subsequent argsort and top-k selection see ALL expert scores.
+    logits = jax.lax.with_sharding_constraint(
+        logits, NamedSharding(self.mesh, PartitionSpec(None, None))
+    )
+    jax.debug.print("MoE gate logits shape[-1] (expect 256 with fix): {v}", v=logits.shape[-1])
 
     # Sigmoid scores (used for final expert weighting).
     scores = jax.nn.sigmoid(logits)
@@ -195,6 +207,7 @@ class MiMoV2FlashSparseMoeBlock(nnx.Module):
         num_experts_per_tok=self.num_experts_per_tok,
         dtype=cfg.dtype,
         weight_dtype=cfg.weight_dtype,
+        mesh=mesh,
         rngs=rngs,
     )
 
