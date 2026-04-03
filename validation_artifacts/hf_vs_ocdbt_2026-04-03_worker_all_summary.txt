@@ -1,0 +1,8 @@
+SUM host=t1v-n-cda9654e-w-1 file=/tmp/hf_vs_ocdbt_result_w1.json checked=70 mismatches=0 local_max_abs=0.0 local_max_key=None
+SUM host=t1v-n-cda9654e-w-5 file=/tmp/hf_vs_ocdbt_result_w5.json checked=70 mismatches=0 local_max_abs=0.0 local_max_key=None
+SUM host=t1v-n-cda9654e-w-0 file=/tmp/hf_vs_ocdbt_result_w0.json checked=72 mismatches=0 local_max_abs=0.0 local_max_key=None
+SUM host=t1v-n-cda9654e-w-6 file=/tmp/hf_vs_ocdbt_result_w6.json checked=72 mismatches=0 local_max_abs=0.0 local_max_key=None
+SUM host=t1v-n-cda9654e-w-2 file=/tmp/hf_vs_ocdbt_result_w2.json checked=72 mismatches=0 local_max_abs=0.0 local_max_key=None
+SUM host=t1v-n-cda9654e-w-7 file=/tmp/hf_vs_ocdbt_result_w7.json checked=70 mismatches=0 local_max_abs=0.0 local_max_key=None
+SUM host=t1v-n-cda9654e-w-4 file=/tmp/hf_vs_ocdbt_result_w4.json checked=72 mismatches=0 local_max_abs=0.0 local_max_key=None
+SUM host=t1v-n-cda9654e-w-3 file=/tmp/hf_vs_ocdbt_result_w3.json checked=70 mismatches=0 local_max_abs=0.0 local_max_key=None
