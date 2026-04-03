@@ -167,9 +167,9 @@ def build_decode_command(
         f"ici_tensor_parallelism={ici_tensor_parallelism}",
         f"ici_expert_parallelism={ici_expert_parallelism}",
         "scan_layers=false",
-        # Checkpoint format: zarr2 (no OCDBT, no zarr3)
-        "checkpoint_storage_use_ocdbt=false",
-        "checkpoint_storage_use_zarr3=false",
+        # Checkpoint format: zarr3 + OCDBT (produced by convert_checkpoint_to_ocdbt.py)
+        "checkpoint_storage_use_ocdbt=true",
+        "checkpoint_storage_use_zarr3=true",
     ]
     return cmd
 

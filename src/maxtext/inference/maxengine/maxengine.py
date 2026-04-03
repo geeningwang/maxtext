@@ -97,6 +97,22 @@ class MaxEngineConfig:
 _BaseEngine = engine_api.Engine if (not is_decoupled() and hasattr(engine_api, "Engine")) else object
 
 
+def _probe_hbm_engine(label: str) -> None:
+  """Print per-device HBM memory stats (callable from MaxEngine methods)."""
+  import socket  # pylint: disable=import-outside-toplevel
+  host = socket.gethostname()
+  for d in jax.local_devices():
+    try:
+      stats = d.memory_stats()
+      used_gb  = stats.get("bytes_in_use",     0) / 2**30
+      limit_gb = stats.get("bytes_limit",       0) / 2**30
+      peak_gb  = stats.get("peak_bytes_in_use", 0) / 2**30
+      print(f"[HBM] {label:<40s} host={host} dev={d.id}"
+            f" used={used_gb:.2f}GB peak={peak_gb:.2f}GB limit={limit_gb:.2f}GB", flush=True)
+    except Exception as e:  # pylint: disable=broad-except
+      print(f"[HBM] {label:<40s} host={host} dev={d.id} memory_stats N/A: {e}", flush=True)
+
+
 class MaxEngine(_BaseEngine):
   """The computational core of the generative model server.
 
@@ -237,9 +253,11 @@ class MaxEngine(_BaseEngine):
       state = maxtext_utils.init_decode_state(None, params)
       state = max_utils.unbox_logicallypartioned(state)
     else:
+      _probe_hbm_engine("before_setup_decode_state")
       state, self.state_mesh_annotations = maxtext_utils.setup_decode_state(
           self.model, self.config, rng1, self._mesh, None
       )
+      _probe_hbm_engine("after_setup_decode_state")
     # pylint: disable=isinstance-second-argument-not-valid-type
     self.abstract_params = jax.tree_util.tree_map(
         lambda x: jax.ShapeDtypeStruct(shape=x.shape, dtype=x.dtype, sharding=x.sharding)

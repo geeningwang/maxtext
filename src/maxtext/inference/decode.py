@@ -84,6 +84,25 @@ def _batch_first_result_token(first_tokens: list[Any], batch_size: int):
   return result_tokens
 
 
+def _probe_hbm(label: str) -> None:
+  """Print per-device HBM memory stats for diagnostics. No logic change."""
+  import socket  # already in stdlib
+  host = socket.gethostname()
+  for d in jax.local_devices():
+    try:
+      stats = d.memory_stats()
+      used_gb  = stats.get("bytes_in_use",      0) / 2**30
+      limit_gb = stats.get("bytes_limit",        0) / 2**30
+      peak_gb  = stats.get("peak_bytes_in_use",  0) / 2**30
+      print(
+          f"[HBM] {label:<36s} host={host} dev={d.id}"
+          f" used={used_gb:.2f}GB peak={peak_gb:.2f}GB limit={limit_gb:.2f}GB",
+          flush=True,
+      )
+    except Exception as e:  # pylint: disable=broad-except
+      print(f"[HBM] {label:<36s} host={host} dev={d.id} memory_stats N/A: {e}", flush=True)
+
+
 def main(argv: Sequence[str]) -> None:
   jax.config.update("jax_default_prng_impl", "unsafe_rbg")
   os.environ["TF_CPP_MIN_LOG_LEVEL"] = "0"
@@ -92,11 +111,13 @@ def main(argv: Sequence[str]) -> None:
   _validate_config(config)
   jax.config.update("jax_use_shardy_partitioner", config.shardy)
   max_utils.print_system_information()
+  _probe_hbm("init")
 
   engine = maxengine.MaxEngine(config)
   rng = jax.random.PRNGKey(1234)
   rng, rng_load_params = jax.random.split(rng)
   params = engine.load_params(rng_load_params)
+  _probe_hbm("after_load_params")
   prof = profiler.Profiler(config)
 
   text = config.prompt
@@ -191,12 +212,14 @@ def main(argv: Sequence[str]) -> None:
       )
     prefill_result_list.append(prefill_result)
     first_token_list.append(first_token)
+  _probe_hbm("after_prefill")
 
   # Insert
   rng, rng_init_decode = jax.random.split(rng)
   decode_state = engine.init_decode_state(rng_init_decode)
   for i in range(_NUM_STREAMS):
     decode_state = engine.insert(prefill_result_list[i], decode_state, slot=i)
+  _probe_hbm("after_insert")
 
   # Generate
   prof_deactivated = False
@@ -206,6 +229,7 @@ def main(argv: Sequence[str]) -> None:
     rng, rng_generate = jax.random.split(rng)
     with jax.profiler.StepTraceAnnotation("generate", step=i):
       decode_state, sampled_tokens = engine.generate(params, decode_state, rng=rng_generate)
+    _probe_hbm(f"generate_step_{i:04d}")
 
     # Automatically deactivate profiler after profiler_steps steps
     if i > config.max_prefill_predict_length + config.profiler_steps:

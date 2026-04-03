@@ -231,66 +231,104 @@ class MiMoV2FlashSparseMoeBlock(nnx.Module):
     )
 
   def __call__(self, hidden_states: Array, deterministic: bool) -> Array:
-    """Apply the MoE block.
+    """Apply the MoE block with expert parallelism (EP) + tensor parallelism (TP).
+
+    Each device holds ``num_experts / EP`` experts with the MLP intermediate
+    dimension split across TP.  shard_map is used so that each device operates
+    only on its local expert shard, and a psum reduces partial embed outputs
+    across the TP axis.  This matches the weight sharding declared in __init__:
+      wi_0/wi_1: (exp, embed_no_exp, mlp)  →  P('expert', None, 'tensor')
+      wo:        (exp, mlp,  embed_no_exp) →  P('expert', 'tensor', None)
 
     Args:
       hidden_states: Shape (batch, seq_len, emb_dim).
-      deterministic: Unused (no dropout in MoE gate).
+      deterministic: Unused.
 
     Returns:
       Output of shape (batch, seq_len, emb_dim).
     """
+    from jax.experimental.shard_map import shard_map
+    from jax.sharding import PartitionSpec as P
+
     orig_shape = hidden_states.shape
     tokens = hidden_states.reshape(-1, self.hidden_size)  # (T, H)
 
-    # Route tokens to experts.
+    # --- Routing (replicated result needed on all devices) ---
     top_k_indices, top_k_weights = self.gate(tokens)  # (T, K), (T, K)
 
-    # Dispatch tokens to their assigned experts using a scatter/gather approach,
-    # which is fully static-shape-friendly and XLA-compilable.
-    #
-    # Strategy: build an (E, T) weight matrix by scattering top_k_weights into
-    # positions indexed by top_k_indices, then use a single einsum per expert
-    # group. For 256 experts this is the most efficient static approach.
-    #
-    # dispatch_weights: (T, E) — weight for each (token, expert) pair (0 if not selected)
+    # Build dispatch weight matrix (T, E) — replicated on all devices.
     T = tokens.shape[0]
     dispatch_weights = jnp.zeros((T, self.num_experts), dtype=jnp.float32)
     tok_idx = jnp.broadcast_to(
         jnp.arange(T)[:, jnp.newaxis], (T, self.num_experts_per_tok)
-    )  # (T, K)
+    )
     dispatch_weights = dispatch_weights.at[tok_idx, top_k_indices].add(
         top_k_weights.astype(jnp.float32)
-    )  # (T, E)
+    )  # (T, E) — replicated
 
-    wi_0 = self.wi_0[...].astype(self.config.dtype)  # (E, H, I)
-    wi_1 = self.wi_1[...].astype(self.config.dtype)  # (E, H, I)
-    wo = self.wo[...].astype(self.config.dtype)       # (E, I, H)
+    # Determine mesh axis names for EP and TP.
+    ep_axis = "expert"
+    tp_axis = "tensor"
+    ep_size = self.mesh.shape.get(ep_axis, 1)
+    local_experts = self.num_experts // ep_size  # experts per device-group
 
-    # For each expert e compute the contribution to each token:
-    #   g_e   = silu(tokens @ wi_0[e])               (T, I)
-    #   u_e   = tokens @ wi_1[e]                      (T, I)
-    #   out_e = (g_e * u_e) @ wo[e]                  (T, H)
-    #   contribution_e = dispatch_weights[:, e:e+1] * out_e  (T, H)
-    #
-    # We vectorise over E using jnp.einsum with the expert axis:
-    #   tokens_all: (T, H) broadcast over all experts.
-    #   gate:  (E, T, I) = silu(einsum('TH,EHI->ETI', tokens, wi_0))
-    #   up:    (E, T, I) =     einsum('TH,EHI->ETI', tokens, wi_1)
-    #   down:  (E, T, H) =     einsum('ETI,EIH->ETH', gate*up, wo)
-    #   out:   (T, H)    =     einsum('TE,ETH->TH',  dispatch_weights, down)
+    def _local_moe(tokens_rep, dispatch_w, wi0, wi1, wo_w):
+      """Compute MoE output for the local expert shard.
 
-    tokens_fp = tokens.astype(self.config.dtype)  # (T, H)
-    gate = jax.nn.silu(
-        jnp.einsum("th,ehi->eti", tokens_fp, wi_0, precision=lax.Precision.DEFAULT)
-    )                                                                     # (E, T, I)
-    up = jnp.einsum("th,ehi->eti", tokens_fp, wi_1,
-                    precision=lax.Precision.DEFAULT)                      # (E, T, I)
-    down = jnp.einsum("eti,eih->eth", gate * up, wo,
-                      precision=lax.Precision.DEFAULT)                    # (E, T, H)
-    output = jnp.einsum("te,eth->th",
-                        dispatch_weights.astype(self.config.dtype), down,
-                        precision=lax.Precision.DEFAULT)                  # (T, H)
+      wi0/wi1: (local_E, H, I_local)  — local expert shard, TP-split on I.
+      wo_w:    (local_E, I_local, H)  — local expert shard, TP-split on I.
+
+      Returns partial output (T, H) that requires psum over TP, then psum
+      over EP (each EP shard contributes to all tokens via dispatch_w).
+      """
+      shard_id = jax.lax.axis_index(ep_axis)  # which expert shard we are
+      # Slice of dispatch_weights for our local experts: (T, local_E)
+      local_dispatch = jax.lax.dynamic_slice_in_dim(
+          dispatch_w, shard_id * local_experts, local_experts, axis=1
+      )
+
+      tokens_fp = tokens_rep.astype(wi0.dtype)
+      # gate: (local_E, T, I_local)
+      gate_out = jax.nn.silu(
+          jnp.einsum("th,ehi->eti", tokens_fp, wi0, precision=lax.Precision.DEFAULT)
+      )
+      # up: (local_E, T, I_local)
+      up_out = jnp.einsum("th,ehi->eti", tokens_fp, wi1,
+                          precision=lax.Precision.DEFAULT)
+      # down: (local_E, T, H)  — partial sum over I_local, needs psum over TP
+      down_out = jnp.einsum("eti,eih->eth", gate_out * up_out, wo_w,
+                            precision=lax.Precision.DEFAULT)
+      # Reduce over TP axis (partial sums across I split).
+      down_out = jax.lax.psum(down_out, tp_axis)
+      # Combine local experts: (T, H)
+      output = jnp.einsum("te,eth->th",
+                          local_dispatch.astype(wi0.dtype), down_out,
+                          precision=lax.Precision.DEFAULT)
+      # psum over EP axis so every device gets the full token output.
+      output = jax.lax.psum(output, ep_axis)
+      return output
+
+    # Partition specs for shard_map inputs.
+    # tokens and dispatch_weights are replicated; weights are sharded.
+    output = shard_map(
+        _local_moe,
+        mesh=self.mesh,
+        in_specs=(
+            P(),           # tokens — replicated
+            P(),           # dispatch_weights — replicated
+            P(ep_axis, None, tp_axis),   # wi_0: (exp, embed_no_exp, mlp)
+            P(ep_axis, None, tp_axis),   # wi_1: (exp, embed_no_exp, mlp)
+            P(ep_axis, tp_axis, None),   # wo:   (exp, mlp, embed_no_exp)
+        ),
+        out_specs=P(),     # output is replicated after psums
+        check_rep=False,
+    )(
+        tokens,
+        dispatch_weights,
+        self.wi_0[...].astype(self.config.dtype),
+        self.wi_1[...].astype(self.config.dtype),
+        self.wo[...].astype(self.config.dtype),
+    )
     return output.reshape(orig_shape)
 
 
