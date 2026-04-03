@@ -1073,6 +1073,14 @@ def setup_decode_state(model, config, rng, mesh, checkpoint_manager):
     # Load params from checkpoint
     max_logging.log(f"Loading decode params from {config.load_parameters_path}")
     unboxed_abstract_state, state_mesh_annotations, _ = get_abstract_state(model, None, config, rng, mesh, False)
+    # DEBUG: print sharding of first MoE wi_0 param to diagnose EP sharding
+    import jax  # pylint: disable=import-outside-toplevel
+    def _print_moe_shardings(path, leaf):
+      path_str = "/".join(str(p.key) if hasattr(p, "key") else str(p) for p in path)
+      if "wi_0" in path_str or "wi_1" in path_str or "wo" in path_str:
+        sharding = getattr(leaf, "sharding", None)
+        print(f"[SHARDING] {path_str}: shape={leaf.shape} sharding={sharding}", flush=True)
+    jax.tree_util.tree_map_with_path(_print_moe_shardings, unboxed_abstract_state.params)
     with nn_partitioning.axis_rules(config.logical_axis_rules):
       params = checkpointing.load_params_from_path(
           config.load_parameters_path,
