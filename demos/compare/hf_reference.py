@@ -90,6 +90,8 @@ def _parse_args():
     p.add_argument("--hub_id", default="XiaomiMiMo/MiMo-V2-Flash",
                    help="HuggingFace Hub repo ID for downloading custom architecture "
                         ".py files when not present in --model_path (e.g. gcsfuse mount).")
+    p.add_argument("--no_fast_load", action="store_true",
+                   help="Disable staged GCS loading and use slower gcsfuse mmap instead.")
     return p.parse_args()
 
 
@@ -118,14 +120,140 @@ if user_site not in sys.path:
 
 
 # ---------------------------------------------------------------------------
+# Fast GCS loading helpers (bypass gcsfuse mmap page-fault bottleneck)
+# ---------------------------------------------------------------------------
+
+def _gcsfuse_gcs_uri(local_path: str) -> Optional[str]:
+    """If local_path is under a gcsfuse mount, return the gs:// URI for it.
+
+    gcsfuse mmap reads via 4KB page-faults gives ~17 MB/s for large files.
+    Using gcloud storage cp directly achieves ~1 GB/s.
+    """
+    import subprocess
+    try:
+        out = subprocess.check_output(["mount"], text=True, timeout=5)
+    except Exception:
+        return None
+    abs_path = os.path.abspath(local_path)
+    for line in out.splitlines():
+        if "gcsfuse" not in line.lower():
+            continue
+        # Linux: "bucket on /mountpoint type fuse.gcsfuse (...)"
+        parts = line.split()
+        if len(parts) >= 3:
+            bucket = parts[0]
+            mountpoint = parts[2].rstrip("/")
+            if abs_path.startswith(mountpoint + "/") or abs_path == mountpoint:
+                suffix = abs_path[len(mountpoint):].lstrip("/")
+                return f"gs://{bucket}/{suffix}" if suffix else f"gs://{bucket}"
+    return None
+
+
+def _load_model_staged(config, effective_model_path: str, gcs_model_uri: str,
+                       torch_dtype) -> "AutoModelForCausalLM":
+    """Create model and load weights by staging safetensors shards from GCS
+    one at a time via gcloud storage cp.
+
+    Each shard is downloaded to /tmp (max ~4 GB on disk at once), loaded with
+    safetensors, cast to torch_dtype, applied to the model, then deleted.
+    Achieves ~1 GB/s vs ~17 MB/s for gcsfuse mmap reads.
+    """
+    import json
+    import subprocess
+    import torch
+    from safetensors.torch import load_file as _st_load
+    from transformers import AutoModelForCausalLM
+
+    # Read weight shard index from the decompressed effective_model_path
+    index_path = os.path.join(effective_model_path, "model.safetensors.index.json")
+    with open(index_path) as f:
+        index = json.load(f)
+    weight_map = index.get("weight_map", {})
+
+    # Group params by shard file
+    shards: dict = {}
+    for param_name, shard_file in weight_map.items():
+        shards.setdefault(shard_file, []).append(param_name)
+
+    total_shards = len(shards)
+    print(f"Creating model structure ({total_shards} shards to load via GCS direct) …",
+          flush=True)
+    # Allocate model in target dtype (virtual address space; physical pages
+    # are committed lazily as we write actual weights below).
+    model = AutoModelForCausalLM.from_config(config, torch_dtype=torch_dtype,
+                                             trust_remote_code=True)
+    model.eval()
+
+    staged_path = "/tmp/mimo_shard_staged.safetensors"
+    total_bytes = 0
+    total_t_dl = 0.0
+
+    for shard_idx, (shard_name, param_names) in enumerate(sorted(shards.items()), 1):
+        shard_gcs_uri = gcs_model_uri.rstrip("/") + "/" + shard_name
+        t0 = time.perf_counter()
+        result = subprocess.run(
+            ["gcloud", "storage", "cp", shard_gcs_uri, staged_path],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"gcloud storage cp failed for {shard_gcs_uri}:\n{result.stderr}"
+            )
+        shard_bytes = os.path.getsize(staged_path)
+        t_dl = time.perf_counter() - t0
+        total_bytes += shard_bytes
+        total_t_dl += t_dl
+
+        tensors = _st_load(staged_path, device="cpu")
+        os.unlink(staged_path)
+
+        # Cast to target dtype (handles FP8 → bfloat16, etc.) and apply
+        partial: dict = {}
+        for name in param_names:
+            if name in tensors:
+                t = tensors[name]
+                if t.dtype != torch_dtype:
+                    t = t.to(torch_dtype)
+                partial[name] = t
+        model.load_state_dict(partial, strict=False)
+        del tensors, partial
+
+        shard_gb = shard_bytes / 2 ** 30
+        dl_mbs = shard_bytes / 2 ** 20 / max(t_dl, 1e-6)
+        print(
+            f"  [{shard_idx:3d}/{total_shards}] {shard_name:<48s}"
+            f" {shard_gb:.2f}GB  {t_dl:.1f}s  {dl_mbs:.0f} MB/s",
+            flush=True,
+        )
+
+    avg_mbs = total_bytes / 2 ** 20 / max(total_t_dl, 1e-6)
+    print(
+        f"All shards loaded: {total_bytes/2**30:.1f}GB in {total_t_dl:.0f}s "
+        f"(avg {avg_mbs:.0f} MB/s)",
+        flush=True,
+    )
+    return model
+
+
+# ---------------------------------------------------------------------------
 # Load helpers
 # ---------------------------------------------------------------------------
 
 def _load_model_and_tokenizer(model_path: str, tokenizer_path: Optional[str],
-                              hub_id: str = "XiaomiMiMo/MiMo-V2-Flash"):
+                              hub_id: str = "XiaomiMiMo/MiMo-V2-Flash",
+                              fast_load: bool = True):
     import torch
     import gzip, shutil, tempfile
     from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
+
+    # Detect GCS URI early (before we create a tmp_dir that obscures the path)
+    gcs_model_uri = _gcsfuse_gcs_uri(model_path) if fast_load else None
+    if gcs_model_uri:
+        print(f"[FAST LOAD] gcsfuse mount detected → will stage shards from {gcs_model_uri}",
+              flush=True)
+    elif fast_load:
+        print("[FAST LOAD] no gcsfuse mount detected; falling back to from_pretrained.",
+              flush=True)
 
     tok_path = tokenizer_path or model_path
     print(f"Loading tokenizer from {tok_path} …")
@@ -221,20 +349,25 @@ def _load_model_and_tokenizer(model_path: str, tokenizer_path: Optional[str],
     except Exception as _e:
         print(f"  WARNING: could not inject RoPE shim: {_e}")
 
-    print(f"Loading model weights from {effective_model_path} "
-          f"(streaming from gcsfuse/GCS — this may take 30-90 minutes) …")
     t0 = time.perf_counter()
-    model = AutoModelForCausalLM.from_pretrained(
-        effective_model_path,
-        config=config,
-        torch_dtype=torch.bfloat16,
-        device_map="cpu",
-        low_cpu_mem_usage=True,
-        trust_remote_code=True,
-    )
-    model.eval()
+    if gcs_model_uri:
+        print(f"Loading model weights via staged GCS copy (fast path) …", flush=True)
+        model = _load_model_staged(config, effective_model_path, gcs_model_uri,
+                                   torch_dtype=torch.bfloat16)
+    else:
+        print(f"Loading model weights from {effective_model_path} "
+              f"(gcsfuse mmap — may be slow for large models) …")
+        model = AutoModelForCausalLM.from_pretrained(
+            effective_model_path,
+            config=config,
+            torch_dtype=torch.bfloat16,
+            device_map="cpu",
+            low_cpu_mem_usage=True,
+            trust_remote_code=True,
+        )
+        model.eval()
     elapsed = time.perf_counter() - t0
-    print(f"Model loaded in {elapsed:.0f}s.")
+    print(f"Model loaded in {elapsed:.0f}s.", flush=True)
     return tokenizer, model
 
 
@@ -379,7 +512,8 @@ def run_reference(model, tokenizer, prompt, max_new_tokens, layers_to_capture, o
 def main():
     args = _parse_args()
     tokenizer, model = _load_model_and_tokenizer(args.model_path, args.tokenizer_path,
-                                                  args.hub_id)
+                                                  args.hub_id,
+                                                  fast_load=not args.no_fast_load)
     run_reference(
         model=model,
         tokenizer=tokenizer,
