@@ -197,13 +197,28 @@ def _load_model_staged(config, effective_model_path: str, gcs_model_uri: str,
                 gcs_uri_shard = f"gs://{bucket}/{sub_path}"
                 _counter[0] += 1
                 t0 = time.perf_counter()
-                result = subprocess.run(
-                    ["gcloud", "storage", "cp", gcs_uri_shard, staged_path],
-                    capture_output=True, text=True,
-                )
-                if result.returncode != 0:
+                _max_retries = 3
+                _last_stderr = ""
+                for _attempt in range(_max_retries):
+                    result = subprocess.run(
+                        ["gcloud", "storage", "cp", gcs_uri_shard, staged_path],
+                        capture_output=True, text=True,
+                    )
+                    if result.returncode == 0:
+                        break
+                    _last_stderr = result.stderr
+                    if _attempt < _max_retries - 1:
+                        _wait = 2 ** _attempt  # 1s, 2s
+                        print(
+                            f"  WARNING: gcloud cp attempt {_attempt + 1} failed "
+                            f"for {os.path.basename(real_str)}; retrying in {_wait}s …",
+                            flush=True,
+                        )
+                        time.sleep(_wait)
+                else:
                     raise RuntimeError(
-                        f"gcloud storage cp failed for {gcs_uri_shard}:\n{result.stderr}"
+                        f"gcloud storage cp failed for {gcs_uri_shard} "
+                        f"after {_max_retries} attempts:\n{_last_stderr}"
                     )
                 shard_bytes = os.path.getsize(staged_path)
                 t_dl = time.perf_counter() - t0
