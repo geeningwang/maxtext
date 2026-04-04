@@ -86,6 +86,23 @@ ls "${MOUNT_DIR}/${GCS_SUBDIR}/" | head -10
 
 # Write the actual model path (bucket_mount/subdir) for convenience
 echo "${MOUNT_DIR}/${GCS_SUBDIR}" > /tmp/hf_model_path.txt
+
+# ── Step 3: Decompress tokenizer files if gzip-encoded ───────────────────────
+# GCS objects with Content-Encoding: gzip are stored compressed; gcloud storage
+# cp preserves the raw bytes.  Decompress any gzip files in mimo-tokenizer/.
+if [[ -d "$HOME/mimo-tokenizer" ]]; then
+  echo ""
+  echo "=== Checking tokenizer files for gzip compression ==="
+  for f in "$HOME/mimo-tokenizer"/*.json "$HOME/mimo-tokenizer"/*.txt; do
+    [[ -f "$f" ]] || continue
+    magic=$(xxd "$f" 2>/dev/null | head -1 || true)
+    if echo "$magic" | grep -q "1f8b"; then
+      /usr/bin/python3 -c "import gzip,shutil; shutil.copyfileobj(gzip.open('$f','rb'), open('${f}.dec','wb'))"
+      mv "${f}.dec" "$f"
+      echo "  decompressed $(basename $f)"
+    fi
+  done
+fi
 echo ""
 echo "=== Setup complete on $(hostname) ==="
 echo "Model path:  ${MOUNT_DIR}/${GCS_SUBDIR}"
