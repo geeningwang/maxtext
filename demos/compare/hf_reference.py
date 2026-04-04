@@ -452,33 +452,46 @@ def _load_model_and_tokenizer(model_path: str, tokenizer_path: Optional[str],
         print(f"  WARNING: could not inject RoPE shim: {_e}")
 
     # Compatibility shim: transformers 5.x _init_weights calls
-    # module.compute_default_rope_parameters on any RotaryEmbedding subclass
-    # with rope_type=="default", but MiMoV2FlashRotaryEmbedding never defined
-    # this method (written for older transformers).  Patch it onto every
-    # RotaryEmbedding class in transformers_modules that is missing it.
+    # module.compute_default_rope_parameters on every RotaryEmbedding instance
+    # with rope_type=="default", but MiMoV2FlashRotaryEmbedding was written for
+    # older transformers and never defined this method.
+    #
+    # We can't patch the class here because modeling_mimo_v2_flash.py is not
+    # imported until AutoModelForCausalLM.from_pretrained() runs — scanning
+    # sys.modules at this point would find only configuration_mimo_v2_flash.
+    #
+    # Instead, patch PreTrainedModel._init_weights globally so that it falls
+    # back gracefully when compute_default_rope_parameters is absent, performing
+    # the same inv_freq reinit it would have done via that method.
     try:
-        import sys
-        from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS as _ROPE_FNS
-        _patched = 0
-        for _mod_name, _mod in list(sys.modules.items()):
-            if _mod is None or "transformers_modules" not in _mod_name:
-                continue
-            for _attr in dir(_mod):
-                if "RotaryEmbedding" not in _attr:
-                    continue
-                _cls = getattr(_mod, _attr, None)
-                if _cls is None or not isinstance(_cls, type):
-                    continue
-                if not hasattr(_cls, "compute_default_rope_parameters"):
-                    def _cdp(self, config=None, **kw):
-                        return _ROPE_FNS["default"](config if config is not None else self.config, **kw)
-                    _cls.compute_default_rope_parameters = _cdp
-                    print(f"  INFO: patched {_cls.__name__}.compute_default_rope_parameters")
-                    _patched += 1
-        if _patched == 0:
-            print("  INFO: compute_default_rope_parameters already present on all RotaryEmbedding classes.")
+        from transformers import modeling_utils as _mu
+        import torch.nn.init as _nn_init
+        from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS as _ROPE_FNS2
+        _orig_init_weights = _mu.PreTrainedModel._init_weights
+
+        def _patched_init_weights(self, module):
+            try:
+                _orig_init_weights(self, module)
+            except AttributeError as _e:
+                if "compute_default_rope_parameters" not in str(_e):
+                    raise
+                # Reinit inv_freq directly — same logic transformers would do
+                # via compute_default_rope_parameters.
+                if (hasattr(module, "original_inv_freq") and
+                        hasattr(module, "inv_freq") and
+                        hasattr(module, "config")):
+                    _rtype = getattr(module, "rope_type", "default")
+                    _fn = _ROPE_FNS2.get(_rtype) or _ROPE_FNS2.get("default")
+                    if _fn:
+                        _buf, _ = _fn(module.config)
+                        _nn_init.copy_(module.inv_freq, _buf)
+                        _nn_init.copy_(module.original_inv_freq, _buf)
+
+        _mu.PreTrainedModel._init_weights = _patched_init_weights
+        print("  INFO: patched PreTrainedModel._init_weights for "
+              "compute_default_rope_parameters fallback.")
     except Exception as _e:
-        print(f"  WARNING: could not patch compute_default_rope_parameters: {_e}")
+        print(f"  WARNING: could not patch _init_weights: {_e}")
 
     t0 = time.perf_counter()
     if gcs_model_uri:
