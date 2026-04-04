@@ -186,11 +186,14 @@ def _load_model_staged(config, effective_model_path: str, gcs_model_uri: str,
 
         def __init__(self, path, framework, device="cpu"):
             path_str = str(path)
+            # Resolve symlinks so gcsfuse-mounted paths are detected even
+            # when accessed through a temp dir with symlinks.
+            real_str = os.path.realpath(path_str)
             self._path_str = path_str
             self._staged = False
-            if "/mimo-hf-gcs/" in path_str:
+            if "/mimo-hf-gcs/" in real_str:
                 bucket = gcs_model_uri.split("gs://")[1].split("/")[0]
-                sub_path = path_str.split("/mimo-hf-gcs/")[1]
+                sub_path = real_str.split("/mimo-hf-gcs/")[1]
                 gcs_uri_shard = f"gs://{bucket}/{sub_path}"
                 _counter[0] += 1
                 t0 = time.perf_counter()
@@ -208,7 +211,7 @@ def _load_model_staged(config, effective_model_path: str, gcs_model_uri: str,
                 _total_t[0] += t_dl
                 shard_gb = shard_bytes / 2 ** 30
                 dl_mbs = shard_bytes / 2 ** 20 / max(t_dl, 1e-6)
-                shard_name = os.path.basename(path_str)
+                shard_name = os.path.basename(real_str)
                 print(
                     f"  [shard {_counter[0]:3d}] {shard_name:<48s}"
                     f" {shard_gb:.2f}GB  {t_dl:.1f}s  {dl_mbs:.0f} MB/s",
