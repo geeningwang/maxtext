@@ -239,6 +239,12 @@ def _load_model_staged(config, effective_model_path: str, gcs_model_uri: str,
         def get_tensor(self, key):
             return self._delegate.get_tensor(key)
 
+        def get_slice(self, key):
+            return self._delegate.get_slice(key)
+
+        def offset_keys(self):
+            return self._delegate.offset_keys()
+
         def metadata(self):
             return self._delegate.metadata()
 
