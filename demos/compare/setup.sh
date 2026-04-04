@@ -60,7 +60,7 @@ mkdir -p "${MOUNT_DIR}"
 
 # gcsfuse mounts a single bucket; we mount the full bucket then point at the subdir.
 # Use --implicit-dirs so safetensors index can enumerate files.
-gcsfuse \
+/usr/bin/gcsfuse \
   --implicit-dirs \
   --stat-cache-ttl=60s \
   --type-cache-ttl=60s \
