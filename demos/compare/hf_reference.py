@@ -341,10 +341,6 @@ def _load_model_and_tokenizer(model_path: str, tokenizer_path: Optional[str],
         print("[FAST LOAD] no gcsfuse mount detected; falling back to from_pretrained.",
               flush=True)
 
-    tok_path = tokenizer_path or model_path
-    print(f"Loading tokenizer from {tok_path} …")
-    tokenizer = AutoTokenizer.from_pretrained(tok_path, trust_remote_code=True)
-
     # gcsfuse serves the GCS objects with transparent gzip encoding.
     # The config.json in the bucket is gzip-compressed, which confuses
     # AutoConfig.  Detect it and decompress to a temp directory; all
@@ -420,6 +416,15 @@ def _load_model_and_tokenizer(model_path: str, tokenizer_path: Optional[str],
             effective_model_path = tmp_dir
     except Exception as e:
         print(f"  WARNING: could not check config.json compression: {e}")
+
+    # Load tokenizer after effective_model_path is resolved (tmp_dir has decompressed JSONs).
+    # If tokenizer_path is explicitly set to the same dir as model_path, use effective path.
+    if tokenizer_path and tokenizer_path != model_path:
+        tok_path = tokenizer_path
+    else:
+        tok_path = effective_model_path
+    print(f"Loading tokenizer from {tok_path} …", flush=True)
+    tokenizer = AutoTokenizer.from_pretrained(tok_path, trust_remote_code=True)
 
     print(f"Loading model config from {effective_model_path} …")
     config = AutoConfig.from_pretrained(effective_model_path, trust_remote_code=True)
