@@ -161,6 +161,8 @@ def _load_model_staged(config, effective_model_path: str, gcs_model_uri: str,
     import json
     import subprocess
     import torch
+    from accelerate import init_empty_weights
+    from accelerate.utils import set_module_tensor_to_device
     from safetensors.torch import load_file as _st_load
     from transformers import AutoModelForCausalLM
 
@@ -176,12 +178,13 @@ def _load_model_staged(config, effective_model_path: str, gcs_model_uri: str,
         shards.setdefault(shard_file, []).append(param_name)
 
     total_shards = len(shards)
-    print(f"Creating model structure ({total_shards} shards to load via GCS direct) …",
+    print(f"Creating model structure on meta device ({total_shards} shards to load) …",
           flush=True)
-    # Allocate model in target dtype (virtual address space; physical pages
-    # are committed lazily as we write actual weights below).
-    model = AutoModelForCausalLM.from_config(config, torch_dtype=torch_dtype,
-                                             trust_remote_code=True)
+    # Use init_empty_weights: model lives on "meta" device — no RAM allocated yet.
+    # Each parameter is materialized (committed to RAM) only when we assign it below.
+    with init_empty_weights():
+        model = AutoModelForCausalLM.from_config(config, torch_dtype=torch_dtype,
+                                                 trust_remote_code=True)
     model.eval()
 
     staged_path = "/tmp/mimo_shard_staged.safetensors"
@@ -207,16 +210,15 @@ def _load_model_staged(config, effective_model_path: str, gcs_model_uri: str,
         tensors = _st_load(staged_path, device="cpu")
         os.unlink(staged_path)
 
-        # Cast to target dtype (handles FP8 → bfloat16, etc.) and apply
-        partial: dict = {}
+        # Cast to target dtype (handles FP8 → bfloat16, etc.) and materialize
+        # each meta-device parameter into real CPU RAM.
         for name in param_names:
             if name in tensors:
                 t = tensors[name]
                 if t.dtype != torch_dtype:
                     t = t.to(torch_dtype)
-                partial[name] = t
-        model.load_state_dict(partial, strict=False)
-        del tensors, partial
+                set_module_tensor_to_device(model, name, device="cpu", value=t)
+        del tensors
 
         shard_gb = shard_bytes / 2 ** 30
         dl_mbs = shard_bytes / 2 ** 20 / max(t_dl, 1e-6)
