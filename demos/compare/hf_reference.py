@@ -148,16 +148,26 @@ def _load_model_and_tokenizer(model_path: str, tokenizer_path: Optional[str],
             for fname in os.listdir(model_path):
                 src = os.path.join(model_path, fname)
                 dst = os.path.join(tmp_dir, fname)
-                if fname == "config.json":
+                if fname.endswith(".json"):
                     import json as _json
-                    with gzip.open(src, "rb") as gf:
-                        cfg_dict = _json.load(gf)
-                    # Strip FP8 quantization so from_pretrained loads as plain bfloat16.
-                    # (The quantization check in transformers re-reads config.json from
-                    # disk, so the in-memory patch alone is not sufficient.)
-                    cfg_dict.pop("quantization_config", None)
-                    with open(dst, "w") as df:
-                        _json.dump(cfg_dict, df, indent=2)
+                    # gcsfuse may serve any JSON file gzip-compressed.
+                    # Decompress if needed; strip quantization_config from config.json.
+                    try:
+                        with open(src, "rb") as _f:
+                            _magic = _f.read(2)
+                        if _magic == b'\x1f\x8b':
+                            with gzip.open(src, "rb") as gf:
+                                _d = _json.load(gf)
+                        else:
+                            with open(src, "r") as gf:
+                                _d = _json.load(gf)
+                        if fname == "config.json":
+                            _d.pop("quantization_config", None)
+                        with open(dst, "w") as df:
+                            _json.dump(_d, df)
+                    except Exception as _e:
+                        print(f"  WARNING: could not process {fname}: {_e}")
+                        os.symlink(src, dst)
                 else:
                     os.symlink(src, dst)
             # The GCS bucket has only safetensors + tokenizer files; the custom
