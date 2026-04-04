@@ -87,6 +87,9 @@ def _parse_args():
                         "Pass --layers_to_capture 0 1 2 to capture only first 3.")
     p.add_argument("--fp32_output", action="store_true",
                    help="Cast all saved arrays to float32 (default is bfloat16 → float32).")
+    p.add_argument("--hub_id", default="XiaomiMiMo/MiMo-V2-Flash",
+                   help="HuggingFace Hub repo ID for downloading custom architecture "
+                        ".py files when not present in --model_path (e.g. gcsfuse mount).")
     return p.parse_args()
 
 
@@ -118,7 +121,8 @@ if user_site not in sys.path:
 # Load helpers
 # ---------------------------------------------------------------------------
 
-def _load_model_and_tokenizer(model_path: str, tokenizer_path: Optional[str]):
+def _load_model_and_tokenizer(model_path: str, tokenizer_path: Optional[str],
+                              hub_id: str = "XiaomiMiMo/MiMo-V2-Flash"):
     import torch
     import gzip, shutil, tempfile
     from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
@@ -149,6 +153,28 @@ def _load_model_and_tokenizer(model_path: str, tokenizer_path: Optional[str]):
                         shutil.copyfileobj(gf, df)
                 else:
                     os.symlink(src, dst)
+            # The GCS bucket has only safetensors + tokenizer files; the custom
+            # architecture Python files (configuration_mimo_v2_flash.py, etc.)
+            # live only on HuggingFace Hub.  Download them now (cached in
+            # ~/.cache/huggingface/hub after the first run).
+            print("  INFO: Downloading custom architecture .py files from "
+                  f"HuggingFace Hub ({hub_id}) …")
+            try:
+                from huggingface_hub import snapshot_download
+                arch_cache = snapshot_download(
+                    repo_id=hub_id,
+                    allow_patterns=["*.py"],
+                    ignore_patterns=["*.safetensors", "*.bin", "*.pt", "*.gguf"],
+                )
+                for fname in os.listdir(arch_cache):
+                    if fname.endswith(".py"):
+                        src = os.path.join(arch_cache, fname)
+                        dst = os.path.join(tmp_dir, fname)
+                        if not os.path.exists(dst):
+                            os.symlink(src, dst)
+                            print(f"    symlinked {fname}")
+            except Exception as e:
+                print(f"  WARNING: could not fetch arch files from Hub: {e}")
             effective_model_path = tmp_dir
     except Exception as e:
         print(f"  WARNING: could not check config.json compression: {e}")
@@ -318,7 +344,8 @@ def run_reference(model, tokenizer, prompt, max_new_tokens, layers_to_capture, o
 
 def main():
     args = _parse_args()
-    tokenizer, model = _load_model_and_tokenizer(args.model_path, args.tokenizer_path)
+    tokenizer, model = _load_model_and_tokenizer(args.model_path, args.tokenizer_path,
+                                                  args.hub_id)
     run_reference(
         model=model,
         tokenizer=tokenizer,
