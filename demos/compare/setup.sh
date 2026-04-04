@@ -57,14 +57,13 @@ echo "=== Mounting gs://${GCS_BUCKET}/${GCS_SUBDIR} at ${MOUNT_DIR} ==="
 # Install gcsfuse if not present (new TPU images may not include it).
 GCSFUSE_BIN=$(command -v gcsfuse 2>/dev/null || echo "")
 if [[ -z "${GCSFUSE_BIN}" ]]; then
-  echo "  gcsfuse not found — installing from packages.cloud.google.com …"
-  export GCSFUSE_REPO=gcsfuse-$(lsb_release -c -s)
-  echo "deb [signed-by=/usr/share/keyrings/cloud.google.asc] https://packages.cloud.google.com/apt ${GCSFUSE_REPO} main" \
-    | sudo tee /etc/apt/sources.list.d/gcsfuse.list
-  curl -s https://packages.cloud.google.com/apt/doc/apt-key.gpg \
-    | sudo gpg --dearmor -o /usr/share/keyrings/cloud.google.asc
-  sudo apt-get -qq update
-  sudo apt-get -qq install -y gcsfuse
+  echo "  gcsfuse not found — installing via direct .deb download …"
+  GCSFUSE_VERSION="2.6.0"
+  GCSFUSE_DEB="/tmp/gcsfuse_${GCSFUSE_VERSION}_amd64.deb"
+  curl -fsSL -o "${GCSFUSE_DEB}" \
+    "https://github.com/GoogleCloudPlatform/gcsfuse/releases/download/v${GCSFUSE_VERSION}/gcsfuse_${GCSFUSE_VERSION}_amd64.deb"
+  sudo dpkg -i "${GCSFUSE_DEB}"
+  rm -f "${GCSFUSE_DEB}"
   GCSFUSE_BIN=$(command -v gcsfuse)
   echo "  gcsfuse installed at ${GCSFUSE_BIN}"
 fi
