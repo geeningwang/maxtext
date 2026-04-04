@@ -198,10 +198,13 @@ def main(argv: Sequence[str]) -> None:
         _all_logits = multihost_utils.process_allgather(
             decode_state["logits"], tiled=True
         )  # [num_procs * local_batch, 1, vocab_size] — fully local on every process
+        # Also gather tokens.data — collective barrier, all processes must participate
+        _all_tokens_data = multihost_utils.process_allgather(sampled_tokens.data, tiled=True)
         if _is_host0() and rel_step < max_new_tokens:
             # Slot 0 is the first logical batch item (process 0's first local slice)
             raw_logits = np.array(_all_logits[0, 0, :], dtype=np.float32)
-            token_id = int(sampled_tokens.get_result_at_slot(0).tokens.item())
+            t_idx = sampled_tokens.tokens_idx
+            token_id = int(np.array(_all_tokens_data[0, t_idx[0]:t_idx[1]])[0])
             token_str = tokenizer_model.decode([token_id])
 
             # Top-10
@@ -227,9 +230,11 @@ def main(argv: Sequence[str]) -> None:
         multihost_utils.sync_global_devices(f"after_logits_{rel_step}")
 
     # ------------------------------------------------------------------ Decode results
-    for i in range(_NUM_STREAMS):
-        results = [t.get_result_at_slot(i).tokens.item() for t in sampled_tokens_list]
-        output = tokenizer_model.decode(results)
+    # sampled_tokens_list contains globally-sharded JAX arrays — token IDs were
+    # already gathered per-step into step_info via process_allgather above.
+    output = ""
+    if _is_host0():
+        output = tokenizer_model.decode([s["token_id"] for s in step_info])
         print(f"Input `{text}` -> `{output}`")
 
     if _is_host0():
