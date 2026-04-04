@@ -285,53 +285,12 @@ kill -TERM <main_pid> <scheduler_pid> <detokenizer_pid>
 
 ---
 
-## llama.cpp Server (alternative path, worker-0)
+## llama.cpp GGUF Path (alternative)
 
-Worker-2 holds the GGUF in a 650 G tmpfs; running llama.cpp **on worker-2**
-would leave too little memory for model weights and KV cache.  llama.cpp is
-therefore built on **worker-0** (708 GB RAM) and reads the GGUF over NFS.
+For the llama.cpp / GGUF inference path, see the dedicated guide:
+[mimo_v2_flash_llamacpp_cpu.md](mimo_v2_flash_llamacpp_cpu.md)
 
-### Build (already completed — HEAD `9c69907`)
-
-```bash
-# worker-0
-git clone --depth=1 https://github.com/ggml-org/llama.cpp.git ~/llama.cpp
-cd ~/llama.cpp
-
-cmake -B build \
-  -DGGML_NATIVE=ON \
-  -DGGML_AVX512=ON \
-  -DGGML_AVX512_VBMI=ON \
-  -DGGML_AVX512_VNNI=ON \
-  -DGGML_AVX2=ON \
-  -DBUILD_SHARED_LIBS=OFF \
-  -DCMAKE_BUILD_TYPE=Release
-
-cmake --build build --config Release -j180
-# Runtime: ~75 s on 180 cores
-```
-
-Binaries are at `~/llama.cpp/build/bin/`: `llama-server`, `llama-cli`,
-`llama-bench`, `llama-gguf`.
-
-### Launching the server (when ready to test)
-
-```bash
-~/llama.cpp/build/bin/llama-server \
-  --model /mnt/gguf-scratch/mimo-v2-flash-Q8_0.gguf \
-  --host 0.0.0.0 --port 8080 \
-  --threads 176 \
-  --ctx-size 2048 \
-  --n-gpu-layers 0
-```
-
-The GGUF (`306 G`) streams over NFS from worker-2 on first load; subsequent
-runs benefit from OS page cache on worker-0.
-
-### Testing
-
-```bash
-curl -s http://localhost:8080/v1/completions \
-  -H "Content-Type: application/json" \
-  -d '{"model": "mimo-v2-flash", "prompt": "What is 1+1? The answer is ", "n_predict": 10}'
-```
+Key difference: the GGUF Q8_0 path produces **coherent output** (`"2. But what
+is 0+0?"` for the 1+1 prompt), while this SGLang path produces garbled Unicode
+(`葭葭葭…`) due to FP8→BF16 weight cast stripping the quantization scales — see
+Known Limitations below.
