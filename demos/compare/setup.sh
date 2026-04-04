@@ -40,7 +40,7 @@ TORCH_INDEX="https://download.pytorch.org/whl/cpu"
 # ── Step 1: Install CPU-only torch + transformers via system pip3 --user ─────
 echo "=== Installing PyTorch (CPU-only) + transformers via pip3 --user ==="
 pip3 install --quiet --user torch --index-url "${TORCH_INDEX}"
-pip3 install --quiet --user "transformers==4.47.0" accelerate
+pip3 install --quiet --user "transformers>=4.51,<5.0" accelerate
 
 echo "=== Verifying ==="
 python3 -c "import torch; print('torch', torch.__version__)"
