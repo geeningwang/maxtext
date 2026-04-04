@@ -154,94 +154,105 @@ def _load_model_staged(config, effective_model_path: str, gcs_model_uri: str,
     """Load model via from_pretrained, but intercept safetensors shard loading
     to stage each shard from GCS before reading (bypassing gcsfuse mmap).
 
-    Patches accelerate.utils.modeling.safe_load_file so that any call to load a
-    shard from a gcsfuse-mounted path first copies it to /tmp via
-    'gcloud storage cp', then reads from the fast local file.
+    accelerate uses safetensors.safe_open (a context manager) to read tensors
+    one-by-one from each shard.  When the path is on a gcsfuse mount this
+    triggers per-tensor 4KB page faults at ~17 MB/s.
 
-    Each shard occupies at most ~4 GB on disk (deleted after loading).
-    Achieves ~1 GB/s vs ~17 MB/s for gcsfuse page-fault reads.
+    Fix: replace safetensors.safe_open with a shim that, for gcsfuse paths,
+    first downloads the whole shard to /tmp via 'gcloud storage cp' (~1 GB/s),
+    then opens the local copy with the real safe_open.
+
+    Each shard occupies at most ~4 GB on disk (deleted after the context exits).
     """
     import subprocess
-    import torch
+    import safetensors
     import safetensors.torch as _st
+    import accelerate.utils.modeling as _aum
     from transformers import AutoModelForCausalLM
 
     staged_path = "/tmp/mimo_shard_staged.safetensors"
-    _orig_load_file = _st.load_file
+    _orig_safe_open = safetensors.safe_open
     _counter = [0]
     _total_bytes = [0]
     _total_t = [0.0]
 
-    def _staged_load_file(path, device="cpu"):
-        """Stage shard from gcsfuse → local /tmp, then load normally."""
-        path_str = str(path)
-        # Detect gcsfuse mount prefix
-        if "/mimo-hf-gcs/" in path_str:
-            # gcsfuse mounts bucket at /tmp/mimo-hf-gcs; extract sub-path
-            # and reconstruct as gs://bucket/sub-path
-            bucket = gcs_model_uri.split("gs://")[1].split("/")[0]
-            sub_path = path_str.split("/mimo-hf-gcs/")[1]
-            gcs_uri_shard = f"gs://{bucket}/{sub_path}"
-            _counter[0] += 1
-            t0 = time.perf_counter()
-            result = subprocess.run(
-                ["gcloud", "storage", "cp", gcs_uri_shard, staged_path],
-                capture_output=True, text=True,
-            )
-            if result.returncode != 0:
-                raise RuntimeError(
-                    f"gcloud storage cp failed for {gcs_uri_shard}:\n{result.stderr}"
+    class _StagedSafeOpen:
+        """Context-manager shim for safetensors.safe_open.
+
+        For paths under a gcsfuse mount the entire shard is downloaded to
+        /tmp first; then the real safe_open is opened on that local copy.
+        The staged file is deleted when the context exits.
+        """
+
+        def __init__(self, path, framework, device="cpu"):
+            path_str = str(path)
+            self._path_str = path_str
+            self._staged = False
+            if "/mimo-hf-gcs/" in path_str:
+                bucket = gcs_model_uri.split("gs://")[1].split("/")[0]
+                sub_path = path_str.split("/mimo-hf-gcs/")[1]
+                gcs_uri_shard = f"gs://{bucket}/{sub_path}"
+                _counter[0] += 1
+                t0 = time.perf_counter()
+                result = subprocess.run(
+                    ["gcloud", "storage", "cp", gcs_uri_shard, staged_path],
+                    capture_output=True, text=True,
                 )
-            shard_bytes = os.path.getsize(staged_path)
-            t_dl = time.perf_counter() - t0
-            _total_bytes[0] += shard_bytes
-            _total_t[0] += t_dl
-            shard_gb = shard_bytes / 2 ** 30
-            dl_mbs = shard_bytes / 2 ** 20 / max(t_dl, 1e-6)
-            shard_name = os.path.basename(path_str)
-            print(
-                f"  [shard {_counter[0]:3d}] {shard_name:<48s}"
-                f" {shard_gb:.2f}GB  {t_dl:.1f}s  {dl_mbs:.0f} MB/s",
-                flush=True,
-            )
-            tensors = _orig_load_file(staged_path, device=device)
-            try:
-                os.unlink(staged_path)
-            except OSError:
-                pass
-            return tensors
-        # Not a gcsfuse path — fall through to original
-        return _orig_load_file(path, device=device)
+                if result.returncode != 0:
+                    raise RuntimeError(
+                        f"gcloud storage cp failed for {gcs_uri_shard}:\n{result.stderr}"
+                    )
+                shard_bytes = os.path.getsize(staged_path)
+                t_dl = time.perf_counter() - t0
+                _total_bytes[0] += shard_bytes
+                _total_t[0] += t_dl
+                shard_gb = shard_bytes / 2 ** 30
+                dl_mbs = shard_bytes / 2 ** 20 / max(t_dl, 1e-6)
+                shard_name = os.path.basename(path_str)
+                print(
+                    f"  [shard {_counter[0]:3d}] {shard_name:<48s}"
+                    f" {shard_gb:.2f}GB  {t_dl:.1f}s  {dl_mbs:.0f} MB/s",
+                    flush=True,
+                )
+                self._delegate = _orig_safe_open(staged_path, framework=framework, device=device)
+                self._staged = True
+            else:
+                self._delegate = _orig_safe_open(path_str, framework=framework, device=device)
 
-    # Patch in accelerate and transformers (they import load_file by name)
-    _patched = False
-    try:
-        import accelerate.utils.modeling as _aum
-        if hasattr(_aum, "safe_load_file"):
-            _aum.safe_load_file = _staged_load_file
-            _patched = True
-    except Exception:
-        pass
-    try:
-        import transformers.modeling_utils as _tmu
-        if hasattr(_tmu, "safe_load_file"):
-            _tmu.safe_load_file = _staged_load_file
-            _patched = True
-    except Exception:
-        pass
-    # Also patch the module-level symbol so any direct caller gets it
-    _st.load_file = _staged_load_file
-    if not _patched:
-        print("  WARNING: could not patch accelerate/transformers safe_load_file; "
-              "falling back to gcsfuse mmap.", flush=True)
+        def __enter__(self):
+            self._delegate.__enter__()
+            return self
 
-    print(f"Loading model via from_pretrained with staged GCS shard interception …",
+        def __exit__(self, *args):
+            result = self._delegate.__exit__(*args)
+            if self._staged:
+                try:
+                    os.unlink(staged_path)
+                except OSError:
+                    pass
+                self._staged = False
+            return result
+
+        def keys(self):
+            return self._delegate.keys()
+
+        def get_tensor(self, key):
+            return self._delegate.get_tensor(key)
+
+        def metadata(self):
+            return self._delegate.metadata()
+
+    # Patch safetensors.safe_open everywhere it is referenced
+    safetensors.safe_open = _StagedSafeOpen
+    _aum.safe_open = _StagedSafeOpen
+    # Also cover the direct import in load_state_dict (from safetensors import safe_open)
+    import sys as _sys
+    _safetensors_mod = _sys.modules.get("safetensors")
+    if _safetensors_mod is not None:
+        _safetensors_mod.safe_open = _StagedSafeOpen
+
+    print("Loading model via from_pretrained with staged GCS shard interception …",
           flush=True)
-    # Do NOT use low_cpu_mem_usage=True: that path uses safe_open for per-tensor
-    # mmap reads (slow via gcsfuse).  Without it, accelerate calls safe_load_file
-    # once per shard (whole-file read), which our patch intercepts for staging.
-    # Memory: from_pretrained first allocates ~582GB bfloat16 structure, then
-    # overwrites it shard-by-shard.  708GB RAM is sufficient.
     model = AutoModelForCausalLM.from_pretrained(
         effective_model_path,
         config=config,
@@ -252,19 +263,10 @@ def _load_model_staged(config, effective_model_path: str, gcs_model_uri: str,
     model.eval()
 
     # Restore originals
-    _st.load_file = _orig_load_file
-    try:
-        import accelerate.utils.modeling as _aum
-        if hasattr(_aum, "safe_load_file"):
-            _aum.safe_load_file = _orig_load_file
-    except Exception:
-        pass
-    try:
-        import transformers.modeling_utils as _tmu
-        if hasattr(_tmu, "safe_load_file"):
-            _tmu.safe_load_file = _orig_load_file
-    except Exception:
-        pass
+    safetensors.safe_open = _orig_safe_open
+    _aum.safe_open = _orig_safe_open
+    if _safetensors_mod is not None:
+        _safetensors_mod.safe_open = _orig_safe_open
 
     if _counter[0] > 0:
         avg_mbs = _total_bytes[0] / 2 ** 20 / max(_total_t[0], 1e-6)
@@ -273,6 +275,9 @@ def _load_model_staged(config, effective_model_path: str, gcs_model_uri: str,
             f"(avg {avg_mbs:.0f} MB/s  across {_counter[0]} shards)",
             flush=True,
         )
+    else:
+        print("WARNING: staged loader ran but intercepted 0 shards — "
+              "gcsfuse path detection may have failed.", flush=True)
     return model
 
 
