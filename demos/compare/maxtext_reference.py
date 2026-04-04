@@ -190,13 +190,17 @@ def main(argv: Sequence[str]) -> None:
         sampled_tokens_list.append(sampled_tokens)
 
         # ---- Save logits and token ID (process 0 only) ----
-        # Barrier: hold all processes here so process 0 can safely materialize the
-        # globally-sharded decode_state["logits"] before other processes race ahead
-        # to the next engine.generate() call (which would cause FAILED_PRECONDITION).
-        multihost_utils.sync_global_devices(f"before_logits_{rel_step}")
+        # decode_state["logits"] is a globally-sharded JAX array across all hosts.
+        # process_allgather is itself a collective barrier — all processes must
+        # participate together, so they cannot diverge here.  After this call every
+        # process holds a fully-local copy of the full logits tensor; process 0 can
+        # then safely call np.array() without triggering a cross-host gather.
+        _all_logits = multihost_utils.process_allgather(
+            decode_state["logits"], tiled=True
+        )  # [num_procs * local_batch, 1, vocab_size] — fully local on every process
         if _is_host0() and rel_step < max_new_tokens:
-            # out_logits: [batch, 1, vocab_size] → take batch=0, pos=0
-            raw_logits = np.array(decode_state["logits"][0, 0, :], dtype=np.float32)
+            # Slot 0 is the first logical batch item (process 0's first local slice)
+            raw_logits = np.array(_all_logits[0, 0, :], dtype=np.float32)
             token_id = int(sampled_tokens.get_result_at_slot(0).tokens.item())
             token_str = tokenizer_model.decode([token_id])
 
