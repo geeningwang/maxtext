@@ -465,7 +465,6 @@ def _load_model_and_tokenizer(model_path: str, tokenizer_path: Optional[str],
     # the same inv_freq reinit it would have done via that method.
     try:
         from transformers import modeling_utils as _mu
-        import torch.nn.init as _nn_init
         from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS as _ROPE_FNS2
         _orig_init_weights = _mu.PreTrainedModel._init_weights
 
@@ -484,8 +483,8 @@ def _load_model_and_tokenizer(model_path: str, tokenizer_path: Optional[str],
                     _fn = _ROPE_FNS2.get(_rtype) or _ROPE_FNS2.get("default")
                     if _fn:
                         _buf, _ = _fn(module.config)
-                        _nn_init.copy_(module.inv_freq, _buf)
-                        _nn_init.copy_(module.original_inv_freq, _buf)
+                        module.inv_freq.copy_(_buf)
+                        module.original_inv_freq.copy_(_buf)
 
         _mu.PreTrainedModel._init_weights = _patched_init_weights
         print("  INFO: patched PreTrainedModel._init_weights for "
