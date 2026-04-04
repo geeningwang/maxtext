@@ -149,8 +149,15 @@ def _load_model_and_tokenizer(model_path: str, tokenizer_path: Optional[str],
                 src = os.path.join(model_path, fname)
                 dst = os.path.join(tmp_dir, fname)
                 if fname == "config.json":
-                    with gzip.open(src, "rb") as gf, open(dst, "wb") as df:
-                        shutil.copyfileobj(gf, df)
+                    import json as _json
+                    with gzip.open(src, "rb") as gf:
+                        cfg_dict = _json.load(gf)
+                    # Strip FP8 quantization so from_pretrained loads as plain bfloat16.
+                    # (The quantization check in transformers re-reads config.json from
+                    # disk, so the in-memory patch alone is not sufficient.)
+                    cfg_dict.pop("quantization_config", None)
+                    with open(dst, "w") as df:
+                        _json.dump(cfg_dict, df, indent=2)
                 else:
                     os.symlink(src, dst)
             # The GCS bucket has only safetensors + tokenizer files; the custom
@@ -181,11 +188,6 @@ def _load_model_and_tokenizer(model_path: str, tokenizer_path: Optional[str],
 
     print(f"Loading model config from {effective_model_path} …")
     config = AutoConfig.from_pretrained(effective_model_path, trust_remote_code=True)
-
-    # Strip FP8 quantization config so the model loads in plain bfloat16 on CPU.
-    if hasattr(config, "quantization_config"):
-        print("  INFO: removing FP8 quantization_config so the model loads as bfloat16.")
-        config.quantization_config = None
 
     print(f"Loading model weights from {effective_model_path} "
           f"(streaming from gcsfuse/GCS — this may take 30-90 minutes) …")
