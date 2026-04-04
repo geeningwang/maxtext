@@ -151,89 +151,124 @@ def _gcsfuse_gcs_uri(local_path: str) -> Optional[str]:
 
 def _load_model_staged(config, effective_model_path: str, gcs_model_uri: str,
                        torch_dtype) -> "AutoModelForCausalLM":
-    """Create model and load weights by staging safetensors shards from GCS
-    one at a time via gcloud storage cp.
+    """Load model via from_pretrained, but intercept safetensors shard loading
+    to stage each shard from GCS before reading (bypassing gcsfuse mmap).
 
-    Each shard is downloaded to /tmp (max ~4 GB on disk at once), loaded with
-    safetensors, cast to torch_dtype, applied to the model, then deleted.
-    Achieves ~1 GB/s vs ~17 MB/s for gcsfuse mmap reads.
+    Patches accelerate.utils.modeling.safe_load_file so that any call to load a
+    shard from a gcsfuse-mounted path first copies it to /tmp via
+    'gcloud storage cp', then reads from the fast local file.
+
+    Each shard occupies at most ~4 GB on disk (deleted after loading).
+    Achieves ~1 GB/s vs ~17 MB/s for gcsfuse page-fault reads.
     """
-    import json
     import subprocess
     import torch
-    from accelerate import init_empty_weights
-    from accelerate.utils import set_module_tensor_to_device
-    from safetensors.torch import load_file as _st_load
+    import safetensors.torch as _st
     from transformers import AutoModelForCausalLM
 
-    # Read weight shard index from the decompressed effective_model_path
-    index_path = os.path.join(effective_model_path, "model.safetensors.index.json")
-    with open(index_path) as f:
-        index = json.load(f)
-    weight_map = index.get("weight_map", {})
+    staged_path = "/tmp/mimo_shard_staged.safetensors"
+    _orig_load_file = _st.load_file
+    _counter = [0]
+    _total_bytes = [0]
+    _total_t = [0.0]
 
-    # Group params by shard file
-    shards: dict = {}
-    for param_name, shard_file in weight_map.items():
-        shards.setdefault(shard_file, []).append(param_name)
+    def _staged_load_file(path, device="cpu"):
+        """Stage shard from gcsfuse → local /tmp, then load normally."""
+        path_str = str(path)
+        # Detect gcsfuse mount prefix
+        if "/mimo-hf-gcs/" in path_str:
+            # gcsfuse mounts bucket at /tmp/mimo-hf-gcs; extract sub-path
+            # and reconstruct as gs://bucket/sub-path
+            bucket = gcs_model_uri.split("gs://")[1].split("/")[0]
+            sub_path = path_str.split("/mimo-hf-gcs/")[1]
+            gcs_uri_shard = f"gs://{bucket}/{sub_path}"
+            _counter[0] += 1
+            t0 = time.perf_counter()
+            result = subprocess.run(
+                ["gcloud", "storage", "cp", gcs_uri_shard, staged_path],
+                capture_output=True, text=True,
+            )
+            if result.returncode != 0:
+                raise RuntimeError(
+                    f"gcloud storage cp failed for {gcs_uri_shard}:\n{result.stderr}"
+                )
+            shard_bytes = os.path.getsize(staged_path)
+            t_dl = time.perf_counter() - t0
+            _total_bytes[0] += shard_bytes
+            _total_t[0] += t_dl
+            shard_gb = shard_bytes / 2 ** 30
+            dl_mbs = shard_bytes / 2 ** 20 / max(t_dl, 1e-6)
+            shard_name = os.path.basename(path_str)
+            print(
+                f"  [shard {_counter[0]:3d}] {shard_name:<48s}"
+                f" {shard_gb:.2f}GB  {t_dl:.1f}s  {dl_mbs:.0f} MB/s",
+                flush=True,
+            )
+            tensors = _orig_load_file(staged_path, device=device)
+            try:
+                os.unlink(staged_path)
+            except OSError:
+                pass
+            return tensors
+        # Not a gcsfuse path — fall through to original
+        return _orig_load_file(path, device=device)
 
-    total_shards = len(shards)
-    print(f"Creating model structure on meta device ({total_shards} shards to load) …",
+    # Patch in accelerate and transformers (they import load_file by name)
+    _patched = False
+    try:
+        import accelerate.utils.modeling as _aum
+        if hasattr(_aum, "safe_load_file"):
+            _aum.safe_load_file = _staged_load_file
+            _patched = True
+    except Exception:
+        pass
+    try:
+        import transformers.modeling_utils as _tmu
+        if hasattr(_tmu, "safe_load_file"):
+            _tmu.safe_load_file = _staged_load_file
+            _patched = True
+    except Exception:
+        pass
+    # Also patch the module-level symbol so any direct caller gets it
+    _st.load_file = _staged_load_file
+    if not _patched:
+        print("  WARNING: could not patch accelerate/transformers safe_load_file; "
+              "falling back to gcsfuse mmap.", flush=True)
+
+    print(f"Loading model via from_pretrained with staged GCS shard interception …",
           flush=True)
-    # Use init_empty_weights: model lives on "meta" device — no RAM allocated yet.
-    # Each parameter is materialized (committed to RAM) only when we assign it below.
-    with init_empty_weights():
-        model = AutoModelForCausalLM.from_config(config, torch_dtype=torch_dtype,
-                                                 trust_remote_code=True)
+    model = AutoModelForCausalLM.from_pretrained(
+        effective_model_path,
+        config=config,
+        torch_dtype=torch_dtype,
+        device_map="cpu",
+        low_cpu_mem_usage=True,
+        trust_remote_code=True,
+    )
     model.eval()
 
-    staged_path = "/tmp/mimo_shard_staged.safetensors"
-    total_bytes = 0
-    total_t_dl = 0.0
+    # Restore originals
+    _st.load_file = _orig_load_file
+    try:
+        import accelerate.utils.modeling as _aum
+        if hasattr(_aum, "safe_load_file"):
+            _aum.safe_load_file = _orig_load_file
+    except Exception:
+        pass
+    try:
+        import transformers.modeling_utils as _tmu
+        if hasattr(_tmu, "safe_load_file"):
+            _tmu.safe_load_file = _orig_load_file
+    except Exception:
+        pass
 
-    for shard_idx, (shard_name, param_names) in enumerate(sorted(shards.items()), 1):
-        shard_gcs_uri = gcs_model_uri.rstrip("/") + "/" + shard_name
-        t0 = time.perf_counter()
-        result = subprocess.run(
-            ["gcloud", "storage", "cp", shard_gcs_uri, staged_path],
-            capture_output=True, text=True,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"gcloud storage cp failed for {shard_gcs_uri}:\n{result.stderr}"
-            )
-        shard_bytes = os.path.getsize(staged_path)
-        t_dl = time.perf_counter() - t0
-        total_bytes += shard_bytes
-        total_t_dl += t_dl
-
-        tensors = _st_load(staged_path, device="cpu")
-        os.unlink(staged_path)
-
-        # Cast to target dtype (handles FP8 → bfloat16, etc.) and materialize
-        # each meta-device parameter into real CPU RAM.
-        for name in param_names:
-            if name in tensors:
-                t = tensors[name]
-                if t.dtype != torch_dtype:
-                    t = t.to(torch_dtype)
-                set_module_tensor_to_device(model, name, device="cpu", value=t)
-        del tensors
-
-        shard_gb = shard_bytes / 2 ** 30
-        dl_mbs = shard_bytes / 2 ** 20 / max(t_dl, 1e-6)
+    if _counter[0] > 0:
+        avg_mbs = _total_bytes[0] / 2 ** 20 / max(_total_t[0], 1e-6)
         print(
-            f"  [{shard_idx:3d}/{total_shards}] {shard_name:<48s}"
-            f" {shard_gb:.2f}GB  {t_dl:.1f}s  {dl_mbs:.0f} MB/s",
+            f"All shards staged: {_total_bytes[0]/2**30:.1f}GB in {_total_t[0]:.0f}s "
+            f"(avg {avg_mbs:.0f} MB/s  across {_counter[0]} shards)",
             flush=True,
         )
-
-    avg_mbs = total_bytes / 2 ** 20 / max(total_t_dl, 1e-6)
-    print(
-        f"All shards loaded: {total_bytes/2**30:.1f}GB in {total_t_dl:.0f}s "
-        f"(avg {avg_mbs:.0f} MB/s)",
-        flush=True,
-    )
     return model
 
 
