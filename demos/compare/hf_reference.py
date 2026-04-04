@@ -237,12 +237,16 @@ def _load_model_staged(config, effective_model_path: str, gcs_model_uri: str,
 
     print(f"Loading model via from_pretrained with staged GCS shard interception …",
           flush=True)
+    # Do NOT use low_cpu_mem_usage=True: that path uses safe_open for per-tensor
+    # mmap reads (slow via gcsfuse).  Without it, accelerate calls safe_load_file
+    # once per shard (whole-file read), which our patch intercepts for staging.
+    # Memory: from_pretrained first allocates ~582GB bfloat16 structure, then
+    # overwrites it shard-by-shard.  708GB RAM is sufficient.
     model = AutoModelForCausalLM.from_pretrained(
         effective_model_path,
         config=config,
         torch_dtype=torch_dtype,
         device_map="cpu",
-        low_cpu_mem_usage=True,
         trust_remote_code=True,
     )
     model.eval()
@@ -399,7 +403,6 @@ def _load_model_and_tokenizer(model_path: str, tokenizer_path: Optional[str],
             config=config,
             torch_dtype=torch.bfloat16,
             device_map="cpu",
-            low_cpu_mem_usage=True,
             trust_remote_code=True,
         )
         model.eval()
