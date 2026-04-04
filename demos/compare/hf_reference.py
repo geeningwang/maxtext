@@ -197,27 +197,38 @@ def _load_model_staged(config, effective_model_path: str, gcs_model_uri: str,
                 gcs_uri_shard = f"gs://{bucket}/{sub_path}"
                 _counter[0] += 1
                 t0 = time.perf_counter()
-                _max_retries = 3
+                # Remove any leftover partial download before starting.
+                try:
+                    os.unlink(staged_path)
+                except OSError:
+                    pass
+                for _f in (staged_path + "_.gstmp",):
+                    try:
+                        os.unlink(_f)
+                    except OSError:
+                        pass
+                _max_retries = 5
                 _last_stderr = ""
                 for _attempt in range(_max_retries):
+                    # Use gsutil cp (has built-in retry/resume and avoids gcloud
+                    # logging-handler bugs seen with 'gcloud storage cp').
                     result = subprocess.run(
-                        ["gcloud", "storage", "cp", gcs_uri_shard, staged_path],
+                        ["gsutil", "cp", gcs_uri_shard, staged_path],
                         capture_output=True, text=True,
                     )
                     if result.returncode == 0:
                         break
-                    _last_stderr = result.stderr
-                    if _attempt < _max_retries - 1:
-                        _wait = 2 ** _attempt  # 1s, 2s
-                        print(
-                            f"  WARNING: gcloud cp attempt {_attempt + 1} failed "
-                            f"for {os.path.basename(real_str)}; retrying in {_wait}s …",
-                            flush=True,
-                        )
-                        time.sleep(_wait)
+                    _last_stderr = result.stderr + result.stdout
+                    _wait = min(2 ** _attempt, 30)  # 1, 2, 4, 8, 16 s
+                    print(
+                        f"  WARNING: gsutil cp attempt {_attempt + 1} failed "
+                        f"for {os.path.basename(real_str)}; retrying in {_wait}s …",
+                        flush=True,
+                    )
+                    time.sleep(_wait)
                 else:
                     raise RuntimeError(
-                        f"gcloud storage cp failed for {gcs_uri_shard} "
+                        f"gsutil cp failed for {gcs_uri_shard} "
                         f"after {_max_retries} attempts:\n{_last_stderr}"
                     )
                 shard_bytes = os.path.getsize(staged_path)
