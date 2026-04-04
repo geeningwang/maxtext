@@ -106,6 +106,13 @@ _require("torch")
 _require("transformers")
 _require("safetensors")
 
+# When installed via `pip3 --user`, the packages land in ~/.local/lib/...
+# Make sure that path is on sys.path.
+import site, sys
+user_site = site.getusersitepackages()
+if user_site not in sys.path:
+    sys.path.insert(0, user_site)
+
 
 # ---------------------------------------------------------------------------
 # Load helpers
@@ -113,25 +120,52 @@ _require("safetensors")
 
 def _load_model_and_tokenizer(model_path: str, tokenizer_path: Optional[str]):
     import torch
+    import gzip, shutil, tempfile
     from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
 
     tok_path = tokenizer_path or model_path
     print(f"Loading tokenizer from {tok_path} …")
     tokenizer = AutoTokenizer.from_pretrained(tok_path, trust_remote_code=True)
 
-    print(f"Loading model config from {model_path} …")
-    config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    # gcsfuse serves the GCS objects with transparent gzip encoding.
+    # The config.json in the bucket is gzip-compressed, which confuses
+    # AutoConfig.  Detect it and decompress to a temp directory; all
+    # other files are symlinked so no large data is copied.
+    effective_model_path = model_path
+    tmp_dir = None
+    config_path = os.path.join(model_path, "config.json")
+    try:
+        with open(config_path, "rb") as f:
+            magic = f.read(2)
+        if magic == b'\x1f\x8b':  # gzip magic bytes
+            print("  INFO: config.json is gzip-compressed (gcsfuse mount). "
+                  "Creating a temp dir with a decompressed copy …")
+            tmp_dir = tempfile.mkdtemp(prefix="mimo_cfg_")
+            for fname in os.listdir(model_path):
+                src = os.path.join(model_path, fname)
+                dst = os.path.join(tmp_dir, fname)
+                if fname == "config.json":
+                    with gzip.open(src, "rb") as gf, open(dst, "wb") as df:
+                        shutil.copyfileobj(gf, df)
+                else:
+                    os.symlink(src, dst)
+            effective_model_path = tmp_dir
+    except Exception as e:
+        print(f"  WARNING: could not check config.json compression: {e}")
+
+    print(f"Loading model config from {effective_model_path} …")
+    config = AutoConfig.from_pretrained(effective_model_path, trust_remote_code=True)
 
     # Strip FP8 quantization config so the model loads in plain bfloat16 on CPU.
-    # The safetensors weights will be automatically dequantized during load.
     if hasattr(config, "quantization_config"):
         print("  INFO: removing FP8 quantization_config so the model loads as bfloat16.")
         config.quantization_config = None
 
-    print(f"Loading model weights from {model_path} (this may take 30-90 minutes …)")
+    print(f"Loading model weights from {effective_model_path} "
+          f"(streaming from gcsfuse/GCS — this may take 30-90 minutes) …")
     t0 = time.perf_counter()
     model = AutoModelForCausalLM.from_pretrained(
-        model_path,
+        effective_model_path,
         config=config,
         torch_dtype=torch.bfloat16,
         device_map="cpu",
