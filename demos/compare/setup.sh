@@ -38,16 +38,17 @@ MOUNT_DIR="/tmp/mimo-hf-gcs"
 TORCH_INDEX="https://download.pytorch.org/whl/cpu"
 
 # ── Step 1: Install CPU-only torch + transformers via system pip3 --user ─────
+# Use the full path to system pip3 so this works both inside and outside a venv.
 echo "=== Installing PyTorch (CPU-only) + transformers via pip3 --user ==="
-pip3 install --quiet --user torch --index-url "${TORCH_INDEX}"
-pip3 install --quiet --user transformers accelerate
+/usr/bin/pip3 install --quiet --user torch --index-url "${TORCH_INDEX}"
+/usr/bin/pip3 install --quiet --user transformers accelerate
 
 echo "=== Verifying ==="
-python3 -c "import torch; print('torch', torch.__version__)"
-python3 -c "import transformers; print('transformers', transformers.__version__)"
+/usr/bin/python3 -c "import torch; print('torch', torch.__version__)"
+/usr/bin/python3 -c "import transformers; print('transformers', transformers.__version__)"
 # safetensors is already in maxtext_venv, but also install for system python:
-pip3 install --quiet --user safetensors
-python3 -c "import safetensors; print('safetensors', safetensors.__version__)"
+/usr/bin/pip3 install --quiet --user safetensors
+/usr/bin/python3 -c "import safetensors; print('safetensors', safetensors.__version__)"
 
 # ── Step 2: Mount GCS bucket with gcsfuse ─────────────────────────────────
 echo ""
