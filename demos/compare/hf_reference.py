@@ -355,9 +355,20 @@ def _load_model_and_tokenizer(model_path: str, tokenizer_path: Optional[str],
     try:
         with open(config_path, "rb") as f:
             magic = f.read(2)
-        if magic == b'\x1f\x8b':  # gzip magic bytes
-            print("  INFO: config.json is gzip-compressed (gcsfuse mount). "
-                  "Creating a temp dir with a decompressed copy …")
+        is_gzip = magic == b'\x1f\x8b'
+        # Need a tmp_dir whenever config.json is gzip-compressed (gcsfuse) OR
+        # when the custom arch .py files are absent from the model directory
+        # (e.g. NFS/local copy from GCS that contains only weights + tokenizer).
+        py_files_present = os.path.exists(
+            os.path.join(model_path, "modeling_mimo_v2_flash.py"))
+        needs_tmp_dir = is_gzip or not py_files_present
+        if needs_tmp_dir:
+            if is_gzip:
+                print("  INFO: config.json is gzip-compressed (gcsfuse mount). "
+                      "Creating a temp dir with a decompressed copy …")
+            else:
+                print("  INFO: custom arch .py files absent from model dir "
+                      "(NFS/local copy). Creating a temp dir with symlinks …")
             tmp_dir = tempfile.mkdtemp(prefix="mimo_cfg_")
             for fname in os.listdir(model_path):
                 src = os.path.join(model_path, fname)
@@ -442,12 +453,13 @@ def _load_model_and_tokenizer(model_path: str, tokenizer_path: Optional[str],
                                    torch_dtype=torch.bfloat16)
     else:
         print(f"Loading model weights from {effective_model_path} "
-              f"(gcsfuse mmap — may be slow for large models) …")
+              f"(direct filesystem read, low_cpu_mem_usage=True) …", flush=True)
         model = AutoModelForCausalLM.from_pretrained(
             effective_model_path,
             config=config,
             torch_dtype=torch.bfloat16,
             device_map="cpu",
+            low_cpu_mem_usage=True,
             trust_remote_code=True,
         )
         model.eval()
