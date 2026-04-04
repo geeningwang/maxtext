@@ -55,6 +55,7 @@ from typing import Sequence, Any
 import numpy as np
 import jax
 import jax.numpy as jnp
+from jax.experimental import multihost_utils
 from absl import app
 
 from maxtext.configs import pyconfig
@@ -189,6 +190,10 @@ def main(argv: Sequence[str]) -> None:
         sampled_tokens_list.append(sampled_tokens)
 
         # ---- Save logits and token ID (process 0 only) ----
+        # Barrier: hold all processes here so process 0 can safely materialize the
+        # globally-sharded decode_state["logits"] before other processes race ahead
+        # to the next engine.generate() call (which would cause FAILED_PRECONDITION).
+        multihost_utils.sync_global_devices(f"before_logits_{rel_step}")
         if _is_host0() and rel_step < max_new_tokens:
             # out_logits: [batch, 1, vocab_size] → take batch=0, pos=0
             raw_logits = np.array(decode_state["logits"][0, 0, :], dtype=np.float32)
@@ -215,6 +220,7 @@ def main(argv: Sequence[str]) -> None:
                 "top10_logits": top10_val,
                 "top10_strs": top10_str,
             })
+        multihost_utils.sync_global_devices(f"after_logits_{rel_step}")
 
     # ------------------------------------------------------------------ Decode results
     for i in range(_NUM_STREAMS):
