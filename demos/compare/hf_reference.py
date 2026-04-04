@@ -508,6 +508,34 @@ def _load_model_and_tokenizer(model_path: str, tokenizer_path: Optional[str],
             low_cpu_mem_usage=True,
             trust_remote_code=True,
         )
+        # Compatibility shim: the official modeling_mimo_v2_flash.py calls
+        # eager_attention_forward(..., position_ids=..., sinks=...) but its own
+        # local function definition doesn't accept position_ids.  This is a bug
+        # in the file itself.  Rewrap after import to absorb unknown kwargs.
+        try:
+            import sys as _sys
+            for _mname, _mod in list(_sys.modules.items()):
+                if _mod is None or "transformers_modules" not in _mname:
+                    continue
+                _fn = getattr(_mod, "eager_attention_forward", None)
+                if _fn is None:
+                    continue
+                import functools as _ft
+                @_ft.wraps(_fn)
+                def _tolerant_eager_attn(*a, position_ids=None, **kw):
+                    return _fn(*a, **kw)
+                _mod.eager_attention_forward = _tolerant_eager_attn
+                # Also patch any MiMoV2FlashAttention class that captured it
+                for _attr in dir(_mod):
+                    _cls = getattr(_mod, _attr, None)
+                    if isinstance(_cls, type) and "Attention" in _attr:
+                        # The class uses module-level eager_attention_forward as default,
+                        # no instance attribute to patch — the module replacement is enough.
+                        pass
+                print(f"  INFO: patched eager_attention_forward in {_mname} "
+                      f"to accept position_ids kwarg.", flush=True)
+        except Exception as _ep:
+            print(f"  WARNING: could not patch eager_attention_forward: {_ep}")
         model.eval()
     elapsed = time.perf_counter() - t0
     print(f"Model loaded in {elapsed:.0f}s.", flush=True)
