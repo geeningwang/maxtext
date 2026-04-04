@@ -451,6 +451,35 @@ def _load_model_and_tokenizer(model_path: str, tokenizer_path: Optional[str],
     except Exception as _e:
         print(f"  WARNING: could not inject RoPE shim: {_e}")
 
+    # Compatibility shim: transformers 5.x _init_weights calls
+    # module.compute_default_rope_parameters on any RotaryEmbedding subclass
+    # with rope_type=="default", but MiMoV2FlashRotaryEmbedding never defined
+    # this method (written for older transformers).  Patch it onto every
+    # RotaryEmbedding class in transformers_modules that is missing it.
+    try:
+        import sys
+        from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS as _ROPE_FNS
+        _patched = 0
+        for _mod_name, _mod in list(sys.modules.items()):
+            if _mod is None or "transformers_modules" not in _mod_name:
+                continue
+            for _attr in dir(_mod):
+                if "RotaryEmbedding" not in _attr:
+                    continue
+                _cls = getattr(_mod, _attr, None)
+                if _cls is None or not isinstance(_cls, type):
+                    continue
+                if not hasattr(_cls, "compute_default_rope_parameters"):
+                    def _cdp(self, config=None, **kw):
+                        return _ROPE_FNS["default"](config if config is not None else self.config, **kw)
+                    _cls.compute_default_rope_parameters = _cdp
+                    print(f"  INFO: patched {_cls.__name__}.compute_default_rope_parameters")
+                    _patched += 1
+        if _patched == 0:
+            print("  INFO: compute_default_rope_parameters already present on all RotaryEmbedding classes.")
+    except Exception as _e:
+        print(f"  WARNING: could not patch compute_default_rope_parameters: {_e}")
+
     t0 = time.perf_counter()
     if gcs_model_uri:
         print(f"Loading model weights via staged GCS copy (fast path) …", flush=True)
