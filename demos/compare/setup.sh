@@ -54,6 +54,21 @@ echo "=== Verifying ==="
 echo ""
 echo "=== Mounting gs://${GCS_BUCKET}/${GCS_SUBDIR} at ${MOUNT_DIR} ==="
 
+# Install gcsfuse if not present (new TPU images may not include it).
+GCSFUSE_BIN=$(command -v gcsfuse 2>/dev/null || echo "")
+if [[ -z "${GCSFUSE_BIN}" ]]; then
+  echo "  gcsfuse not found — installing from packages.cloud.google.com …"
+  export GCSFUSE_REPO=gcsfuse-$(lsb_release -c -s)
+  echo "deb [signed-by=/usr/share/keyrings/cloud.google.asc] https://packages.cloud.google.com/apt ${GCSFUSE_REPO} main" \
+    | sudo tee /etc/apt/sources.list.d/gcsfuse.list
+  curl -s https://packages.cloud.google.com/apt/doc/apt-key.gpg \
+    | sudo gpg --dearmor -o /usr/share/keyrings/cloud.google.asc
+  sudo apt-get -qq update
+  sudo apt-get -qq install -y gcsfuse
+  GCSFUSE_BIN=$(command -v gcsfuse)
+  echo "  gcsfuse installed at ${GCSFUSE_BIN}"
+fi
+
 # Unmount if already mounted (ignore errors)
 fusermount -u "${MOUNT_DIR}" 2>/dev/null || true
 
@@ -61,7 +76,7 @@ mkdir -p "${MOUNT_DIR}"
 
 # gcsfuse mounts a single bucket; we mount the full bucket then point at the subdir.
 # Use --implicit-dirs so safetensors index can enumerate files.
-/usr/bin/gcsfuse \
+"${GCSFUSE_BIN}" \
   --implicit-dirs \
   --stat-cache-ttl=60s \
   --type-cache-ttl=60s \
