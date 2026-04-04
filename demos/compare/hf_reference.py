@@ -199,6 +199,28 @@ def _load_model_and_tokenizer(model_path: str, tokenizer_path: Optional[str],
     print(f"Loading model config from {effective_model_path} …")
     config = AutoConfig.from_pretrained(effective_model_path, trust_remote_code=True)
 
+    # Compatibility shim: transformers 5.x removed 'default' from ROPE_INIT_FUNCTIONS
+    # but the MiMo-V2-Flash modeling code still references it.
+    try:
+        from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+        if "default" not in ROPE_INIT_FUNCTIONS:
+            def _default_rope(config=None, device=None, seq_len=None, **kw):
+                import math
+                base = getattr(config, "rope_theta", 10000.0)
+                partial = getattr(config, "partial_rotary_factor", 1.0)
+                head_dim = getattr(config, "head_dim", None) or (
+                    config.hidden_size // config.num_attention_heads)
+                dim = int(head_dim * partial)
+                inv_freq = 1.0 / (base ** (
+                    torch.arange(0, dim, 2, dtype=torch.int64).to(
+                        device=device, dtype=torch.float) / dim))
+                return inv_freq, 1.0
+            ROPE_INIT_FUNCTIONS["default"] = _default_rope
+            print("  INFO: injected ROPE_INIT_FUNCTIONS['default'] compat shim "
+                  "(transformers 5.x removed it).")
+    except Exception as _e:
+        print(f"  WARNING: could not inject RoPE shim: {_e}")
+
     print(f"Loading model weights from {effective_model_path} "
           f"(streaming from gcsfuse/GCS — this may take 30-90 minutes) …")
     t0 = time.perf_counter()
