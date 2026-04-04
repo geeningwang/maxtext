@@ -259,11 +259,16 @@ def _load_model_staged(config, effective_model_path: str, gcs_model_uri: str,
 
     print("Loading model via from_pretrained with staged GCS shard interception …",
           flush=True)
+    # Use low_cpu_mem_usage=True to skip _init_weights (meta-device init).
+    # This avoids allocating 582GB of random weights before loading from disk.
+    # Our _StagedSafeOpen shim intercepts the safe_open calls that
+    # low_cpu_mem_usage+device_map uses, staging each shard via gcloud storage cp.
     model = AutoModelForCausalLM.from_pretrained(
         effective_model_path,
         config=config,
         torch_dtype=torch_dtype,
         device_map="cpu",
+        low_cpu_mem_usage=True,
         trust_remote_code=True,
     )
     model.eval()
