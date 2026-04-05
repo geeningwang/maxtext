@@ -37,7 +37,7 @@ Setup (run once on a TPU worker with enough RAM, ~700 GB):
 
 Usage:
   python3 demos/compare/hf_reference.py \
-      --model_path /mnt/mimo-weights \
+      --model_path /tmp/mimo-hf-model \
       --tokenizer_path $HOME/mimo-tokenizer \
       --prompt "<|im_start|>system\nYou are MiMo...<|im_end|>...<think></think>" \
       --max_new_tokens 16 \
@@ -65,9 +65,9 @@ import numpy as np
 
 def _parse_args():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--model_path", default="/mnt/mimo-weights",
-                   help="Local directory containing safetensors + config.json "
-                        "(default: /mnt/mimo-weights, NFS from worker-1).")
+    p.add_argument("--model_path", required=True,
+                   help="Local directory containing safetensors + config.json. "
+                        "Download from GCS first (see setup notes above).")
     p.add_argument("--tokenizer_path", default=None,
                    help="Path to tokenizer directory (defaults to --model_path).")
     p.add_argument("--prompt", default=(
@@ -372,7 +372,7 @@ def _load_model_and_tokenizer(model_path: str, tokenizer_path: Optional[str],
                 if fname.endswith(".json"):
                     import json as _json
                     # gcsfuse may serve any JSON file gzip-compressed.
-                    # Decompress gzip-compressed JSON files if needed (gcsfuse path).
+                    # Decompress if needed; strip quantization_config from config.json.
                     try:
                         with open(src, "rb") as _f:
                             _magic = _f.read(2)
@@ -382,10 +382,8 @@ def _load_model_and_tokenizer(model_path: str, tokenizer_path: Optional[str],
                         else:
                             with open(src, "r") as gf:
                                 _d = _json.load(gf)
-                        # Do NOT strip quantization_config: FP8 weights require it so
-                        # that HF Transformers selects FineGrainedFP8HfQuantizer and
-                        # applies weight_scale_inv during dequantization.  Removing it
-                        # causes FP8 bytes to be reinterpreted as raw BF16 → garbled output.
+                        if fname == "config.json":
+                            _d.pop("quantization_config", None)
                         with open(dst, "w") as df:
                             _json.dump(_d, df)
                     except Exception as _e:
