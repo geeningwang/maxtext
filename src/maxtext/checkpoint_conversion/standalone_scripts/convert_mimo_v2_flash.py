@@ -320,10 +320,11 @@ def convert_hf_to_maxtext(
     if not shard_paths:
         raise FileNotFoundError(f"No *.safetensors files found in: {base_model_path}")
     max_logging.log(f"Found {len(shard_paths)} safetensors shards")
-    sys.stdout.flush(); sys.stderr.flush()
+    print(f"[convert] Found {len(shard_paths)} safetensors shards", flush=True)
 
     key_to_shard = _build_shard_index(shard_paths)
     max_logging.log(f"Indexed {len(key_to_shard)} weight keys across {len(shard_paths)} shards")
+    print(f"[convert] Indexed {len(key_to_shard)} weight keys across {len(shard_paths)} shards", flush=True)
     sys.stdout.flush(); sys.stderr.flush()
 
     # ------------------------------------------------------------------
@@ -349,11 +350,11 @@ def convert_hf_to_maxtext(
         "lm_head.weight_scale_inv",
     ]
     max_logging.log("[global] Loading shared weights (embed_tokens, norm, lm_head)...")
-    sys.stdout.flush(); sys.stderr.flush()
+    print("[convert] [global] Loading shared weights (embed_tokens, norm, lm_head)...", flush=True)
     shared = _load_keys_batch(shared_keys, key_to_shard)
     _apply_fp8_dequant(shared)
     max_logging.log(f"[global] Shared weights loaded and dequantized ({len(shared)} tensors).")
-    sys.stdout.flush(); sys.stderr.flush()
+    print(f"[convert] [global] Shared weights loaded and dequantized ({len(shared)} tensors).", flush=True)
 
     emb = shared.get("model.embed_tokens.weight")
     if emb is not None:
@@ -392,7 +393,11 @@ def convert_hf_to_maxtext(
             f"[layer {i:02d}/{num_layers-1}] Start  type={layer_type}/{attn_type}  "
             f"elapsed={time.monotonic()-_convert_start:.0f}s"
         )
-        sys.stdout.flush(); sys.stderr.flush()
+        print(
+            f"[convert] [layer {i:02d}/{num_layers-1}] Start  type={layer_type}/{attn_type}  "
+            f"elapsed={time.monotonic()-_convert_start:.0f}s",
+            flush=True,
+        )
 
         # Collect all HF weight keys needed for this layer so we can open
         # each shard exactly once for this layer.
@@ -440,10 +445,17 @@ def convert_hf_to_maxtext(
         max_logging.log(
             f"[layer {i:02d}/{num_layers-1}] Loaded {len(lt)} tensors in {_t_loaded-_t0:.1f}s"
         )
-        sys.stdout.flush(); sys.stderr.flush()
+        print(
+            f"[convert] [layer {i:02d}/{num_layers-1}] Loaded {len(lt)} tensors in {_t_loaded-_t0:.1f}s",
+            flush=True,
+        )
         _apply_fp8_dequant(lt)
         max_logging.log(
             f"[layer {i:02d}/{num_layers-1}] Dequant done in {time.monotonic()-_t_loaded:.1f}s"
+        )
+        print(
+            f"[convert] [layer {i:02d}/{num_layers-1}] Dequant done in {time.monotonic()-_t_loaded:.1f}s",
+            flush=True,
         )
         sys.stdout.flush(); sys.stderr.flush()
 
@@ -582,7 +594,12 @@ def convert_hf_to_maxtext(
             f"avg={avg:.0f}s  ETA={remaining/60:.1f}min  "
             f"total_elapsed={time.monotonic()-_convert_start:.0f}s"
         )
-        sys.stdout.flush(); sys.stderr.flush()
+        print(
+            f"[convert] [layer {i:02d}/{num_layers-1}] Done  layer_time={_layer_elapsed:.0f}s  "
+            f"avg={avg:.0f}s  ETA={remaining/60:.1f}min  "
+            f"total_elapsed={time.monotonic()-_convert_start:.0f}s",
+            flush=True,
+        )
         gc.collect()
 
     # ------------------------------------------------------------------
@@ -759,7 +776,12 @@ def convert_and_save_streaming(
             f"({len(layer_flat)} arrays, total so far: {arrays_written[0]}, "
             f"save_time={save_elapsed:.1f}s)"
         )
-        sys.stdout.flush(); sys.stderr.flush()
+        print(
+            f"[convert] Streaming-saved layer {layer_idx} "
+            f"({len(layer_flat)} arrays, total so far: {arrays_written[0]}, "
+            f"save_time={save_elapsed:.1f}s)",
+            flush=True,
+        )
 
     # Run conversion; the callback writes + frees each decoder layer in turn.
     # Global weights (embeddings, norm, logits) are returned in `flat` after
