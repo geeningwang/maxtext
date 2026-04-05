@@ -13,484 +13,688 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-r"""HuggingFace inference demo for MiMo-V2-Flash.
+r"""HuggingFace CPU reference for MiMo-V2-Flash comparison.
 
-Loads the model from a local directory (default: /mnt/mimo-weights) and
-runs text generation.  The model's native FP8 E4M3 weights are automatically
-dequantized to BF16 by HF Transformers using the per-128×128-block
-weight_scale_inv tensors, requiring ~620 GB RAM.
+Runs the model step-by-step in greedy mode on CPU, capturing per-layer
+hidden states and final logits at each decode step.  The output is a set
+of NumPy files that can be compared against the MaxText/TPU activations
+produced by demos/compare/maxtext_reference.py.
 
-Validated on worker-0 of the jingnw-node cluster:
-  AMD EPYC 9B14, 180 vCPUs, 708 GB RAM.
-  Weights at /mnt/mimo-weights (NFS from worker-1, 292 GB safetensors).
+Setup (run once on a TPU worker with enough RAM, ~700 GB):
+  # Install PyTorch (CPU-only, no CUDA needed):
+  pip install --quiet torch --index-url https://download.pytorch.org/whl/cpu
+  pip install --quiet transformers safetensors accelerate
 
-Requirements:
-  pip install torch transformers safetensors accelerate huggingface_hub
+  # Download the HF weights from GCS to a local path:
+  mkdir -p /tmp/mimo-hf-model
+  gsutil -m cp gs://jingnw-mimo-v2-flash-us-east5/hf-model/config.json   /tmp/mimo-hf-model/
+  gsutil -m cp gs://jingnw-mimo-v2-flash-us-east5/hf-model/model.safetensors.index.json /tmp/mimo-hf-model/
+  gsutil -m cp 'gs://jingnw-mimo-v2-flash-us-east5/hf-model/model_*.safetensors' /tmp/mimo-hf-model/
+
+  NOTE: The weights are FP8 in the GCS bucket (~320 GB compressed).
+  When loaded with torch_dtype=bfloat16 they occupy ~600 GB in RAM.
+  Run on worker-0 which has the most headroom.
 
 Usage:
-  # Simplest — uses /mnt/mimo-weights by default:
-  python3 demos/mimo_v2_flash_demo_hf.py
-
-  # Custom path / prompt:
-  python3 demos/mimo_v2_flash_demo_hf.py \
+  python3 demos/compare/hf_reference.py \
       --model_path /mnt/mimo-weights \
-      --prompt "The key to solving any hard problem is" \
-      --max_new_tokens 64
+      --tokenizer_path $HOME/mimo-tokenizer \
+      --prompt "<|im_start|>system\nYou are MiMo...<|im_end|>...<think></think>" \
+      --max_new_tokens 16 \
+      --out_dir /tmp/compare_hf \
+      --layers_to_capture 0 5 10 47
 
-Note: /mnt/mimo-weights contains only safetensors + JSON files, not the
-custom architecture .py files.  On first run this script downloads those
-from HuggingFace Hub (XiaomiMiMo/MiMo-V2-Flash) and caches them in
-~/.cache/huggingface/hub.
+  Outputs (in --out_dir):
+    tokens.json          — list of generated token IDs + decoded strings
+    step{N}_logits.npy   — float32 logits [vocab], for steps 0..max_new_tokens-1
+    step{N}_layer{L}.npy — float32 hidden state [hidden], captured layers only
 """
 
 import argparse
+import json
 import os
 import sys
 import time
+from typing import Optional
 
+import numpy as np
 
-HF_HUB_ID = "XiaomiMiMo/MiMo-V2-Flash"
-DEFAULT_MODEL_PATH = "/mnt/mimo-weights"
+# ---------------------------------------------------------------------------
+# Argument parsing
+# ---------------------------------------------------------------------------
+
+def _parse_args():
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--model_path", default="/mnt/mimo-weights",
+                   help="Local directory containing safetensors + config.json "
+                        "(default: /mnt/mimo-weights, NFS from worker-1).")
+    p.add_argument("--tokenizer_path", default=None,
+                   help="Path to tokenizer directory (defaults to --model_path).")
+    p.add_argument("--prompt", default=(
+        "<|im_start|>system\n"
+        "You are MiMo, a helpful AI assistant engineered by Xiaomi."
+        "<|im_end|><|im_start|>user\n"
+        "Explain the key difference between attention and cross-attention."
+        "<|im_end|><|im_start|>assistant\n"
+        "<think></think>"
+    ))
+    p.add_argument("--max_new_tokens", type=int, default=16)
+    p.add_argument("--out_dir", default="/tmp/compare_hf",
+                   help="Directory where activation .npy files are written.")
+    p.add_argument("--layers_to_capture", type=int, nargs="+",
+                   default=[0, 1, 2, 5, 10, 20, 30, 40, 47],
+                   help="Layer indices whose hidden-state outputs are saved. "
+                        "Pass --layers_to_capture 0 1 2 to capture only first 3.")
+    p.add_argument("--fp32_output", action="store_true",
+                   help="Cast all saved arrays to float32 (default is bfloat16 → float32).")
+    p.add_argument("--hub_id", default="XiaomiMiMo/MiMo-V2-Flash",
+                   help="HuggingFace Hub repo ID for downloading custom architecture "
+                        ".py files when not present in --model_path (e.g. gcsfuse mount).")
+    p.add_argument("--no_fast_load", action="store_true",
+                   help="Disable staged GCS loading and use slower gcsfuse mmap instead.")
+    return p.parse_args()
 
 
 # ---------------------------------------------------------------------------
 # Import guard
 # ---------------------------------------------------------------------------
 
-def _check_imports():
-    missing = []
-    for pkg in ("torch", "transformers", "safetensors", "accelerate"):
-        try:
-            import importlib
-            importlib.import_module(pkg)
-        except ImportError:
-            missing.append(pkg)
-    if missing:
-        print(
-            f"ERROR: Missing required packages: {', '.join(missing)}\n"
-            f"Install with:  pip install {' '.join(missing)}",
-            file=sys.stderr,
-        )
+def _require(pkg):
+    try:
+        import importlib
+        importlib.import_module(pkg)
+    except ImportError:
+        print(f"ERROR: package '{pkg}' not found.  Run: pip install {pkg}", file=sys.stderr)
         sys.exit(1)
 
+_require("torch")
+_require("transformers")
+_require("safetensors")
+
+# When installed via `pip3 --user`, the packages land in ~/.local/lib/...
+# Make sure that path is on sys.path.
+import site, sys
+user_site = site.getusersitepackages()
+if user_site not in sys.path:
+    sys.path.insert(0, user_site)
+
 
 # ---------------------------------------------------------------------------
-# Model path preparation
+# Fast GCS loading helpers (bypass gcsfuse mmap page-fault bottleneck)
 # ---------------------------------------------------------------------------
 
-def _make_effective_model_path(model_path: str, hub_id: str = HF_HUB_ID) -> str:
-    """Return a path that AutoConfig/AutoModelForCausalLM can open.
+def _gcsfuse_gcs_uri(local_path: str) -> Optional[str]:
+    """If local_path is under a gcsfuse mount, return the gs:// URI for it.
 
-    /mnt/mimo-weights has only safetensors + JSON files — no custom .py files.
-    Creates a tempdir, symlinks all files from model_path into it, then
-    downloads the custom architecture .py files from HF Hub into that tempdir.
-    Also handles gzip-compressed JSON (gcsfuse mounts).
-
-    Important: quantization_config is preserved in config.json so that HF
-    Transformers selects FineGrainedFP8HfQuantizer and applies weight_scale_inv
-    during dequantization.  Removing it causes FP8 bytes to be misinterpreted
-    as raw BF16 → garbled output.
+    gcsfuse mmap reads via 4KB page-faults gives ~17 MB/s for large files.
+    Using gcloud storage cp directly achieves ~1 GB/s.
     """
-    import gzip
-    import json
-    import tempfile
-
-    config_path = os.path.join(model_path, "config.json")
-    with open(config_path, "rb") as f:
-        magic = f.read(2)
-    is_gzip = magic == b'\x1f\x8b'
-    py_present = os.path.exists(
-        os.path.join(model_path, "modeling_mimo_v2_flash.py"))
-
-    if not is_gzip and py_present:
-        # Directory already has everything — use as-is.
-        return model_path
-
-    reason = ("config.json is gzip-compressed"
-              if is_gzip else "custom arch .py files not in model dir")
-    print(f"  INFO: {reason}; creating temp dir with symlinks …")
-
-    tmp_dir = tempfile.mkdtemp(prefix="mimo_cfg_")
-    for fname in os.listdir(model_path):
-        src = os.path.join(model_path, fname)
-        dst = os.path.join(tmp_dir, fname)
-        if fname.endswith(".json"):
-            try:
-                with open(src, "rb") as _f:
-                    _magic = _f.read(2)
-                if _magic == b'\x1f\x8b':
-                    with gzip.open(src, "rb") as gf:
-                        data = json.load(gf)
-                else:
-                    with open(src) as gf:
-                        data = json.load(gf)
-                with open(dst, "w") as df:
-                    json.dump(data, df)
-            except Exception as e:
-                print(f"  WARNING: could not process {fname}: {e}")
-                os.symlink(src, dst)
-        else:
-            os.symlink(src, dst)
-
-    # Download custom architecture .py files from Hub (cached after first run).
-    print(f"  INFO: downloading custom .py files from {hub_id} …")
+    import subprocess
     try:
-        from huggingface_hub import snapshot_download
-        arch_cache = snapshot_download(
-            repo_id=hub_id,
-            allow_patterns=["*.py"],
-            ignore_patterns=["*.safetensors", "*.bin", "*.pt", "*.gguf"],
+        out = subprocess.check_output(["mount"], text=True, timeout=5)
+    except Exception:
+        return None
+    abs_path = os.path.abspath(local_path)
+    for line in out.splitlines():
+        if "gcsfuse" not in line.lower():
+            continue
+        # Linux: "bucket on /mountpoint type fuse.gcsfuse (...)"
+        parts = line.split()
+        if len(parts) >= 3:
+            bucket = parts[0]
+            mountpoint = parts[2].rstrip("/")
+            if abs_path.startswith(mountpoint + "/") or abs_path == mountpoint:
+                suffix = abs_path[len(mountpoint):].lstrip("/")
+                return f"gs://{bucket}/{suffix}" if suffix else f"gs://{bucket}"
+    return None
+
+
+def _load_model_staged(config, effective_model_path: str, gcs_model_uri: str,
+                       torch_dtype) -> "AutoModelForCausalLM":
+    """Load model via from_pretrained, but intercept safetensors shard loading
+    to stage each shard from GCS before reading (bypassing gcsfuse mmap).
+
+    accelerate uses safetensors.safe_open (a context manager) to read tensors
+    one-by-one from each shard.  When the path is on a gcsfuse mount this
+    triggers per-tensor 4KB page faults at ~17 MB/s.
+
+    Fix: replace safetensors.safe_open with a shim that, for gcsfuse paths,
+    first downloads the whole shard to /tmp via 'gcloud storage cp' (~1 GB/s),
+    then opens the local copy with the real safe_open.
+
+    Each shard occupies at most ~4 GB on disk (deleted after the context exits).
+    """
+    import subprocess
+    import safetensors
+    import safetensors.torch as _st
+    import accelerate.utils.modeling as _aum
+    from transformers import AutoModelForCausalLM
+
+    staged_path = "/tmp/mimo_shard_staged.safetensors"
+    _orig_safe_open = safetensors.safe_open
+    _counter = [0]
+    _total_bytes = [0]
+    _total_t = [0.0]
+
+    class _StagedSafeOpen:
+        """Context-manager shim for safetensors.safe_open.
+
+        For paths under a gcsfuse mount the entire shard is downloaded to
+        /tmp first; then the real safe_open is opened on that local copy.
+        The staged file is deleted when the context exits.
+        """
+
+        def __init__(self, path, framework, device="cpu"):
+            path_str = str(path)
+            # Resolve symlinks so gcsfuse-mounted paths are detected even
+            # when accessed through a temp dir with symlinks.
+            real_str = os.path.realpath(path_str)
+            self._path_str = path_str
+            self._staged = False
+            if "/mimo-hf-gcs/" in real_str:
+                bucket = gcs_model_uri.split("gs://")[1].split("/")[0]
+                sub_path = real_str.split("/mimo-hf-gcs/")[1]
+                gcs_uri_shard = f"gs://{bucket}/{sub_path}"
+                _counter[0] += 1
+                t0 = time.perf_counter()
+                # Remove any leftover partial download before starting.
+                try:
+                    os.unlink(staged_path)
+                except OSError:
+                    pass
+                for _f in (staged_path + "_.gstmp",):
+                    try:
+                        os.unlink(_f)
+                    except OSError:
+                        pass
+                _max_retries = 5
+                _last_stderr = ""
+                for _attempt in range(_max_retries):
+                    # Use gsutil cp (has built-in retry/resume and avoids gcloud
+                    # logging-handler bugs seen with 'gcloud storage cp').
+                    result = subprocess.run(
+                        ["gsutil", "cp", gcs_uri_shard, staged_path],
+                        capture_output=True, text=True,
+                    )
+                    if result.returncode == 0:
+                        break
+                    _last_stderr = result.stderr + result.stdout
+                    _wait = min(2 ** _attempt, 30)  # 1, 2, 4, 8, 16 s
+                    print(
+                        f"  WARNING: gsutil cp attempt {_attempt + 1} failed "
+                        f"for {os.path.basename(real_str)}; retrying in {_wait}s …",
+                        flush=True,
+                    )
+                    time.sleep(_wait)
+                else:
+                    raise RuntimeError(
+                        f"gsutil cp failed for {gcs_uri_shard} "
+                        f"after {_max_retries} attempts:\n{_last_stderr}"
+                    )
+                shard_bytes = os.path.getsize(staged_path)
+                t_dl = time.perf_counter() - t0
+                _total_bytes[0] += shard_bytes
+                _total_t[0] += t_dl
+                shard_gb = shard_bytes / 2 ** 30
+                dl_mbs = shard_bytes / 2 ** 20 / max(t_dl, 1e-6)
+                shard_name = os.path.basename(real_str)
+                print(
+                    f"  [shard {_counter[0]:3d}] {shard_name:<48s}"
+                    f" {shard_gb:.2f}GB  {t_dl:.1f}s  {dl_mbs:.0f} MB/s",
+                    flush=True,
+                )
+                self._delegate = _orig_safe_open(staged_path, framework=framework, device=device)
+                self._staged = True
+            else:
+                self._delegate = _orig_safe_open(path_str, framework=framework, device=device)
+
+        def __enter__(self):
+            self._delegate.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            result = self._delegate.__exit__(*args)
+            if self._staged:
+                try:
+                    os.unlink(staged_path)
+                except OSError:
+                    pass
+                self._staged = False
+            return result
+
+        def keys(self):
+            return self._delegate.keys()
+
+        def get_tensor(self, key):
+            return self._delegate.get_tensor(key)
+
+        def get_slice(self, key):
+            return self._delegate.get_slice(key)
+
+        def offset_keys(self):
+            return self._delegate.offset_keys()
+
+        def metadata(self):
+            return self._delegate.metadata()
+
+    # Patch safetensors.safe_open everywhere it is referenced
+    safetensors.safe_open = _StagedSafeOpen
+    _aum.safe_open = _StagedSafeOpen
+    # Also cover the direct import in load_state_dict (from safetensors import safe_open)
+    import sys as _sys
+    _safetensors_mod = _sys.modules.get("safetensors")
+    if _safetensors_mod is not None:
+        _safetensors_mod.safe_open = _StagedSafeOpen
+
+    print("Loading model via from_pretrained with staged GCS shard interception …",
+          flush=True)
+    # Use low_cpu_mem_usage=True to skip _init_weights (meta-device init).
+    # This avoids allocating 582GB of random weights before loading from disk.
+    # Our _StagedSafeOpen shim intercepts the safe_open calls that
+    # low_cpu_mem_usage+device_map uses, staging each shard via gcloud storage cp.
+    model = AutoModelForCausalLM.from_pretrained(
+        effective_model_path,
+        config=config,
+        torch_dtype=torch_dtype,
+        device_map="cpu",
+        low_cpu_mem_usage=True,
+        trust_remote_code=True,
+    )
+    model.eval()
+
+    # Restore originals
+    safetensors.safe_open = _orig_safe_open
+    _aum.safe_open = _orig_safe_open
+    if _safetensors_mod is not None:
+        _safetensors_mod.safe_open = _orig_safe_open
+
+    if _counter[0] > 0:
+        avg_mbs = _total_bytes[0] / 2 ** 20 / max(_total_t[0], 1e-6)
+        print(
+            f"All shards staged: {_total_bytes[0]/2**30:.1f}GB in {_total_t[0]:.0f}s "
+            f"(avg {avg_mbs:.0f} MB/s  across {_counter[0]} shards)",
+            flush=True,
         )
-        for fname in os.listdir(arch_cache):
-            if fname.endswith(".py"):
-                src = os.path.join(arch_cache, fname)
-                dst = os.path.join(tmp_dir, fname)
-                if not os.path.exists(dst):
-                    os.symlink(src, dst)
-                    print(f"    symlinked {fname}")
-    except Exception as e:
-        print(f"  WARNING: could not fetch arch files from Hub: {e}")
-
-    return tmp_dir
+    else:
+        print("WARNING: staged loader ran but intercepted 0 shards — "
+              "gcsfuse path detection may have failed.", flush=True)
+    return model
 
 
 # ---------------------------------------------------------------------------
-# Transformers 5.x compatibility shims for MiMo-V2-Flash
+# Load helpers
 # ---------------------------------------------------------------------------
 
-def _apply_pre_load_shims():
-    """Shims that must be in place before from_pretrained() is called."""
+def _load_model_and_tokenizer(model_path: str, tokenizer_path: Optional[str],
+                              hub_id: str = "XiaomiMiMo/MiMo-V2-Flash",
+                              fast_load: bool = True):
     import torch
+    import gzip, shutil, tempfile
+    from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
 
-    # transformers 5.x removed 'default' from ROPE_INIT_FUNCTIONS but
-    # MiMo-V2-Flash's modeling code still references it.
+    # Detect GCS URI early (before we create a tmp_dir that obscures the path)
+    gcs_model_uri = _gcsfuse_gcs_uri(model_path) if fast_load else None
+    if gcs_model_uri:
+        print(f"[FAST LOAD] gcsfuse mount detected → will stage shards from {gcs_model_uri}",
+              flush=True)
+    elif fast_load:
+        print("[FAST LOAD] no gcsfuse mount detected; falling back to from_pretrained.",
+              flush=True)
+
+    # gcsfuse serves the GCS objects with transparent gzip encoding.
+    # The config.json in the bucket is gzip-compressed, which confuses
+    # AutoConfig.  Detect it and decompress to a temp directory; all
+    # other files are symlinked so no large data is copied.
+    effective_model_path = model_path
+    tmp_dir = None
+    config_path = os.path.join(model_path, "config.json")
+    try:
+        with open(config_path, "rb") as f:
+            magic = f.read(2)
+        is_gzip = magic == b'\x1f\x8b'
+        # Need a tmp_dir whenever config.json is gzip-compressed (gcsfuse) OR
+        # when the custom arch .py files are absent from the model directory
+        # (e.g. NFS/local copy from GCS that contains only weights + tokenizer).
+        py_files_present = os.path.exists(
+            os.path.join(model_path, "modeling_mimo_v2_flash.py"))
+        needs_tmp_dir = is_gzip or not py_files_present
+        if needs_tmp_dir:
+            if is_gzip:
+                print("  INFO: config.json is gzip-compressed (gcsfuse mount). "
+                      "Creating a temp dir with a decompressed copy …")
+            else:
+                print("  INFO: custom arch .py files absent from model dir "
+                      "(NFS/local copy). Creating a temp dir with symlinks …")
+            tmp_dir = tempfile.mkdtemp(prefix="mimo_cfg_")
+            for fname in os.listdir(model_path):
+                src = os.path.join(model_path, fname)
+                dst = os.path.join(tmp_dir, fname)
+                if fname.endswith(".json"):
+                    import json as _json
+                    # gcsfuse may serve any JSON file gzip-compressed.
+                    # Decompress gzip-compressed JSON files if needed (gcsfuse path).
+                    try:
+                        with open(src, "rb") as _f:
+                            _magic = _f.read(2)
+                        if _magic == b'\x1f\x8b':
+                            with gzip.open(src, "rb") as gf:
+                                _d = _json.load(gf)
+                        else:
+                            with open(src, "r") as gf:
+                                _d = _json.load(gf)
+                        # Do NOT strip quantization_config: FP8 weights require it so
+                        # that HF Transformers selects FineGrainedFP8HfQuantizer and
+                        # applies weight_scale_inv during dequantization.  Removing it
+                        # causes FP8 bytes to be reinterpreted as raw BF16 → garbled output.
+                        with open(dst, "w") as df:
+                            _json.dump(_d, df)
+                    except Exception as _e:
+                        print(f"  WARNING: could not process {fname}: {_e}")
+                        os.symlink(src, dst)
+                else:
+                    os.symlink(src, dst)
+            # The GCS bucket has only safetensors + tokenizer files; the custom
+            # architecture Python files (configuration_mimo_v2_flash.py, etc.)
+            # live only on HuggingFace Hub.  Download them now (cached in
+            # ~/.cache/huggingface/hub after the first run).
+            print("  INFO: Downloading custom architecture .py files from "
+                  f"HuggingFace Hub ({hub_id}) …")
+            try:
+                from huggingface_hub import snapshot_download
+                arch_cache = snapshot_download(
+                    repo_id=hub_id,
+                    allow_patterns=["*.py"],
+                    ignore_patterns=["*.safetensors", "*.bin", "*.pt", "*.gguf"],
+                )
+                for fname in os.listdir(arch_cache):
+                    if fname.endswith(".py"):
+                        src = os.path.join(arch_cache, fname)
+                        dst = os.path.join(tmp_dir, fname)
+                        if not os.path.exists(dst):
+                            os.symlink(src, dst)
+                            print(f"    symlinked {fname}")
+            except Exception as e:
+                print(f"  WARNING: could not fetch arch files from Hub: {e}")
+            effective_model_path = tmp_dir
+    except Exception as e:
+        print(f"  WARNING: could not check config.json compression: {e}")
+
+    # Load tokenizer after effective_model_path is resolved (tmp_dir has decompressed JSONs).
+    # If tokenizer_path is explicitly set to the same dir as model_path, use effective path.
+    if tokenizer_path and tokenizer_path != model_path:
+        tok_path = tokenizer_path
+    else:
+        tok_path = effective_model_path
+    print(f"Loading tokenizer from {tok_path} …", flush=True)
+    tokenizer = AutoTokenizer.from_pretrained(tok_path, trust_remote_code=True)
+
+    print(f"Loading model config from {effective_model_path} …")
+    config = AutoConfig.from_pretrained(effective_model_path, trust_remote_code=True)
+
+    # Compatibility shim: transformers 5.x removed 'default' from ROPE_INIT_FUNCTIONS
+    # but the MiMo-V2-Flash modeling code still references it.
     try:
         from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
         if "default" not in ROPE_INIT_FUNCTIONS:
             def _default_rope(config=None, device=None, seq_len=None, **kw):
+                import math
                 base = getattr(config, "rope_theta", 10000.0)
                 partial = getattr(config, "partial_rotary_factor", 1.0)
-                head_dim = (getattr(config, "head_dim", None) or
-                            config.hidden_size // config.num_attention_heads)
+                head_dim = getattr(config, "head_dim", None) or (
+                    config.hidden_size // config.num_attention_heads)
                 dim = int(head_dim * partial)
                 inv_freq = 1.0 / (base ** (
                     torch.arange(0, dim, 2, dtype=torch.int64).to(
                         device=device, dtype=torch.float) / dim))
                 return inv_freq, 1.0
             ROPE_INIT_FUNCTIONS["default"] = _default_rope
-            print("  INFO: injected ROPE_INIT_FUNCTIONS['default'] compat shim.")
-    except Exception as e:
-        print(f"  WARNING: RoPE shim failed: {e}")
+            print("  INFO: injected ROPE_INIT_FUNCTIONS['default'] compat shim "
+                  "(transformers 5.x removed it).")
+    except Exception as _e:
+        print(f"  WARNING: could not inject RoPE shim: {_e}")
 
-    # transformers 5.x _init_weights calls compute_default_rope_parameters on
-    # RotaryEmbedding instances, but MiMo's class never defined this method.
+    # Compatibility shim: transformers 5.x _init_weights calls
+    # module.compute_default_rope_parameters on every RotaryEmbedding instance
+    # with rope_type=="default", but MiMoV2FlashRotaryEmbedding was written for
+    # older transformers and never defined this method.
+    #
+    # We can't patch the class here because modeling_mimo_v2_flash.py is not
+    # imported until AutoModelForCausalLM.from_pretrained() runs — scanning
+    # sys.modules at this point would find only configuration_mimo_v2_flash.
+    #
+    # Instead, patch PreTrainedModel._init_weights globally so that it falls
+    # back gracefully when compute_default_rope_parameters is absent, performing
+    # the same inv_freq reinit it would have done via that method.
     try:
         from transformers import modeling_utils as _mu
-        from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS as _ROPE
-        _orig = _mu.PreTrainedModel._init_weights
+        from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS as _ROPE_FNS2
+        _orig_init_weights = _mu.PreTrainedModel._init_weights
 
         def _patched_init_weights(self, module):
             try:
-                _orig(self, module)
-            except AttributeError as e:
-                if "compute_default_rope_parameters" not in str(e):
+                _orig_init_weights(self, module)
+            except AttributeError as _e:
+                if "compute_default_rope_parameters" not in str(_e):
                     raise
+                # Reinit inv_freq directly — same logic transformers would do
+                # via compute_default_rope_parameters.
                 if (hasattr(module, "original_inv_freq") and
-                        hasattr(module, "inv_freq") and hasattr(module, "config")):
-                    fn = (_ROPE.get(getattr(module, "rope_type", "default"))
-                          or _ROPE.get("default"))
-                    if fn:
-                        buf, _ = fn(module.config)
-                        module.inv_freq.copy_(buf)
-                        module.original_inv_freq.copy_(buf)
+                        hasattr(module, "inv_freq") and
+                        hasattr(module, "config")):
+                    _rtype = getattr(module, "rope_type", "default")
+                    _fn = _ROPE_FNS2.get(_rtype) or _ROPE_FNS2.get("default")
+                    if _fn:
+                        _buf, _ = _fn(module.config)
+                        module.inv_freq.copy_(_buf)
+                        module.original_inv_freq.copy_(_buf)
 
         _mu.PreTrainedModel._init_weights = _patched_init_weights
-        print("  INFO: patched _init_weights for compute_default_rope_parameters fallback.")
-    except Exception as e:
-        print(f"  WARNING: _init_weights shim failed: {e}")
+        print("  INFO: patched PreTrainedModel._init_weights for "
+              "compute_default_rope_parameters fallback.")
+    except Exception as _e:
+        print(f"  WARNING: could not patch _init_weights: {_e}")
 
-
-def _apply_post_load_shims():
-    """Shims applied after from_pretrained() (model code is now imported)."""
-    # eager_attention_forward in the model file doesn't accept position_ids
-    # but transformers 5.x passes it as a kwarg.
-    try:
-        import functools
-        for mname, mod in list(sys.modules.items()):
-            if mod is None or "transformers_modules" not in mname:
-                continue
-            fn = getattr(mod, "eager_attention_forward", None)
-            if fn is None:
-                continue
-
-            @functools.wraps(fn)
-            def _tolerant(*a, position_ids=None, **kw):
-                return fn(*a, **kw)
-
-            mod.eager_attention_forward = _tolerant
-            print(f"  INFO: patched eager_attention_forward in {mname}.")
-    except Exception as e:
-        print(f"  WARNING: eager_attention_forward patch failed: {e}")
-
-
-# ---------------------------------------------------------------------------
-# FP8 → BF16 streaming loader
-# ---------------------------------------------------------------------------
-
-def _load_weights_fp8_to_bf16(model, model_path: str):
-    """Stream safetensors shards one at a time, dequantizing FP8 tensors.
-
-    HF Transformers 5.x FineGrainedFP8HfQuantizer crashes during model
-    construction for custom architectures with low_cpu_mem_usage=True.
-    This loader bypasses that path entirely:
-
-      1. Reads the safetensors index to find which shard each tensor lives in.
-      2. Iterates shards in order.  In each shard:
-         - Collects all tensors.
-         - For every FP8 weight tensor (dtype float8_e4m3fn), multiplies by the
-           co-located weight_scale_inv (FP32) using block-wise [128, 128] scaling,
-           exactly as Fp8Dequantize does.
-         - Discards weight_scale_inv and activation_scale tensors.
-      3. Loads the resulting BF16 tensors into the model via
-         accelerate.utils.set_module_tensor_to_device, which never holds more
-         than one shard in memory alongside the growing model (~2 GB peak per shard
-         on top of the ~620 GB resident model).
-
-    All co-location guaranteed: weight_scale_inv always lives in the same
-    shard as its weight (verified against model.safetensors.index.json).
-    """
-    import json
-    import torch
-    from safetensors import safe_open
-    from accelerate.utils import set_module_tensor_to_device
-
-    BLOCK_SIZE = [128, 128]
-
-    index_path = os.path.join(model_path, "model.safetensors.index.json")
-    with open(index_path) as f:
-        index = json.load(f)
-    weight_map = index["weight_map"]  # tensor_name → shard_filename
-
-    # Group tensors by shard, preserving shard order from index values
-    shard_order = list(dict.fromkeys(weight_map.values()))  # deduplicated, ordered
-    shard_to_tensors: dict[str, list[str]] = {s: [] for s in shard_order}
-    for name, shard in weight_map.items():
-        shard_to_tensors[shard].append(name)
-
-    n_shards = len(shard_order)
-    n_fp8 = sum(1 for n in weight_map if n.endswith(".weight_scale_inv"))
-    print(f"  {n_shards} shards, {len(weight_map)} tensors ({n_fp8} FP8 weight pairs)")
-
-    ignored_keys = set()
-    missing_keys = []
-
-    for shard_idx, shard_file in enumerate(shard_order):
-        shard_path = os.path.join(model_path, shard_file)
-        shard_dict: dict[str, torch.Tensor] = {}
-        with safe_open(shard_path, framework="pt", device="cpu") as f:
-            for name in shard_to_tensors[shard_file]:
-                shard_dict[name] = f.get_tensor(name)
-
-        # Dequantize FP8 tensors using co-located scales
-        scale_names = [n for n in shard_dict if n.endswith(".weight_scale_inv")]
-        for scale_name in scale_names:
-            weight_name = scale_name[: -len(".weight_scale_inv")] + ".weight"
-            if weight_name not in shard_dict:
-                ignored_keys.add(scale_name)
-                continue
-            weight = shard_dict[weight_name]
-            scale = shard_dict[scale_name]
-            if weight.dtype == torch.float8_e4m3fn:
-                # weight may be ND: [...batch, rows, cols] (e.g. 3D for MoE experts)
-                rows, cols = weight.shape[-2], weight.shape[-1]
-                batch_shape = weight.shape[:-2]
-                bm, bn = BLOCK_SIZE
-                q = weight.to(scale.dtype).reshape(-1, rows, cols)
-                q = q.reshape(-1, rows // bm, bm, cols // bn, bn)
-                s = scale.reshape(-1, rows // bm, cols // bn)
-                s = s.unsqueeze(-1).unsqueeze(2)  # [-1, rows//bm, 1, cols//bn, 1]
-                dq = (q * s).reshape(-1, rows, cols)
-                shard_dict[weight_name] = dq.reshape(
-                    *batch_shape, rows, cols).to(torch.bfloat16)
-            del shard_dict[scale_name]
-            ignored_keys.add(scale_name)
-
-        # Drop activation_scale tensors (not needed for inference)
-        for name in list(shard_dict):
-            if "activation_scale" in name:
-                del shard_dict[name]
-                ignored_keys.add(name)
-
-        # Load tensors into model one-by-one
-        for name, tensor in shard_dict.items():
-            try:
-                set_module_tensor_to_device(
-                    model, name, device="cpu",
-                    value=tensor.to(torch.bfloat16)
-                    if tensor.dtype not in (torch.bfloat16, torch.float32,
-                                            torch.float16, torch.int32,
-                                            torch.int64, torch.bool)
-                    else tensor,
-                    dtype=None,
-                )
-            except Exception:
-                missing_keys.append(name)
-
-        # Progress every 10 shards
-        if (shard_idx + 1) % 10 == 0 or (shard_idx + 1) == n_shards:
-            print(f"  [{shard_idx + 1:3d}/{n_shards}] {shard_file}", flush=True)
-
-    if missing_keys:
-        print(f"  WARNING: {len(missing_keys)} tensors could not be loaded: "
-              f"{missing_keys[:5]}{'...' if len(missing_keys) > 5 else ''}")
-
-
-# ---------------------------------------------------------------------------
-# Load
-# ---------------------------------------------------------------------------
-
-def load_model(model_path: str = DEFAULT_MODEL_PATH):
-    """Load the tokeniser and model from a local directory.
-
-    Uses a streaming shard loader that dequantizes FP8 E4M3 weights to BF16
-    by applying the per-128×128-block weight_scale_inv tensors inline.
-    Resident memory: ~620 GB BF16.
-    """
-    import json
-    import torch
-    from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
-
-    effective_path = _make_effective_model_path(model_path)
-
-    print(f"Loading tokeniser from {effective_path} …")
-    tokenizer = AutoTokenizer.from_pretrained(effective_path, trust_remote_code=True)
-
-    # Load config with quantization_config stripped so model initialises as
-    # plain nn.Linear (no FP8 quantizer active).  Dequantization is handled
-    # by our streaming loader below.
-    print(f"Loading config …")
-    with open(os.path.join(effective_path, "config.json")) as _f:
-        _cfg_dict = json.load(_f)
-    _cfg_dict.pop("quantization_config", None)
-    import tempfile as _tf
-    _cfg_tmp = _tf.mkdtemp(prefix="mimo_cfg_bare_")
-    with open(os.path.join(_cfg_tmp, "config.json"), "w") as _f:
-        json.dump(_cfg_dict, _f)
-    for _fname in os.listdir(effective_path):
-        if _fname != "config.json":
-            _src = os.path.join(effective_path, _fname)
-            _dst = os.path.join(_cfg_tmp, _fname)
-            if not os.path.exists(_dst):
-                os.symlink(_src, _dst)
-
-    config = AutoConfig.from_pretrained(_cfg_tmp, trust_remote_code=True)
-
-    _apply_pre_load_shims()
-
-    print(f"Instantiating empty model on meta device …")
     t0 = time.perf_counter()
-    # low_cpu_mem_usage=True keeps all parameters on meta device until
-    # explicitly assigned; no tensor memory is allocated yet.
-    model = AutoModelForCausalLM.from_pretrained(
-        _cfg_tmp,
-        config=config,
-        torch_dtype=torch.bfloat16,
-        device_map="cpu",
-        low_cpu_mem_usage=True,
-        trust_remote_code=True,
-    )
-    init_elapsed = time.perf_counter() - t0
-    print(f"Model skeleton ready in {init_elapsed:.0f}s.")
-
-    _apply_post_load_shims()
-
-    print(f"Loading weights with FP8→BF16 dequant (streaming, ~620 GB) …")
-    t1 = time.perf_counter()
-    _load_weights_fp8_to_bf16(model, model_path)
-    load_elapsed = time.perf_counter() - t1
-    print(f"Weights loaded in {load_elapsed:.0f}s.")
-
-    model.eval()
-    total = time.perf_counter() - t0
-    print(f"Total load time: {total:.0f}s.")
+    if gcs_model_uri:
+        print(f"Loading model weights via staged GCS copy (fast path) …", flush=True)
+        model = _load_model_staged(config, effective_model_path, gcs_model_uri,
+                                   torch_dtype=torch.bfloat16)
+    else:
+        print(f"Loading model weights from {effective_model_path} "
+              f"(direct filesystem read, low_cpu_mem_usage=True) …", flush=True)
+        model = AutoModelForCausalLM.from_pretrained(
+            effective_model_path,
+            config=config,
+            torch_dtype=torch.bfloat16,
+            device_map="cpu",
+            low_cpu_mem_usage=True,
+            trust_remote_code=True,
+        )
+        # Compatibility shim: the official modeling_mimo_v2_flash.py calls
+        # eager_attention_forward(..., position_ids=..., sinks=...) but its own
+        # local function definition doesn't accept position_ids.  This is a bug
+        # in the file itself.  Rewrap after import to absorb unknown kwargs.
+        try:
+            import sys as _sys
+            for _mname, _mod in list(_sys.modules.items()):
+                if _mod is None or "transformers_modules" not in _mname:
+                    continue
+                _fn = getattr(_mod, "eager_attention_forward", None)
+                if _fn is None:
+                    continue
+                import functools as _ft
+                @_ft.wraps(_fn)
+                def _tolerant_eager_attn(*a, position_ids=None, **kw):
+                    return _fn(*a, **kw)
+                _mod.eager_attention_forward = _tolerant_eager_attn
+                # Also patch any MiMoV2FlashAttention class that captured it
+                for _attr in dir(_mod):
+                    _cls = getattr(_mod, _attr, None)
+                    if isinstance(_cls, type) and "Attention" in _attr:
+                        # The class uses module-level eager_attention_forward as default,
+                        # no instance attribute to patch — the module replacement is enough.
+                        pass
+                print(f"  INFO: patched eager_attention_forward in {_mname} "
+                      f"to accept position_ids kwarg.", flush=True)
+        except Exception as _ep:
+            print(f"  WARNING: could not patch eager_attention_forward: {_ep}")
+        model.eval()
+    elapsed = time.perf_counter() - t0
+    print(f"Model loaded in {elapsed:.0f}s.", flush=True)
     return tokenizer, model
 
 
 # ---------------------------------------------------------------------------
-# Inference
+# Activation hooks
 # ---------------------------------------------------------------------------
 
-def generate(
-    tokenizer,
-    model,
-    prompt: str,
-    max_new_tokens: int = 128,
-    temperature: float = 0.0,
-    top_p: float = 1.0,
-) -> str:
-    """Run greedy (temperature=0) or sampled generation."""
+class _LayerCapturer:
+    """
+    Registers a forward hook on model.model.layers[i] for each index in
+    `layer_ids`.  After a forward pass, `.captures[i]` holds the layer
+    output hidden-state as a float32 numpy array of shape [hidden_size].
+    (We capture index [0, -1, :] = last token position, batch 0.)
+    """
+
+    def __init__(self, layers, layer_ids):
+        self.captures = {}
+        self._hooks = []
+        for i in layer_ids:
+            if i >= len(layers):
+                print(f"WARNING: layer {i} out of range ({len(layers)} layers); skipping.")
+                continue
+            hook = layers[i].register_forward_hook(self._make_hook(i))
+            self._hooks.append(hook)
+
+    def _make_hook(self, layer_idx):
+        def hook(module, inputs, output):  # pylint: disable=unused-argument
+            # output is typically (hidden_states,) or a tuple starting with hidden_states
+            hidden = output[0] if isinstance(output, tuple) else output
+            # hidden shape: [batch, seq_len, hidden_size]
+            # grab the LAST token position, batch 0
+            h = hidden[0, -1, :].detach().float().cpu().numpy()
+            self.captures[layer_idx] = h
+        return hook
+
+    def remove(self):
+        for h in self._hooks:
+            h.remove()
+        self._hooks.clear()
+
+
+# ---------------------------------------------------------------------------
+# Step-by-step greedy decode with activation capture
+# ---------------------------------------------------------------------------
+
+def run_reference(model, tokenizer, prompt, max_new_tokens, layers_to_capture, out_dir):
     import torch
 
+    os.makedirs(out_dir, exist_ok=True)
+
     inputs = tokenizer(prompt, return_tensors="pt")
-    input_ids = inputs["input_ids"]
+    input_ids = inputs["input_ids"]  # [1, prompt_len]
+    print(f"Prompt tokenized to {input_ids.shape[1]} tokens.")
 
-    gen_kwargs = {
-        "max_new_tokens": max_new_tokens,
-        "do_sample": temperature > 0.0,
-    }
-    if temperature > 0.0:
-        gen_kwargs["temperature"] = temperature
-        gen_kwargs["top_p"] = top_p
+    all_token_ids = input_ids[0].tolist()
+    generated_ids = []
+    step_info = []
 
-    t0 = time.perf_counter()
-    with torch.inference_mode():
-        output_ids = model.generate(input_ids, **gen_kwargs)
-    elapsed = time.perf_counter() - t0
+    current_ids = input_ids
+    past_key_values = None
 
-    generated = output_ids[0, input_ids.shape[-1]:]
-    text = tokenizer.decode(generated, skip_special_tokens=True)
-    n = len(generated)
-    print(f"Generated {n} tokens in {elapsed:.2f}s  ({n / elapsed:.1f} tok/s)")
-    return text
+    for step in range(max_new_tokens):
+        print(f"  Step {step} / {max_new_tokens} …", end="\r", flush=True)
+
+        # Register hooks for this step
+        layers = model.model.layers
+        capturer = _LayerCapturer(layers, layers_to_capture)
+
+        t0 = time.perf_counter()
+        with torch.inference_mode():
+            out = model(
+                input_ids=current_ids,
+                past_key_values=past_key_values,
+                use_cache=True,
+                output_hidden_states=False,  # Hidden states via hooks; this would OOM
+            )
+        elapsed = time.perf_counter() - t0
+        capturer.remove()
+
+        logits_last = out.logits[0, -1, :].float().cpu().numpy()  # [vocab_size]
+        next_token_id = int(np.argmax(logits_last))
+        next_token_str = tokenizer.decode([next_token_id])
+
+        # Top-10 for display
+        top10_idx = np.argsort(logits_last)[-10:][::-1].tolist()
+        top10_val = logits_last[top10_idx].tolist()
+        top10_str = [tokenizer.decode([t]) for t in top10_idx]
+
+        print(f"\n  Step {step:3d}: token={next_token_id} ({next_token_str!r})"
+              f"  top-3: {list(zip(top10_idx[:3], top10_str[:3], [f'{v:.2f}' for v in top10_val[:3]]))}  "
+              f" elapsed={elapsed:.1f}s")
+
+        # Save logits
+        np.save(os.path.join(out_dir, f"step{step:04d}_logits.npy"), logits_last)
+
+        # Save layer hidden states
+        for layer_idx, hidden in capturer.captures.items():
+            np.save(os.path.join(out_dir, f"step{step:04d}_layer{layer_idx:02d}.npy"), hidden)
+
+        step_info.append({
+            "step": step,
+            "token_id": next_token_id,
+            "token_str": next_token_str,
+            "top10_ids": top10_idx,
+            "top10_logits": top10_val,
+            "top10_strs": top10_str,
+        })
+
+        generated_ids.append(next_token_id)
+        all_token_ids.append(next_token_id)
+
+        # Prepare next iteration
+        current_ids = torch.tensor([[next_token_id]])
+        past_key_values = out.past_key_values
+
+        # Stop on eos
+        if next_token_id == tokenizer.eos_token_id:
+            print("  EOS reached.")
+            break
+
+    print()
+    output_text = tokenizer.decode(generated_ids, skip_special_tokens=False)
+    print(f"\n=== Generated text ===\n{output_text}\n")
+
+    tokens_path = os.path.join(out_dir, "tokens.json")
+    with open(tokens_path, "w") as f:
+        json.dump({
+            "prompt": prompt,
+            "prompt_token_ids": input_ids[0].tolist(),
+            "generated_token_ids": generated_ids,
+            "generated_text": output_text,
+            "steps": step_info,
+        }, f, indent=2)
+    print(f"Saved token info  -> {tokens_path}")
+    print(f"Saved activations -> {out_dir}/step*.npy")
 
 
 # ---------------------------------------------------------------------------
-# CLI
+# Main
 # ---------------------------------------------------------------------------
 
 def main():
-    _check_imports()
-
-    p = argparse.ArgumentParser(
-        description="HuggingFace inference demo for MiMo-V2-Flash.")
-    p.add_argument(
-        "--model_path", default=DEFAULT_MODEL_PATH,
-        help=f"Local directory containing model weights (default: {DEFAULT_MODEL_PATH})",
-    )
-    p.add_argument(
-        "--prompt",
-        default=(
-            "Solve step by step: A train travels at 120 km/h for 2.5 hours, "
-            "then at 80 km/h for 1.5 hours. What is the total distance?"
-        ),
-    )
-    p.add_argument("--max_new_tokens", type=int, default=128)
-    p.add_argument("--temperature", type=float, default=0.0,
-                   help="Sampling temperature; 0.0 = greedy decoding.")
-    p.add_argument("--top_p", type=float, default=1.0)
-    args = p.parse_args()
-
-    tokenizer, model = load_model(args.model_path)
-
-    print(f"\nPrompt:\n{args.prompt}\n")
-    print("-" * 60)
-    output = generate(
-        tokenizer, model, args.prompt,
+    args = _parse_args()
+    tokenizer, model = _load_model_and_tokenizer(args.model_path, args.tokenizer_path,
+                                                  args.hub_id,
+                                                  fast_load=not args.no_fast_load)
+    run_reference(
+        model=model,
+        tokenizer=tokenizer,
+        prompt=args.prompt,
         max_new_tokens=args.max_new_tokens,
-        temperature=args.temperature,
-        top_p=args.top_p,
+        layers_to_capture=args.layers_to_capture,
+        out_dir=args.out_dir,
     )
-    print(f"Output:\n{output}")
 
 
 if __name__ == "__main__":
