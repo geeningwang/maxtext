@@ -11,15 +11,16 @@ This document summarises all four validated inference configurations for
 | # | Stack | Hardware | Weight format | Status | Output quality |
 |---|---|---|---|---|---|
 | 1 | **MaxText + TPU** | TPU v6e / Ironwood v7 | BF16 (OCDBT checkpoint) | ✅ Forward pass validated | N/A — unit-test only (no autoregressive generation yet) |
-| 2 | **HuggingFace Transformers (CPU)** | AMD EPYC 9B14, 180 vCPUs, 708 GB | BF16 (safetensors, loaded to CPU) | ✅ Runs end-to-end | Garbled (`葭葭葭…`) — matches MaxText |
+| 2 | **HuggingFace Transformers (CPU)** | AMD EPYC 9B14, 180 vCPUs, 708 GB | BF16 (shard-by-shard FP8→BF16 dequant with `weight_scale_inv`) | ✅ Runs end-to-end | Coherent (`"2. But what if we consider it in a"`) |
 | 3 | **SGLang CPU engine** | AMD EPYC 9B14, 180 vCPUs, 708 GB | FP8→BF16 cast at load (quantization_config=null) | ✅ Runs, 5 patches needed | Garbled (`葭葭葭…`) — FP8 scale tensors stripped |
 | 4 | **llama.cpp (GGUF Q8_0)** | AMD EPYC 9B14, 180 vCPUs, 708 GB | Q8_0 on disk, int8+f32 accumulation in compute | ✅ Runs, no patches needed | Coherent (`"2. But what is 0+0?"`) |
 
-**Key finding:** garbled output in settings 2 and 3 is reproduced consistently
-across HF and SGLang, confirming it is a model/tokenizer-level behaviour rather
-than a framework bug.  The llama.cpp GGUF path (setting 4) produces coherent
-output because `convert_hf_to_gguf.py` reads the original FP8 weights and
-re-encodes them to Q8_0, side-stepping the FP8→BF16 cast issue.
+**Key finding:** Setting 2 (HF) now produces coherent output using a shard-by-shard
+FP8→BF16 loader that applies `weight_scale_inv` block scales correctly.  Setting 3
+(SGLang) remains garbled because it strips `quantization_config` and silently
+skips the scale tensors.  Settings 2 and 4 both produce coherent output via
+different paths: HF uses accurate per-block FP8 dequantization; llama.cpp
+re-encodes FP8 to Q8_0 at conversion time.
 
 ---
 
@@ -70,27 +71,39 @@ python3 MaxText/decode.py MaxText/configs/base.yml \
 
 ### Weight format
 - **On disk:** FP8 safetensors (original HF format)
-- **In memory:** BF16 (PyTorch `.to(torch.bfloat16)` at load; FP8→BF16 via `.copy_()`)
+- **In memory:** BF16 — loaded via a custom shard-by-shard streamer that reads each
+  safetensors shard, applies `weight_scale_inv` block scales
+  (`dequant[i,j] = fp8[i,j] * scale[i//bm, j//bn]` with dynamic per-tensor block
+  dims), then frees the FP8 source before moving to the next shard.  Peak memory
+  is ~540 GB (final BF16 model) + ~4 GB per shard overhead, staying within 708 GB.
 
 ### Patches required
-None to the HF model code. Several monkey-patches in the demo script to handle
-`compute_default_rope_parameters` and `eager_attention_forward` compatibility.
+None to the HF model code. The demo script handles:
+- `init_empty_weights()` for zero-RAM meta-device skeleton instantiation
+- `ROPE_INIT_FUNCTIONS['default']` shim for Transformers 5.x compatibility
+- `eager_attention_forward` / `compute_default_rope_parameters` monkey-patches
+- Custom `_load_weights_fp8_to_bf16()` shard streamer (avoids `FineGrainedFP8HfQuantizer` 730 GB peak)
 
 ### Key command
 ```bash
 python3 demos/mimo_v2_flash_demo_hf.py \
   --model_path /mnt/mimo-weights \
-  --device cpu \
-  --dtype bfloat16 \
   --prompt "What is 1+1? The answer is " \
   --max_new_tokens 10
 ```
 
-### Output (validated 2026-04-04)
+### Performance (measured 2026-04-05)
+| Metric | Value |
+|---|---|
+| Skeleton init (meta device) | ~13s, ~0 GB |
+| Weight streaming (145 shards) | ~3.5 min, peak ~540 GB RSS |
+| Generation (10 tokens) | 8.83s, **1.1 tok/s** |
+
+### Output (validated 2026-04-05)
 ```
-葭葭葭葭葭葭葭葭葭葭
+2. But what if we consider it in a
 ```
-Garbled output consistent with MaxText TPU run.
+Coherent output — FP8 weights correctly dequantized to BF16 using `weight_scale_inv` block scales.
 
 ---
 
