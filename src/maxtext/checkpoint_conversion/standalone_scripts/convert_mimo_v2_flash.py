@@ -149,6 +149,35 @@ def _load_keys_batch(
     return tensors
 
 
+def _apply_fp8_dequant(lt: dict) -> None:
+    """Apply weight_scale_inv to FP8 weights that were loaded via .float().
+
+    When PyTorch loads an FP8 E4M3FN tensor and calls .float(), it converts
+    each FP8 value to float32 using the E4M3FN bit format, but does NOT apply
+    the learned per-block scale (weight_scale_inv).  This function multiplies
+    each weight by its block-expanded scale to produce the correct BF16 values.
+
+    The dequantization formula matches the HuggingFace FP8 quantizer:
+        dequant[i, j] = fp8_raw[i, j] * weight_scale_inv[i // bm, j // bn]
+    where bm = rows // scale_rows, bn = cols // scale_cols.
+
+    Modifies *lt* in-place: updates each weight entry and removes the
+    corresponding ``weight_scale_inv`` entry.
+    """
+    for scale_key in [k for k in list(lt) if k.endswith(".weight_scale_inv")]:
+        weight_key = scale_key[: -len(".weight_scale_inv")] + ".weight"
+        if weight_key not in lt:
+            continue
+        w = lt[weight_key].astype(np.float32)
+        s = lt.pop(scale_key).astype(np.float32)
+        rows, cols = w.shape[-2], w.shape[-1]
+        sr, sc = s.shape[-2], s.shape[-1]
+        bm, bn = rows // sr, cols // sc
+        s_exp = np.repeat(np.repeat(s, bm, axis=-2), bn, axis=-1)  # (rows, cols)
+        result = w * s_exp
+        lt[weight_key] = result.astype(_BF16) if _BF16 is not None else result
+
+
 # ---------------------------------------------------------------------------
 # Optional disk-backed storage for converted arrays (streaming / low-RAM mode)
 # ---------------------------------------------------------------------------
@@ -313,8 +342,10 @@ def convert_hf_to_maxtext(
         "model.embed_tokens.weight",
         "model.norm.weight",
         "lm_head.weight",
+        "lm_head.weight_scale_inv",
     ]
     shared = _load_keys_batch(shared_keys, key_to_shard)
+    _apply_fp8_dequant(shared)
 
     emb = shared.get("model.embed_tokens.weight")
     if emb is not None:
@@ -346,11 +377,17 @@ def convert_hf_to_maxtext(
 
         # Collect all HF weight keys needed for this layer so we can open
         # each shard exactly once for this layer.
+        # weight_scale_inv mates are included so _apply_fp8_dequant can scale
+        # raw FP8 values (converted to float32 via .float()) to correct BF16.
         layer_keys: list[str] = [
             f"{hf}.self_attn.q_proj.weight",
+            f"{hf}.self_attn.q_proj.weight_scale_inv",
             f"{hf}.self_attn.k_proj.weight",
+            f"{hf}.self_attn.k_proj.weight_scale_inv",
             f"{hf}.self_attn.v_proj.weight",
+            f"{hf}.self_attn.v_proj.weight_scale_inv",
             f"{hf}.self_attn.o_proj.weight",
+            f"{hf}.self_attn.o_proj.weight_scale_inv",
             f"{hf}.self_attn.attention_sink_bias",
             f"{hf}.input_layernorm.weight",
             f"{hf}.post_attention_layernorm.weight",
@@ -363,17 +400,24 @@ def convert_hf_to_maxtext(
             for j in range(num_experts):
                 layer_keys += [
                     f"{hf}.mlp.experts.{j}.gate_proj.weight",
+                    f"{hf}.mlp.experts.{j}.gate_proj.weight_scale_inv",
                     f"{hf}.mlp.experts.{j}.up_proj.weight",
+                    f"{hf}.mlp.experts.{j}.up_proj.weight_scale_inv",
                     f"{hf}.mlp.experts.{j}.down_proj.weight",
+                    f"{hf}.mlp.experts.{j}.down_proj.weight_scale_inv",
                 ]
         else:
             layer_keys += [
                 f"{hf}.mlp.gate_proj.weight",
+                f"{hf}.mlp.gate_proj.weight_scale_inv",
                 f"{hf}.mlp.up_proj.weight",
+                f"{hf}.mlp.up_proj.weight_scale_inv",
                 f"{hf}.mlp.down_proj.weight",
+                f"{hf}.mlp.down_proj.weight_scale_inv",
             ]
 
         lt = _load_keys_batch(layer_keys, key_to_shard)
+        _apply_fp8_dequant(lt)
 
         # ----- Attention -----
         q = lt.get(f"{hf}.self_attn.q_proj.weight")
