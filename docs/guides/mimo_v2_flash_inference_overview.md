@@ -10,7 +10,7 @@ This document summarises all four validated inference configurations for
 
 | # | Stack | Hardware | Weight format | Status | Output quality |
 |---|---|---|---|---|---|
-| 1 | **MaxText + TPU** | TPU v6e / Ironwood v7 | BF16 (OCDBT checkpoint) | ✅ Forward pass validated | N/A — unit-test only (no autoregressive generation yet) |
+| 1 | **MaxText + TPU** | TPU v6e / Ironwood v7 | BF16 (OCDBT checkpoint, FP8 dequantized via `weight_scale_inv`) | ✅ Forward pass validated | N/A — unit-test only (no autoregressive generation yet) |
 | 2 | **HuggingFace Transformers (CPU)** | AMD EPYC 9B14, 180 vCPUs, 708 GB | BF16 (shard-by-shard FP8→BF16 dequant with `weight_scale_inv`) | ✅ Runs end-to-end | Coherent (`"2. But what if we consider it in a"`) |
 | 3 | **SGLang CPU engine** | AMD EPYC 9B14, 180 vCPUs, 708 GB | FP8→BF16 cast at load (quantization_config=null) | ✅ Runs, 5 patches needed | Garbled (`葭葭葭…`) — FP8 scale tensors stripped |
 | 4 | **llama.cpp (GGUF Q8_0)** | AMD EPYC 9B14, 180 vCPUs, 708 GB | Q8_0 on disk, int8+f32 accumulation in compute | ✅ Runs, no patches needed | Coherent (`"2. But what is 0+0?"`) |
@@ -34,8 +34,11 @@ re-encodes FP8 to Q8_0 at conversion time.
 
 ### Weights
 - Source: HF safetensors at `gs://jingnw-mimo-v2-flash-us-east5/hf-model`
-- Converted to Orbax/zarr3+OCDBT BF16 checkpoint (~313 GB)
-- Conversion validated: 568 tensors, 0 mismatches, max absolute diff = 0.0
+- **Step 1:** Convert HF FP8 → MaxText zarr2 BF16 with `weight_scale_inv` applied:
+  `gs://jingnw-mimo-v2-flash-us-east5/mimo-v2-flash-fixed/checkpoints/0/items`
+- **Step 1b:** Convert zarr2 → zarr3+OCDBT on all 8 workers:
+  `gs://jingnw-mimo-v2-flash-us-east5/mimo-v2-flash-fixed-ocdbt/checkpoints/0/items`
+- Conversion: 8-process OCDBT (`process_0`–`process_7`), `tensor=4 × expert=8` mesh
 
 ### Weight format
 - **On disk:** `safetensors` FP8 (original HF) → `zarr3+OCDBT` BF16 (converted)
@@ -49,14 +52,25 @@ re-encodes FP8 to Q8_0 at conversion time.
 
 ### Status
 Forward pass JIT-compiles and produces finite output.  Autoregressive sampling
-loop not yet wired up; no end-to-end text generation validated.
+loop not yet wired up; no end-to-end text generation validated.  A fresh OCDBT
+checkpoint with correct FP8 dequantization (`weight_scale_inv` applied) is
+currently being generated — previous OCDBT checkpoint (`mimo-v2-flash-ocdbt`)
+had a bug where FP8 block scales were not applied, producing garbled output.
 
 ### Key command
 ```bash
-python3 MaxText/decode.py MaxText/configs/base.yml \
-  per_device_batch_size=1 \
-  model_name=mimo-v2-flash \
-  load_parameters_path=gs://jingnw-mimo-v2-flash-us-east5/mimo-v2-flash-ocdbt/checkpoints/0/items
+gcloud compute tpus tpu-vm ssh <tpu-node> --worker=all --zone=<zone> --internal-ip \
+  --command="cd ~/maxtext && python3 -m maxtext.inference.decode \
+    src/maxtext/configs/base.yml \
+    model_name=mimo-v2-flash \
+    run_name=mimo_inference \
+    load_parameters_path=gs://jingnw-mimo-v2-flash-us-east5/mimo-v2-flash-fixed-ocdbt/checkpoints/0/items \
+    checkpoint_storage_use_ocdbt=true \
+    checkpoint_storage_use_zarr3=true \
+    ici_tensor_parallelism=4 \
+    ici_expert_parallelism=8 \
+    scan_layers=false \
+    per_device_batch_size=1"
 ```
 
 ---

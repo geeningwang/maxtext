@@ -90,72 +90,119 @@ them to an Orbax checkpoint that MaxText can load.
 
 ### Memory modes
 
-| Mode | Peak RAM | Disk (tmpdir) | Best for |
-|---|---|---|---|
-| **Streaming** (`--tmpdir`) | **~25 GB** | ~576 GB (bfloat16) | v6e-1, any low-RAM VM |
-| In-RAM (default) | ~970 GB | none | Large multi-socket hosts |
+| Mode | Flag | Peak RAM | Disk (tmpdir) | Best for |
+|---|---|---|---|---|
+| **Streaming-save** (recommended) | `--streaming_save` | **~50 GB** | none | Any VM ≥ 64 GB RAM |
+| Streaming with memmaps | `--tmpdir <path>` | **~25 GB** | ~576 GB (bfloat16) | VMs with very little RAM but large scratch |
+| Streaming (auto tmpdir) | `--streaming` | **~25 GB** | ~576 GB (auto-created) | Same as above, tmpdir cleaned up on exit |
+| In-RAM (default) | *(none)* | ~970 GB | none | Large multi-socket hosts |
 
-The streaming mode processes one decoder layer at a time and writes converted
-arrays to memory-mapped files so that RAM usage never exceeds approximately
-one MoE layer (~25 GB).  The only requirement is ~580 GB of free scratch space
-accessible from the VM (a local SSD or a mounted persistent disk).
-The output Orbax/zarr checkpoint (zstd-compressed bfloat16) takes an additional ~313 GB.
+**Recommended: `--streaming_save`.**  This mode converts and writes one decoder
+layer at a time, keeping peak RAM bounded to approximately one MoE layer
+(~50 GB).  No scratch disk is needed — converted arrays are kept in RAM only
+for the duration of a single layer before being written to the output checkpoint
+and freed.  The output Orbax/zarr2 checkpoint (zstd-compressed bfloat16) takes
+~313 GB in GCS.
 
-### Running on a v6e-1 (streaming mode)
+The `--tmpdir` / `--streaming` modes reduce peak RAM further (~25 GB) by
+memory-mapping converted arrays to disk, but require ~580 GB of free scratch
+space on a local or persistent disk.
 
-```bash
-# Attach a persistent disk with ≥600 GB free for the tmpdir scratch space,
-# plus ~313 GB for the output checkpoint (≥ ~920 GB total if both reside on
-# the same disk), e.g. mounted at /mnt/scratch.
-# Then run:
-python3 -m maxtext.checkpoint_conversion.standalone_scripts.convert_mimo_v2_flash \
-    --base_model_path /local/path/to/MiMo-V2-Flash \
-    --maxtext_model_path gs://<your-bucket>/mimo-v2-flash/checkpoints/0/items \
-    --tmpdir /mnt/scratch/mimo_tmp \
-    --simulated_cpu_devices_count 1
-```
-
-`--tmpdir` enables streaming mode.  The memmap files under `mimo_tmp` are
-**not** cleaned up automatically when `--tmpdir` is specified, so you can
-inspect them or reuse them if the save step needs to be retried.  Use
-`--streaming` instead if you want the tmpdir to be created and removed
-automatically:
+### Running in streaming-save mode (recommended)
 
 ```bash
 python3 -m maxtext.checkpoint_conversion.standalone_scripts.convert_mimo_v2_flash \
     --base_model_path /local/path/to/MiMo-V2-Flash \
     --maxtext_model_path gs://<your-bucket>/mimo-v2-flash/checkpoints/0/items \
-    --streaming \
-    --simulated_cpu_devices_count 1
+    --streaming_save
 ```
 
-### Running on a high-RAM machine (in-RAM mode)
+Running from a HuggingFace Hub repo:
 
 ```bash
-# Download and convert in one step
 python3 -m maxtext.checkpoint_conversion.standalone_scripts.convert_mimo_v2_flash \
     --base_model_path XiaomiMiMo/MiMo-V2-Flash \
     --maxtext_model_path gs://<your-bucket>/mimo-v2-flash/checkpoints/0/items \
-    --download_from_hub \
-    --simulated_cpu_devices_count 16
-
-# Or, if you have the model locally:
-python3 -m maxtext.checkpoint_conversion.standalone_scripts.convert_mimo_v2_flash \
-    --base_model_path /local/path/to/MiMo-V2-Flash \
-    --maxtext_model_path gs://<your-bucket>/mimo-v2-flash/checkpoints/0/items
+    --streaming_save \
+    --download_from_hub
 ```
 
+### Running on a low-RAM VM with disk scratch (memmap mode)
+
+```bash
+# Attach a persistent disk with ≥600 GB free for the tmpdir scratch space,
+# e.g. mounted at /mnt/scratch.  Then run:
+python3 -m maxtext.checkpoint_conversion.standalone_scripts.convert_mimo_v2_flash \
+    --base_model_path /local/path/to/MiMo-V2-Flash \
+    --maxtext_model_path gs://<your-bucket>/mimo-v2-flash/checkpoints/0/items \
+    --tmpdir /mnt/scratch/mimo_tmp
+```
+
+`--tmpdir` enables memmap streaming mode.  The memmap files under `mimo_tmp` are
+**not** cleaned up automatically when `--tmpdir` is specified, so you can
+inspect them or reuse them if the save step needs to be retried.  Use
+`--streaming` instead for auto-cleanup of the tmpdir on exit.
+
 The conversion:
-- Loads weights from all `*.safetensors` shards
+- Loads weights from all `*.safetensors` shards (one layer at a time in streaming modes)
+- Applies `weight_scale_inv` block scales to dequantize FP8 → BF16 correctly
 - Transposes linear weight matrices from HF `(out, in)` to MaxText `(in, out)`
 - Reshapes attention projections into `(hidden, heads, head_dim)` layout
 - Stacks per-expert MoE weights into `(num_experts, dim_in, dim_out)` tensors
-- Saves an Orbax/Zarr3 checkpoint compatible with MaxText's parameter loader
+- Saves an Orbax/zarr2 checkpoint compatible with MaxText's parameter loader
 
-**Memory note (streaming mode):** Each decoder layer's raw tensors are loaded
-from the relevant shard files, converted, flushed to disk as memmaps, and freed
-before the next layer begins.  The large MoE expert stacks (256 × 3 matrices
-per layer) are the peak allocation, at ~25 GB in float32.
+---
+
+## Step 1b: Convert zarr2 Checkpoint to OCDBT Format (Recommended)
+
+The zarr2 checkpoint from Step 1 is fully functional but loads slowly on
+multi-host TPU slices because every host reads the entire checkpoint over GCS.
+Converting to **zarr3 + OCDBT** lets each of the 8 workers write (and later
+read) only its own expert partition, giving ~8× faster checkpoint load on v6e-32.
+
+This step must be run on **all 8 TPU workers simultaneously**, using the same
+parallelism as inference (`ici_tensor_parallelism=4 ici_expert_parallelism=8`).
+
+> **Why `tensor=4, expert=8`?**  MiMo-V2-Flash has only 4 KV heads for global
+> attention layers.  Pure `TP=32` would require splitting KV heads across 32
+> devices, but 4 is not divisible by 32.  Using `TP=4` (intra-host) ×
+> `EP=8` (inter-host) gives 4 TP per host (divisible into 4 KV heads) and
+> shards the 256 experts evenly across 8 hosts (32 experts/host).
+
+```bash
+gcloud compute tpus tpu-vm ssh <tpu-node> --worker=all --zone=<zone> --internal-ip \
+  --command="cd ~/maxtext && nohup ~/maxtext/maxtext_venv/bin/python3 -u \
+    -m maxtext.tools.convert_checkpoint_to_ocdbt \
+    src/maxtext/configs/base.yml \
+    model_name=mimo-v2-flash \
+    run_name=mimo_ocdbt_convert \
+    load_parameters_path=gs://<your-bucket>/mimo-v2-flash/checkpoints/0/items \
+    base_output_directory=gs://<your-bucket>/ \
+    checkpoint_storage_use_ocdbt=false \
+    checkpoint_storage_use_zarr3=false \
+    ici_tensor_parallelism=4 \
+    ici_expert_parallelism=8 \
+    scan_layers=false \
+    per_device_batch_size=1 \
+    max_target_length=384 \
+    attention=dot_product \
+    dtype=bfloat16 \
+    weight_dtype=bfloat16 \
+    --ocdbt_output_path=gs://<your-bucket>/mimo-v2-flash-ocdbt/checkpoints/0/items \
+    > /tmp/convert_ocdbt.log 2>&1 &"
+```
+
+All 8 workers load the zarr2 checkpoint together (each reads the relevant shards
+for its expert partition) and each writes its own `ocdbt.process_N/` shard.
+The resulting checkpoint at `mimo-v2-flash-ocdbt/checkpoints/0/items` has the
+8-process OCDBT layout (`process_0` through `process_7`) and loads significantly
+faster than the zarr2 source.
+
+After conversion, use `checkpoint_storage_use_ocdbt=true checkpoint_storage_use_zarr3=true`
+and point `load_parameters_path` at the OCDBT path.
+
+> **Note:** The zarr2 checkpoint from Step 1 is still required as the input for
+> this step.  Do not delete it until the OCDBT checkpoint is validated.
 
 ---
 
@@ -286,14 +333,14 @@ For the full 309B model:
 
 | TPU topology | Parallelism | Notes |
 |---|---|---|
-| **v6e-32 (32 chips)** | **TP(32)** | **Minimum viable v6e config**; 1024 GB HBM fits model + KV cache |
-| v6e-64 (64 chips) | FSDP(2) × TP(32) | Better batch throughput |
-| v6e-128 (128 chips) | FSDP(4) × TP(32) | High-throughput serving |
-| v6e-256 (256 chips) | FSDP(16) × TP(16) | Maximum throughput on v6e |
-| **Ironwood-4 (4 chips)** | **TP(4)** | **Minimum viable Ironwood config**; 768 GB HBM fits model + small KV cache |
-| Ironwood-8 (8 chips) | TP(8) | 1,536 GB HBM; comfortable headroom for model + KV cache + large batches |
-| Ironwood-16 (16 chips) | TP(16) or FSDP(2) × TP(8) | High-throughput serving |
-| Ironwood-32 (32 chips) | FSDP(4) × TP(8) | Maximum single-host throughput on Ironwood |
+| **v6e-32 (32 chips, 8 hosts)** | **TP(4) × EP(8)** | **Minimum viable v6e config**; 1024 GB HBM fits model + KV cache; TP=4 required (only 4 KV heads on GA layers, not divisible by 32) |
+| v6e-64 (64 chips, 16 hosts) | TP(4) × EP(16) | Better batch throughput |
+| v6e-128 (128 chips, 32 hosts) | TP(4) × EP(32) | High-throughput serving |
+| v6e-256 (256 chips, 64 hosts) | TP(4) × EP(64) | Maximum throughput on v6e |
+| **Ironwood-4 (4 chips, 1 host)** | **TP(4)** | **Minimum viable Ironwood config**; 768 GB HBM fits model + small KV cache |
+| Ironwood-8 (8 chips, 2 hosts) | TP(4) × EP(2) | 1,536 GB HBM; comfortable headroom |
+| Ironwood-16 (16 chips, 4 hosts) | TP(4) × EP(4) | High-throughput serving |
+| Ironwood-32 (32 chips, 8 hosts) | TP(4) × EP(8) | Maximum throughput on Ironwood |
 
 For the **v6e-32 minimum config**, use pure tensor parallelism across all 32 chips:
 
@@ -380,7 +427,8 @@ python3 -m pytest tests/unit/mimo_v2_flash_architecture_test.py \
 | Decoder registry | `src/maxtext/layers/decoders.py` |
 | Model YAML config | `src/maxtext/configs/models/mimo-v2-flash.yml` |
 | DecoderBlockType enum | `src/maxtext/common/common_types.py` |
-| Checkpoint conversion | `src/maxtext/checkpoint_conversion/standalone_scripts/convert_mimo_v2_flash.py` |
+| Checkpoint conversion (HF→zarr2) | `src/maxtext/checkpoint_conversion/standalone_scripts/convert_mimo_v2_flash.py` |
+| Checkpoint conversion (zarr2→OCDBT) | `src/maxtext/tools/convert_checkpoint_to_ocdbt.py` |
 | Param mapping | `src/maxtext/checkpoint_conversion/utils/param_mapping.py` |
 | Unit tests | `tests/unit/mimo_v2_flash_architecture_test.py` |
 | TPU execution tests | `tests/unit/mimo_v2_flash_tpu_test.py` |
@@ -397,9 +445,10 @@ python3 -m pytest tests/unit/mimo_v2_flash_architecture_test.py \
   as a follow-up.
 - **Scan layers:** `scan_layers=true` is not yet validated for MiMo.  Use
   `scan_layers=false` (the default in `mimo-v2-flash.yml`).
-- **FP8 weights:** The original model was trained in FP8.  The conversion
-  script loads to bfloat16.  FP8-to-bfloat16 dequantisation is handled by
-  `safetensors` transparently if the shards were already dequantised, but
-  if you download the raw FP8 shards you may need to run
-  `tools/checkpoint_conversion/standalone_scripts/deepseek_fp8_to_bf16.py`
-  as a pre-processing step.
+- **FP8 weights:** The original model is stored in FP8 with per-block
+  `weight_scale_inv` scale tensors.  The conversion script explicitly reads
+  these scale tensors and applies block-wise dequantisation
+  (`dequant[i,j] = fp8[i,j] * scale[i//bm, j//bn]`) to produce correct BF16
+  weights.  Without this step the model outputs garbled text.  The fix is
+  applied in `_apply_fp8_dequant()` inside
+  `convert_mimo_v2_flash.py` — no separate pre-processing step is needed.
