@@ -145,17 +145,17 @@ def _load_keys_batch(
     tensors: dict[str, np.ndarray] = {}
     total_shards = len(shard_to_keys)
     for idx, (shard_path, batch) in enumerate(shard_to_keys.items()):
-        if progress_every > 0 and (idx % progress_every == 0 or idx == total_shards - 1):
-            print(
-                f"[convert] {label}  shard {idx+1}/{total_shards}  keys_loaded={len(tensors)}",
-                flush=True,
-            )
         with safe_open(shard_path, framework="pt", device="cpu") as f:
             for key in batch:
                 # .float() handles fp8/fp16/bf16 → float32; numpy() works on float32.
                 # Then astype(_BF16) downcasts to bf16 via ml_dtypes.
                 arr_f32 = f.get_tensor(key).float().numpy()
                 tensors[key] = arr_f32.astype(_BF16) if _BF16 is not None else arr_f32
+        if progress_every > 0 and (idx % progress_every == 0 or idx == total_shards - 1):
+            print(
+                f"[convert] {label}  shard {idx+1}/{total_shards} done  keys_loaded={len(tensors)}",
+                flush=True,
+            )
     return tensors
 
 
