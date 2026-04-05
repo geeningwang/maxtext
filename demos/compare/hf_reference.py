@@ -372,7 +372,7 @@ def _load_model_and_tokenizer(model_path: str, tokenizer_path: Optional[str],
                 if fname.endswith(".json"):
                     import json as _json
                     # gcsfuse may serve any JSON file gzip-compressed.
-                    # Decompress if needed; strip quantization_config from config.json.
+                    # Decompress gzip-compressed JSON files if needed (gcsfuse path).
                     try:
                         with open(src, "rb") as _f:
                             _magic = _f.read(2)
@@ -382,8 +382,10 @@ def _load_model_and_tokenizer(model_path: str, tokenizer_path: Optional[str],
                         else:
                             with open(src, "r") as gf:
                                 _d = _json.load(gf)
-                        if fname == "config.json":
-                            _d.pop("quantization_config", None)
+                        # Do NOT strip quantization_config: FP8 weights require it so
+                        # that HF Transformers selects FineGrainedFP8HfQuantizer and
+                        # applies weight_scale_inv during dequantization.  Removing it
+                        # causes FP8 bytes to be reinterpreted as raw BF16 → garbled output.
                         with open(dst, "w") as df:
                             _json.dump(_d, df)
                     except Exception as _e:
