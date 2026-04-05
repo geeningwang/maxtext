@@ -127,6 +127,8 @@ def _build_shard_index(shard_paths: list[pathlib.Path]) -> dict[str, pathlib.Pat
 def _load_keys_batch(
     keys: Iterable[str],
     key_to_shard: dict[str, pathlib.Path],
+    label: str = "",
+    progress_every: int = 10,
 ) -> dict[str, np.ndarray]:
     """Load a set of weight keys, opening each shard at most once.
 
@@ -141,7 +143,13 @@ def _load_keys_batch(
             shard_to_keys.setdefault(shard, []).append(key)
 
     tensors: dict[str, np.ndarray] = {}
-    for shard_path, batch in shard_to_keys.items():
+    total_shards = len(shard_to_keys)
+    for idx, (shard_path, batch) in enumerate(shard_to_keys.items()):
+        if progress_every > 0 and (idx % progress_every == 0 or idx == total_shards - 1):
+            print(
+                f"[convert] {label}  shard {idx+1}/{total_shards}  keys_loaded={len(tensors)}",
+                flush=True,
+            )
         with safe_open(shard_path, framework="pt", device="cpu") as f:
             for key in batch:
                 # .float() handles fp8/fp16/bf16 → float32; numpy() works on float32.
@@ -151,7 +159,7 @@ def _load_keys_batch(
     return tensors
 
 
-def _apply_fp8_dequant(lt: dict) -> None:
+def _apply_fp8_dequant(lt: dict, label: str = "", progress_every: int = 64) -> None:
     """Apply weight_scale_inv to FP8 weights that were loaded via .float().
 
     When PyTorch loads an FP8 E4M3FN tensor and calls .float(), it converts
@@ -166,7 +174,14 @@ def _apply_fp8_dequant(lt: dict) -> None:
     Modifies *lt* in-place: updates each weight entry and removes the
     corresponding ``weight_scale_inv`` entry.
     """
-    for scale_key in [k for k in list(lt) if k.endswith(".weight_scale_inv")]:
+    scale_keys = [k for k in list(lt) if k.endswith(".weight_scale_inv")]
+    total = len(scale_keys)
+    for idx, scale_key in enumerate(scale_keys):
+        if progress_every > 0 and (idx % progress_every == 0 or idx == total - 1):
+            print(
+                f"[convert] {label}  dequant {idx+1}/{total}",
+                flush=True,
+            )
         weight_key = scale_key[: -len(".weight_scale_inv")] + ".weight"
         if weight_key not in lt:
             continue
@@ -351,8 +366,8 @@ def convert_hf_to_maxtext(
     ]
     max_logging.log("[global] Loading shared weights (embed_tokens, norm, lm_head)...")
     print("[convert] [global] Loading shared weights (embed_tokens, norm, lm_head)...", flush=True)
-    shared = _load_keys_batch(shared_keys, key_to_shard)
-    _apply_fp8_dequant(shared)
+    shared = _load_keys_batch(shared_keys, key_to_shard, label="[global] load")
+    _apply_fp8_dequant(shared, label="[global] dequant")
     max_logging.log(f"[global] Shared weights loaded and dequantized ({len(shared)} tensors).")
     print(f"[convert] [global] Shared weights loaded and dequantized ({len(shared)} tensors).", flush=True)
 
@@ -440,7 +455,11 @@ def convert_hf_to_maxtext(
                 f"{hf}.mlp.down_proj.weight_scale_inv",
             ]
 
-        lt = _load_keys_batch(layer_keys, key_to_shard)
+        lt = _load_keys_batch(
+            layer_keys, key_to_shard,
+            label=f"[layer {i:02d}/{num_layers-1}] load",
+            progress_every=5,
+        )
         _t_loaded = time.monotonic()
         max_logging.log(
             f"[layer {i:02d}/{num_layers-1}] Loaded {len(lt)} tensors in {_t_loaded-_t0:.1f}s"
@@ -449,7 +468,7 @@ def convert_hf_to_maxtext(
             f"[convert] [layer {i:02d}/{num_layers-1}] Loaded {len(lt)} tensors in {_t_loaded-_t0:.1f}s",
             flush=True,
         )
-        _apply_fp8_dequant(lt)
+        _apply_fp8_dequant(lt, label=f"[layer {i:02d}/{num_layers-1}] dequant", progress_every=64)
         max_logging.log(
             f"[layer {i:02d}/{num_layers-1}] Dequant done in {time.monotonic()-_t_loaded:.1f}s"
         )
