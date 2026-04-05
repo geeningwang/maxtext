@@ -60,7 +60,9 @@ import gc
 import os
 import pathlib
 import shutil
+import sys
 import tempfile
+import time
 from collections.abc import Iterable
 
 import numpy as np
@@ -318,9 +320,11 @@ def convert_hf_to_maxtext(
     if not shard_paths:
         raise FileNotFoundError(f"No *.safetensors files found in: {base_model_path}")
     max_logging.log(f"Found {len(shard_paths)} safetensors shards")
+    sys.stdout.flush(); sys.stderr.flush()
 
     key_to_shard = _build_shard_index(shard_paths)
     max_logging.log(f"Indexed {len(key_to_shard)} weight keys across {len(shard_paths)} shards")
+    sys.stdout.flush(); sys.stderr.flush()
 
     # ------------------------------------------------------------------
     # 2. Prepare storage backend
@@ -344,8 +348,12 @@ def convert_hf_to_maxtext(
         "lm_head.weight",
         "lm_head.weight_scale_inv",
     ]
+    max_logging.log("[global] Loading shared weights (embed_tokens, norm, lm_head)...")
+    sys.stdout.flush(); sys.stderr.flush()
     shared = _load_keys_batch(shared_keys, key_to_shard)
     _apply_fp8_dequant(shared)
+    max_logging.log(f"[global] Shared weights loaded and dequantized ({len(shared)} tensors).")
+    sys.stdout.flush(); sys.stderr.flush()
 
     emb = shared.get("model.embed_tokens.weight")
     if emb is not None:
@@ -368,12 +376,23 @@ def convert_hf_to_maxtext(
     # ------------------------------------------------------------------
     # 4. Convert decoder layers one at a time
     # ------------------------------------------------------------------
+    _layer_times: list[float] = []
+    _convert_start = time.monotonic()
+
     for i in tqdm(range(num_layers), desc="Converting decoder layers"):
+        _t0 = time.monotonic()
         hf = f"model.layers.{i}"
         mt = f"decoder.layers.{i}"
         is_swa = hybrid[i] == 1
         is_moe = moe_freq[i] == 1
         kv_h = swa_num_kv_heads if is_swa else num_kv_heads
+        layer_type = "MoE" if is_moe else "dense"
+        attn_type = "SWA" if is_swa else "GA"
+        max_logging.log(
+            f"[layer {i:02d}/{num_layers-1}] Start  type={layer_type}/{attn_type}  "
+            f"elapsed={time.monotonic()-_convert_start:.0f}s"
+        )
+        sys.stdout.flush(); sys.stderr.flush()
 
         # Collect all HF weight keys needed for this layer so we can open
         # each shard exactly once for this layer.
@@ -417,7 +436,16 @@ def convert_hf_to_maxtext(
             ]
 
         lt = _load_keys_batch(layer_keys, key_to_shard)
+        _t_loaded = time.monotonic()
+        max_logging.log(
+            f"[layer {i:02d}/{num_layers-1}] Loaded {len(lt)} tensors in {_t_loaded-_t0:.1f}s"
+        )
+        sys.stdout.flush(); sys.stderr.flush()
         _apply_fp8_dequant(lt)
+        max_logging.log(
+            f"[layer {i:02d}/{num_layers-1}] Dequant done in {time.monotonic()-_t_loaded:.1f}s"
+        )
+        sys.stdout.flush(); sys.stderr.flush()
 
         # ----- Attention -----
         q = lt.get(f"{hf}.self_attn.q_proj.weight")
@@ -545,6 +573,16 @@ def convert_hf_to_maxtext(
                     except OSError:
                         pass
 
+        _layer_elapsed = time.monotonic() - _t0
+        _layer_times.append(_layer_elapsed)
+        avg = sum(_layer_times) / len(_layer_times)
+        remaining = (num_layers - (i + 1)) * avg
+        max_logging.log(
+            f"[layer {i:02d}/{num_layers-1}] Done  layer_time={_layer_elapsed:.0f}s  "
+            f"avg={avg:.0f}s  ETA={remaining/60:.1f}min  "
+            f"total_elapsed={time.monotonic()-_convert_start:.0f}s"
+        )
+        sys.stdout.flush(); sys.stderr.flush()
         gc.collect()
 
     # ------------------------------------------------------------------
@@ -711,13 +749,17 @@ def convert_and_save_streaming(
 
     def _on_layer_complete(layer_idx: int, layer_flat: dict) -> None:
         """Callback: write layer_idx's arrays to zarr immediately."""
+        _t_save = time.time()
         for key, arr in sorted(layer_flat.items()):
             tree_meta.update(_write_one_zarr_array(items_dir, key, arr, compressor))
             arrays_written[0] += 1
+        save_elapsed = time.time() - _t_save
         max_logging.log(
             f"  Streaming-saved layer {layer_idx} "
-            f"({len(layer_flat)} arrays, total so far: {arrays_written[0]})"
+            f"({len(layer_flat)} arrays, total so far: {arrays_written[0]}, "
+            f"save_time={save_elapsed:.1f}s)"
         )
+        sys.stdout.flush(); sys.stderr.flush()
 
     # Run conversion; the callback writes + frees each decoder layer in turn.
     # Global weights (embeddings, norm, logits) are returned in `flat` after
