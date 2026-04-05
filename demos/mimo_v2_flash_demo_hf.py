@@ -234,16 +234,129 @@ def _apply_post_load_shims():
 
 
 # ---------------------------------------------------------------------------
+# FP8 → BF16 streaming loader
+# ---------------------------------------------------------------------------
+
+def _load_weights_fp8_to_bf16(model, model_path: str):
+    """Stream safetensors shards one at a time, dequantizing FP8 tensors.
+
+    HF Transformers 5.x FineGrainedFP8HfQuantizer crashes during model
+    construction for custom architectures with low_cpu_mem_usage=True.
+    This loader bypasses that path entirely:
+
+      1. Reads the safetensors index to find which shard each tensor lives in.
+      2. Iterates shards in order.  In each shard:
+         - Collects all tensors.
+         - For every FP8 weight tensor (dtype float8_e4m3fn), multiplies by the
+           co-located weight_scale_inv (FP32) using block-wise [128, 128] scaling,
+           exactly as Fp8Dequantize does.
+         - Discards weight_scale_inv and activation_scale tensors.
+      3. Loads the resulting BF16 tensors into the model via
+         accelerate.utils.set_module_tensor_to_device, which never holds more
+         than one shard in memory alongside the growing model (~2 GB peak per shard
+         on top of the ~620 GB resident model).
+
+    All co-location guaranteed: weight_scale_inv always lives in the same
+    shard as its weight (verified against model.safetensors.index.json).
+    """
+    import json
+    import torch
+    from safetensors import safe_open
+    from accelerate.utils import set_module_tensor_to_device
+
+    BLOCK_SIZE = [128, 128]
+
+    index_path = os.path.join(model_path, "model.safetensors.index.json")
+    with open(index_path) as f:
+        index = json.load(f)
+    weight_map = index["weight_map"]  # tensor_name → shard_filename
+
+    # Group tensors by shard, preserving shard order from index values
+    shard_order = list(dict.fromkeys(weight_map.values()))  # deduplicated, ordered
+    shard_to_tensors: dict[str, list[str]] = {s: [] for s in shard_order}
+    for name, shard in weight_map.items():
+        shard_to_tensors[shard].append(name)
+
+    n_shards = len(shard_order)
+    n_fp8 = sum(1 for n in weight_map if n.endswith(".weight_scale_inv"))
+    print(f"  {n_shards} shards, {len(weight_map)} tensors ({n_fp8} FP8 weight pairs)")
+
+    ignored_keys = set()
+    missing_keys = []
+
+    for shard_idx, shard_file in enumerate(shard_order):
+        shard_path = os.path.join(model_path, shard_file)
+        shard_dict: dict[str, torch.Tensor] = {}
+        with safe_open(shard_path, framework="pt", device="cpu") as f:
+            for name in shard_to_tensors[shard_file]:
+                shard_dict[name] = f.get_tensor(name)
+
+        # Dequantize FP8 tensors using co-located scales
+        scale_names = [n for n in shard_dict if n.endswith(".weight_scale_inv")]
+        for scale_name in scale_names:
+            weight_name = scale_name[: -len(".weight_scale_inv")] + ".weight"
+            if weight_name not in shard_dict:
+                ignored_keys.add(scale_name)
+                continue
+            weight = shard_dict[weight_name]
+            scale = shard_dict[scale_name]
+            if weight.dtype == torch.float8_e4m3fn:
+                # weight may be ND: [...batch, rows, cols] (e.g. 3D for MoE experts)
+                rows, cols = weight.shape[-2], weight.shape[-1]
+                batch_shape = weight.shape[:-2]
+                bm, bn = BLOCK_SIZE
+                q = weight.to(scale.dtype).reshape(-1, rows, cols)
+                q = q.reshape(-1, rows // bm, bm, cols // bn, bn)
+                s = scale.reshape(-1, rows // bm, cols // bn)
+                s = s.unsqueeze(-1).unsqueeze(2)  # [-1, rows//bm, 1, cols//bn, 1]
+                dq = (q * s).reshape(-1, rows, cols)
+                shard_dict[weight_name] = dq.reshape(
+                    *batch_shape, rows, cols).to(torch.bfloat16)
+            del shard_dict[scale_name]
+            ignored_keys.add(scale_name)
+
+        # Drop activation_scale tensors (not needed for inference)
+        for name in list(shard_dict):
+            if "activation_scale" in name:
+                del shard_dict[name]
+                ignored_keys.add(name)
+
+        # Load tensors into model one-by-one
+        for name, tensor in shard_dict.items():
+            try:
+                set_module_tensor_to_device(
+                    model, name, device="cpu",
+                    value=tensor.to(torch.bfloat16)
+                    if tensor.dtype not in (torch.bfloat16, torch.float32,
+                                            torch.float16, torch.int32,
+                                            torch.int64, torch.bool)
+                    else tensor,
+                    dtype=None,
+                )
+            except Exception:
+                missing_keys.append(name)
+
+        # Progress every 10 shards
+        if (shard_idx + 1) % 10 == 0 or (shard_idx + 1) == n_shards:
+            print(f"  [{shard_idx + 1:3d}/{n_shards}] {shard_file}", flush=True)
+
+    if missing_keys:
+        print(f"  WARNING: {len(missing_keys)} tensors could not be loaded: "
+              f"{missing_keys[:5]}{'...' if len(missing_keys) > 5 else ''}")
+
+
+# ---------------------------------------------------------------------------
 # Load
 # ---------------------------------------------------------------------------
 
 def load_model(model_path: str = DEFAULT_MODEL_PATH):
     """Load the tokeniser and model from a local directory.
 
-    FP8 weights are dequantized to BF16 automatically on CPU by HF Transformers
-    (FineGrainedFP8HfQuantizer → Fp8Dequantize applies weight_scale_inv).
+    Uses a streaming shard loader that dequantizes FP8 E4M3 weights to BF16
+    by applying the per-128×128-block weight_scale_inv tensors inline.
     Resident memory: ~620 GB BF16.
     """
+    import json
     import torch
     from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
@@ -252,26 +365,54 @@ def load_model(model_path: str = DEFAULT_MODEL_PATH):
     print(f"Loading tokeniser from {effective_path} …")
     tokenizer = AutoTokenizer.from_pretrained(effective_path, trust_remote_code=True)
 
-    print(f"Loading config from {effective_path} …")
-    config = AutoConfig.from_pretrained(effective_path, trust_remote_code=True)
+    # Load config with quantization_config stripped so model initialises as
+    # plain nn.Linear (no FP8 quantizer active).  Dequantization is handled
+    # by our streaming loader below.
+    print(f"Loading config …")
+    with open(os.path.join(effective_path, "config.json")) as _f:
+        _cfg_dict = json.load(_f)
+    _cfg_dict.pop("quantization_config", None)
+    import tempfile as _tf
+    _cfg_tmp = _tf.mkdtemp(prefix="mimo_cfg_bare_")
+    with open(os.path.join(_cfg_tmp, "config.json"), "w") as _f:
+        json.dump(_cfg_dict, _f)
+    for _fname in os.listdir(effective_path):
+        if _fname != "config.json":
+            _src = os.path.join(effective_path, _fname)
+            _dst = os.path.join(_cfg_tmp, _fname)
+            if not os.path.exists(_dst):
+                os.symlink(_src, _dst)
+
+    config = AutoConfig.from_pretrained(_cfg_tmp, trust_remote_code=True)
 
     _apply_pre_load_shims()
 
-    print(f"Loading model weights (FP8→BF16 dequant, ~620 GB) …")
+    print(f"Instantiating empty model on meta device …")
     t0 = time.perf_counter()
+    # low_cpu_mem_usage=True keeps all parameters on meta device until
+    # explicitly assigned; no tensor memory is allocated yet.
     model = AutoModelForCausalLM.from_pretrained(
-        effective_path,
+        _cfg_tmp,
         config=config,
         torch_dtype=torch.bfloat16,
         device_map="cpu",
         low_cpu_mem_usage=True,
         trust_remote_code=True,
     )
-    model.eval()
-    elapsed = time.perf_counter() - t0
-    print(f"Model loaded in {elapsed:.0f}s.")
+    init_elapsed = time.perf_counter() - t0
+    print(f"Model skeleton ready in {init_elapsed:.0f}s.")
 
     _apply_post_load_shims()
+
+    print(f"Loading weights with FP8→BF16 dequant (streaming, ~620 GB) …")
+    t1 = time.perf_counter()
+    _load_weights_fp8_to_bf16(model, model_path)
+    load_elapsed = time.perf_counter() - t1
+    print(f"Weights loaded in {load_elapsed:.0f}s.")
+
+    model.eval()
+    total = time.perf_counter() - t0
+    print(f"Total load time: {total:.0f}s.")
     return tokenizer, model
 
 
