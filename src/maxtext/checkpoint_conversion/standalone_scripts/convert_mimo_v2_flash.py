@@ -797,7 +797,12 @@ def convert_and_save_streaming(
     def _on_layer_complete(layer_idx: int, layer_flat: dict) -> None:
         """Callback: write layer_idx's arrays to zarr immediately."""
         _t_save = time.time()
-        for key, arr in sorted(layer_flat.items()):
+        total_arrays = len(layer_flat)
+        for arr_idx, (key, arr) in enumerate(sorted(layer_flat.items())):
+            print(
+                f"[convert] saving layer {layer_idx} array {arr_idx+1}/{total_arrays}: {key}  shape={arr.shape}",
+                flush=True,
+            )
             tree_meta.update(_write_one_zarr_array(items_dir, key, arr, compressor))
             arrays_written[0] += 1
         save_elapsed = time.time() - _t_save
