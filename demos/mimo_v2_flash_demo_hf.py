@@ -326,8 +326,8 @@ def load_model(model_path: str = DEFAULT_MODEL_PATH):
     """Load tokeniser and model using the shard-by-shard FP8→BF16 loader.
 
     Avoids the ~730 GB peak of FineGrainedFP8HfQuantizer:
-      1. Strips quantization_config so from_pretrained builds plain nn.Linear
-         on meta device (effectively 0 GB parameter memory).
+      1. Uses accelerate init_empty_weights() so the model skeleton lives on
+         the meta device — zero RAM for parameters.
       2. Streams each safetensors shard, dequantizes FP8→BF16 with dynamic
          per-tensor block sizes, assigns into model, then frees the shard.
     Peak memory: ~620 GB BF16 steady-state + ~4 GB per-shard overhead.
@@ -335,6 +335,7 @@ def load_model(model_path: str = DEFAULT_MODEL_PATH):
     import json
     import tempfile
     import torch
+    from accelerate import init_empty_weights
     from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
     effective_path = _make_effective_model_path(model_path)
@@ -343,7 +344,7 @@ def load_model(model_path: str = DEFAULT_MODEL_PATH):
     tokenizer = AutoTokenizer.from_pretrained(effective_path, trust_remote_code=True)
 
     # Build a bare config dir with quantization_config stripped so the model
-    # skeleton is plain nn.Linear — no FP8 quantizer, no weight allocation yet.
+    # initialises as plain nn.Linear (no FP8 quantizer).
     with open(os.path.join(effective_path, "config.json")) as f:
         cfg_dict = json.load(f)
     cfg_dict.pop("quantization_config", None)
@@ -362,16 +363,12 @@ def load_model(model_path: str = DEFAULT_MODEL_PATH):
 
     _apply_pre_load_shims()
 
-    # Instantiate model skeleton — parameters stay on meta device (~0 GB RAM).
-    print(f"Instantiating model skeleton (meta device) …")
+    # Instantiate model skeleton on meta device — no tensor memory allocated.
+    print(f"Instantiating model skeleton (meta device, ~0 GB) …")
     t0 = time.perf_counter()
-    model = AutoModelForCausalLM.from_pretrained(
-        bare_dir,
-        config=config,
-        torch_dtype=torch.bfloat16,
-        low_cpu_mem_usage=True,
-        trust_remote_code=True,
-    )
+    with init_empty_weights():
+        model = AutoModelForCausalLM.from_config(config, trust_remote_code=True)
+    model = model.to(torch.bfloat16)
     skeleton_elapsed = time.perf_counter() - t0
     print(f"Skeleton ready in {skeleton_elapsed:.0f}s.")
 
