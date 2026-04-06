@@ -9,6 +9,13 @@ This validation compares original HF safetensor values directly against regenera
 - TPU workers: 8
 - Validation mode: distributed by layer partition (`layer % 8`)
 
+> **Note (2026-04-06):** `mimo-v2-flash-ocdbt` (validated here) is the **old/buggy**
+> checkpoint — it stored FP8 values cast to BF16 *without* applying `weight_scale_inv`
+> block scales.  Values matched HF raw FP8-cast-BF16 (hence 0 mismatches), but the
+> model produced garbled output at inference time.  The corrected checkpoint is
+> `mimo-v2-flash-fixed-ocdbt` (384 GB), which applies `weight_scale_inv` correctly
+> and is what should be used for inference.
+
 ## Final Result
 
 - Workers completed: `8/8`

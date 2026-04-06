@@ -54,14 +54,15 @@ re-encodes FP8 to Q8_0 at conversion time.
 Forward pass JIT-compiles and produces finite output.  Autoregressive sampling
 loop not yet wired up; no end-to-end text generation validated.
 
-Checkpoint conversion is in progress using a distributed approach:
-worker 0 runs `convert_mimo_v2_flash.py --streaming_save` over all 48 layers
-(plus global weights); workers 1–7 run `convert_mimo_v2_flash_distributed.py`
-in parallel, each handling 3 layers from the upper range (layers 27–47).  After
-all workers finish, `--scan_and_finalize` writes the valid `_METADATA` file and
-Step 1b (OCDBT conversion) runs on all 8 workers to produce
-`mimo-v2-flash-fixed-ocdbt`.  Previous OCDBT checkpoint (`mimo-v2-flash-ocdbt`)
-had a bug where FP8 block scales were not applied, producing garbled output.
+Checkpoint conversion is **complete** (as of 2026-04-06).  The full pipeline ran
+using a distributed approach: worker 0 ran `convert_mimo_v2_flash.py` over all
+48 layers plus global weights; workers 1–7 ran in parallel each handling 3 layers
+from the upper range (layers 27–47).  After all workers finished,
+`--scan_and_finalize` wrote the valid `_METADATA` file.  Step 1b (OCDBT
+conversion) then ran on all 8 workers to produce `mimo-v2-flash-fixed-ocdbt`
+(384 GB, 8-process OCDBT, zarr3).  Previous OCDBT checkpoint
+(`mimo-v2-flash-ocdbt`) had a bug where FP8 block scales were not applied,
+producing garbled output; use `mimo-v2-flash-fixed-ocdbt` for all inference.
 
 ### Key command
 ```bash

@@ -233,7 +233,8 @@ parallelism as inference (`ici_tensor_parallelism=4 ici_expert_parallelism=8`).
 
 ```bash
 gcloud compute tpus tpu-vm ssh <tpu-node> --worker=all --zone=<zone> --internal-ip \
-  --command="cd ~/maxtext && nohup ~/maxtext/maxtext_venv/bin/python3 -u \
+  --command="cd ~/maxtext && nohup env OCDBT_OUTPUT_PATH=gs://<your-bucket>/mimo-v2-flash-ocdbt/checkpoints/0/items \
+    ~/maxtext/maxtext_venv/bin/python3 -u \
     -m maxtext.tools.convert_checkpoint_to_ocdbt \
     src/maxtext/configs/base.yml \
     model_name=mimo-v2-flash \
@@ -247,10 +248,10 @@ gcloud compute tpus tpu-vm ssh <tpu-node> --worker=all --zone=<zone> --internal-
     scan_layers=false \
     per_device_batch_size=1 \
     max_target_length=384 \
+    max_prefill_predict_length=128 \
     attention=dot_product \
     dtype=bfloat16 \
     weight_dtype=bfloat16 \
-    --ocdbt_output_path=gs://<your-bucket>/mimo-v2-flash-ocdbt/checkpoints/0/items \
     > /tmp/convert_ocdbt.log 2>&1 &"
 ```
 
