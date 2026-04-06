@@ -516,3 +516,13 @@ python3 -m pytest tests/unit/mimo_v2_flash_architecture_test.py \
   weights.  Without this step the model outputs garbled text.  The fix is
   applied in `_apply_fp8_dequant()` inside
   `convert_mimo_v2_flash.py` — no separate pre-processing step is needed.
+- **`query_pre_attn_scalar` (fixed 2026-04-06, commit `6051205a`):** MaxText
+  folds `1/sqrt(head_dim)` into the query projection *weight initialisation*.
+  When loading pre-trained HF weights (which carry no such folding), the forward
+  pass must apply the scaling explicitly.  The original `Attention()` call in
+  `mimo_v2_flash.py` was missing `query_pre_attn_scalar=cfg.head_dim**-0.5`,
+  so attention logits were `sqrt(192) ≈ 13.9×` too large at runtime, producing
+  completely garbled text even with a perfectly converted checkpoint.  Fix:
+  added `query_pre_attn_scalar=cfg.head_dim**-0.5` to the `Attention()`
+  constructor (consistent with all other MaxText HF-loaded models: Llama4,
+  Qwen3, GPT-OSS, Olmo3, Gemma3).

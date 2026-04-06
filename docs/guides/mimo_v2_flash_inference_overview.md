@@ -10,7 +10,7 @@ This document summarises all four validated inference configurations for
 
 | # | Stack | Hardware | Weight format | Status | Output quality |
 |---|---|---|---|---|---|
-| 1 | **MaxText + TPU** | TPU v6e / Ironwood v7 | BF16 (OCDBT checkpoint, FP8 dequantized via `weight_scale_inv`) | ✅ Forward pass validated | N/A — unit-test only (no autoregressive generation yet) |
+| 1 | **MaxText + TPU** | TPU v6e / Ironwood v7 | BF16 (OCDBT checkpoint, FP8 dequantized via `weight_scale_inv`) | ✅ End-to-end generation validated | Coherent (`"2. But what if we are in binary?…"`) |
 | 2 | **HuggingFace Transformers (CPU)** | AMD EPYC 9B14, 180 vCPUs, 708 GB | BF16 (shard-by-shard FP8→BF16 dequant with `weight_scale_inv`) | ✅ Runs end-to-end | Coherent (`"2. But what if we consider it in a"`) |
 | 3 | **SGLang CPU engine** | AMD EPYC 9B14, 180 vCPUs, 708 GB | FP8→BF16 cast at load (quantization_config=null) | ✅ Runs, 5 patches needed | Garbled (`葭葭葭…`) — FP8 scale tensors stripped |
 | 4 | **llama.cpp (GGUF Q8_0)** | AMD EPYC 9B14, 180 vCPUs, 708 GB | Q8_0 on disk, int8+f32 accumulation in compute | ✅ Runs, no patches needed | Coherent (`"2. But what is 0+0?"`) |
@@ -51,8 +51,10 @@ re-encodes FP8 to Q8_0 at conversion time.
 - noaux-TC sigmoid MoE routing (sigmoid scores, not softmax; L1-normalised final weights)
 
 ### Status
-Forward pass JIT-compiles and produces finite output.  Autoregressive sampling
-loop not yet wired up; no end-to-end text generation validated.
+End-to-end autoregressive generation is **validated** (as of 2026-04-06).  The
+demo script `demos/mimo_v2_flash_demo_jax.py` runs on v6e-32 (8 workers,
+`ici_tensor_parallelism=4 ici_expert_parallelism=8`) and produces coherent
+output at ~71 ms/step (~14 tok/s).
 
 Checkpoint conversion is **complete** (as of 2026-04-06).  The full pipeline ran
 using a distributed approach: worker 0 ran `convert_mimo_v2_flash.py` over all
@@ -63,6 +65,27 @@ conversion) then ran on all 8 workers to produce `mimo-v2-flash-fixed-ocdbt`
 (384 GB, 8-process OCDBT, zarr3).  Previous OCDBT checkpoint
 (`mimo-v2-flash-ocdbt`) had a bug where FP8 block scales were not applied,
 producing garbled output; use `mimo-v2-flash-fixed-ocdbt` for all inference.
+
+**Bug fixed (2026-04-06):** `query_pre_attn_scalar` was missing from the
+`Attention()` constructor call in `mimo_v2_flash.py`.  MaxText folds
+`1/sqrt(head_dim)` into the query kernel *initialisation* only; when loading
+existing HF weights the forward pass must apply this scale explicitly.  Without
+it, attention logits were `sqrt(192) ≈ 13.9×` too large, driving softmax to
+near-argmax and producing completely garbled token predictions.  Fix: added
+`query_pre_attn_scalar=cfg.head_dim**-0.5` (commit `6051205a`).
+
+### Performance (measured 2026-04-06, v6e-32)
+| Metric | Value |
+|---|---|
+| Checkpoint load | ~32 s |
+| Generation (steady-state) | **~71 ms/step (~14 tok/s)** |
+| Parallelism | TP=4 × EP=8 |
+
+### Output (validated 2026-04-06)
+```
+2. But what if we are in binary? In binary, 1+1=10, which is 2 in decimal. So the answer depends on the context.
+```
+Coherent — matches HF reference output for the same prompt.
 
 ### Key command
 ```bash
