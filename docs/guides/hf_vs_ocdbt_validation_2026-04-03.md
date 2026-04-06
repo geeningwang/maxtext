@@ -46,6 +46,11 @@ Conclusion: direct HF values and OCDBT values are equivalent for all validated t
    and any other variant confirmed during A/B testing on 2026-04-03.
    **To stop a background validator process: simply launch a fresh one without trying to
    stop the old one first — or reboot the worker VM if a clean state is required.**
+
+   > **Update 2026-04-06:** SSH keys were regenerated on this date (`ssh-keygen` +
+   > `gcloud compute os-login ssh-keys add`).  After re-keying, `kill <pid>` sent via
+   > `--command=` works reliably.  Avoid `pkill -f` (kills by pattern across all users)
+   > but `kill <specific-pid>` is safe to use in `--command=` strings.
 3. If `ssh` returns code `255`, respawn ssh-agent and re-add key:
 
 ```bash

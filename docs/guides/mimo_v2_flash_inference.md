@@ -76,7 +76,17 @@ unbiased sigmoid scores, then L1-normalised.
    ```bash
    cd maxtext && pip install -e "src/[gpu]"
    ```
-3. HuggingFace `transformers`, `safetensors`, and `huggingface_hub`:
+3. Checkpoint conversion dependencies (`zarr`, `numcodecs`, `tqdm` — required for
+   conversion scripts; usually installed as part of the MaxText venv but can be
+   added explicitly):
+   ```bash
+   pip install zarr numcodecs tqdm safetensors
+   ```
+   > **Note:** `torch` is **not** required for the conversion scripts.  They read
+   > safetensors shards via the numpy framework (`framework="np"`) and use
+   > `ml_dtypes` for FP8/bfloat16 dtypes.
+4. HuggingFace libraries (required for the demo scripts and
+   `--download_from_hub` mode only):
    ```bash
    pip install transformers safetensors huggingface_hub
    ```
@@ -151,9 +161,61 @@ The conversion:
 - Stacks per-expert MoE weights into `(num_experts, dim_in, dim_out)` tensors
 - Saves an Orbax/zarr2 checkpoint compatible with MaxText's parameter loader
 
----
+### Distributed conversion (8 workers in parallel — recommended for speed)
 
-## Step 1b: Convert zarr2 Checkpoint to OCDBT Format (Recommended)
+On a v6e-32 (or any 8-worker TPU slice) you can cut conversion time ~8× by
+running `convert_mimo_v2_flash_distributed.py`, which splits the 48 decoder
+layers across all 8 workers while worker 0 also writes the global weights
+(embeddings, final norm, lm_head).
+
+**Phase 1 — run on all 8 workers simultaneously:**
+
+```bash
+# worker 0: all layers + global weights (launched first, runs the longest)
+gcloud compute tpus tpu-vm ssh <tpu-node> --zone=<zone> --worker=0 \
+  --command='nohup ~/maxtext/maxtext_venv/bin/python3 -u \
+    -m maxtext.checkpoint_conversion.standalone_scripts.convert_mimo_v2_flash \
+    --base_model_path /path/to/hf-model \
+    --maxtext_model_path gs://<bucket>/mimo-v2-flash/checkpoints/0/items \
+    --streaming_save > /tmp/convert_w0.log 2>&1 &'
+
+# workers 1–7: each handles an exclusive 3-layer slice (no global weights)
+# Adjust --layer_start / --layer_end / --worker_rank per worker:
+gcloud compute tpus tpu-vm ssh <tpu-node> --zone=<zone> --worker=1 \
+  --command='nohup ~/maxtext/maxtext_venv/bin/python3 -u \
+    -m maxtext.checkpoint_conversion.standalone_scripts.convert_mimo_v2_flash_distributed \
+    --base_model_path /path/to/hf-model \
+    --maxtext_model_path gs://<bucket>/mimo-v2-flash/checkpoints/0/items \
+    --layer_start 27 --layer_end 30 --skip_global_weights \
+    --worker_rank 1 --num_workers 8 > /tmp/convert_w1.log 2>&1 &'
+```
+
+Reference layer assignments (3 layers each, from the top down):
+
+| Worker | `--layer_start` | `--layer_end` |
+|--------|----------------|---------------|
+| 1 | 27 | 30 |
+| 2 | 30 | 33 |
+| 3 | 33 | 36 |
+| 4 | 36 | 39 |
+| 5 | 39 | 42 |
+| 6 | 42 | 45 |
+| 7 | 45 | 48 |
+
+**Phase 2 — finalize metadata (run once, after all workers finish):**
+
+```bash
+gcloud compute tpus tpu-vm ssh <tpu-node> --zone=<zone> --worker=0 \
+  --command='~/maxtext/maxtext_venv/bin/python3 -u \
+    -m maxtext.checkpoint_conversion.standalone_scripts.convert_mimo_v2_flash_distributed \
+    --base_model_path /path/to/hf-model \
+    --maxtext_model_path gs://<bucket>/mimo-v2-flash/checkpoints/0/items \
+    --scan_and_finalize --num_workers 8'
+```
+
+This scans all written zarr directories, rebuilds the `tree_meta` manifest, and
+writes `_METADATA` + `commit_success.txt` to produce a valid Orbax checkpoint.
+
 
 The zarr2 checkpoint from Step 1 is fully functional but loads slowly on
 multi-host TPU slices because every host reads the entire checkpoint over GCS.
@@ -428,6 +490,7 @@ python3 -m pytest tests/unit/mimo_v2_flash_architecture_test.py \
 | Model YAML config | `src/maxtext/configs/models/mimo-v2-flash.yml` |
 | DecoderBlockType enum | `src/maxtext/common/common_types.py` |
 | Checkpoint conversion (HF→zarr2) | `src/maxtext/checkpoint_conversion/standalone_scripts/convert_mimo_v2_flash.py` |
+| Checkpoint conversion (distributed, 8 workers) | `src/maxtext/checkpoint_conversion/standalone_scripts/convert_mimo_v2_flash_distributed.py` |
 | Checkpoint conversion (zarr2→OCDBT) | `src/maxtext/tools/convert_checkpoint_to_ocdbt.py` |
 | Param mapping | `src/maxtext/checkpoint_conversion/utils/param_mapping.py` |
 | Unit tests | `tests/unit/mimo_v2_flash_architecture_test.py` |

@@ -52,9 +52,15 @@ re-encodes FP8 to Q8_0 at conversion time.
 
 ### Status
 Forward pass JIT-compiles and produces finite output.  Autoregressive sampling
-loop not yet wired up; no end-to-end text generation validated.  A fresh OCDBT
-checkpoint with correct FP8 dequantization (`weight_scale_inv` applied) is
-currently being generated — previous OCDBT checkpoint (`mimo-v2-flash-ocdbt`)
+loop not yet wired up; no end-to-end text generation validated.
+
+Checkpoint conversion is in progress using a distributed approach:
+worker 0 runs `convert_mimo_v2_flash.py --streaming_save` over all 48 layers
+(plus global weights); workers 1–7 run `convert_mimo_v2_flash_distributed.py`
+in parallel, each handling 3 layers from the upper range (layers 27–47).  After
+all workers finish, `--scan_and_finalize` writes the valid `_METADATA` file and
+Step 1b (OCDBT conversion) runs on all 8 workers to produce
+`mimo-v2-flash-fixed-ocdbt`.  Previous OCDBT checkpoint (`mimo-v2-flash-ocdbt`)
 had a bug where FP8 block scales were not applied, producing garbled output.
 
 ### Key command
@@ -81,7 +87,8 @@ gcloud compute tpus tpu-vm ssh <tpu-node> --worker=all --zone=<zone> --internal-
 
 ### Hardware
 - worker-0: AMD EPYC 9B14, 180 vCPUs, 708 GB RAM (no GPU)
-- Weights served over NFS from worker-1: `/mnt/mimo-weights` (292 GB safetensors)
+- Weights sourced from GCS: `gs://jingnw-mimo-v2-flash-us-east5/hf-model` (145 safetensors shards)
+  *(Previously served over NFS from worker-1; NFS tmpfs decommissioned 2026-04-04.)*
 
 ### Weight format
 - **On disk:** FP8 safetensors (original HF format)
@@ -217,8 +224,8 @@ All three CPU settings share the same physical cluster (`jingnw-node` TPU VM):
 | Node | IP | Role |
 |---|---|---|
 | worker-0 | — | CPU inference host (SGLang, llama.cpp) |
-| worker-1 | `10.202.0.151` | HF safetensors weights (`/mnt/mimo-weights`, 292 G tmpfs, NFS ro) |
-| worker-2 | `10.202.0.29` | GGUF Q8_0 (`/mnt/gguf-scratch`, 650 G tmpfs, NFS rw) |
+| worker-1 | `10.202.0.151` | *(NFS tmpfs decommissioned 2026-04-04; HF weights now in GCS)* |
+| worker-2 | `10.202.0.29` | *(NFS tmpfs decommissioned 2026-04-04; GGUF re-encode not applicable — use GCS source)* |
 
 The TPU setting uses a separate `jingnw-node` TPU VM slice (v6e or Ironwood)
 with weights stored in GCS (`gs://jingnw-mimo-v2-flash-us-east5/`).
