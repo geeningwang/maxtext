@@ -307,6 +307,8 @@ def convert_hf_to_maxtext(
     params: dict,
     tmpdir: str | None = None,
     on_layer_complete: "callable | None" = None,
+    layer_range: "tuple[int, int] | None" = None,
+    skip_global_weights: bool = False,
 ) -> dict:
     """Load and convert HF safetensors weights to a nested MaxText dict.
 
@@ -321,6 +323,14 @@ def convert_hf_to_maxtext(
         base_model_path: Directory containing ``*.safetensors`` shards.
         params: Model parameter dict from ``MODEL_PARAMS``.
         tmpdir: Optional scratch directory for memmap files (streaming mode).
+        on_layer_complete: Optional callback called after each layer is converted.
+        layer_range: Optional ``(start, end)`` tuple (end exclusive) to limit
+            which decoder layers this call processes.  Layers outside the range
+            are skipped entirely (no shard I/O).  Used by the distributed
+            converter to partition work across workers.
+        skip_global_weights: If True, skip loading the globally-shared weights
+            (embeddings, decoder norm, lm_head).  Used by non-zero ranks in
+            distributed mode where rank 0 handles global weights.
 
     Returns:
         Nested dict of numpy arrays (or memmaps) ready for Orbax checkpoint save.
@@ -377,28 +387,32 @@ def convert_hf_to_maxtext(
     ]
     max_logging.log("[global] Loading shared weights (embed_tokens, norm, lm_head)...")
     print("[convert] [global] Loading shared weights (embed_tokens, norm, lm_head)...", flush=True)
-    shared = _load_keys_batch(shared_keys, key_to_shard, label="[global] load")
-    _apply_fp8_dequant(shared, label="[global] dequant")
-    max_logging.log(f"[global] Shared weights loaded and dequantized ({len(shared)} tensors).")
-    print(f"[convert] [global] Shared weights loaded and dequantized ({len(shared)} tensors).", flush=True)
+    if skip_global_weights:
+        max_logging.log("[global] Skipping global weights (skip_global_weights=True).")
+        print("[convert] [global] Skipping global weights (non-rank-0 worker).", flush=True)
+    else:
+        shared = _load_keys_batch(shared_keys, key_to_shard, label="[global] load")
+        _apply_fp8_dequant(shared, label="[global] dequant")
+        max_logging.log(f"[global] Shared weights loaded and dequantized ({len(shared)} tensors).")
+        print(f"[convert] [global] Shared weights loaded and dequantized ({len(shared)} tensors).", flush=True)
 
-    emb = shared.get("model.embed_tokens.weight")
-    if emb is not None:
-        flat["token_embedder.embedding"] = _put("token_embedder.embedding", emb)
+        emb = shared.get("model.embed_tokens.weight")
+        if emb is not None:
+            flat["token_embedder.embedding"] = _put("token_embedder.embedding", emb)
 
-    norm = shared.get("model.norm.weight")
-    if norm is not None:
-        flat["decoder.decoder_norm.scale"] = _put("decoder.decoder_norm.scale", norm)
+        norm = shared.get("model.norm.weight")
+        if norm is not None:
+            flat["decoder.decoder_norm.scale"] = _put("decoder.decoder_norm.scale", norm)
 
-    lm = shared.get("lm_head.weight")
-    if lm is not None:
-        # HF: (vocab, hidden) → MaxText kernel: (hidden, vocab)
-        flat["decoder.logits_dense.kernel"] = _put(
-            "decoder.logits_dense.kernel", lm.T
-        )
+        lm = shared.get("lm_head.weight")
+        if lm is not None:
+            # HF: (vocab, hidden) → MaxText kernel: (hidden, vocab)
+            flat["decoder.logits_dense.kernel"] = _put(
+                "decoder.logits_dense.kernel", lm.T
+            )
 
-    del shared
-    gc.collect()
+        del shared
+        gc.collect()
 
     # ------------------------------------------------------------------
     # 4. Convert decoder layers one at a time
@@ -407,6 +421,10 @@ def convert_hf_to_maxtext(
     _convert_start = time.monotonic()
 
     for i in tqdm(range(num_layers), desc="Converting decoder layers"):
+        # Skip layers outside this worker's assigned range.
+        if layer_range is not None and not (layer_range[0] <= i < layer_range[1]):
+            continue
+
         _t0 = time.monotonic()
         hf = f"model.layers.{i}"
         mt = f"decoder.layers.{i}"
