@@ -66,7 +66,6 @@ import time
 from collections.abc import Iterable
 
 import numpy as np
-import torch
 from safetensors import safe_open
 from tqdm import tqdm
 
