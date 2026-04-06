@@ -117,7 +117,7 @@ def _build_shard_index(shard_paths: list[pathlib.Path]) -> dict[str, pathlib.Pat
     """
     key_to_shard: dict[str, pathlib.Path] = {}
     for shard_path in tqdm(shard_paths, desc="Indexing shards"):
-        with safe_open(shard_path, framework="pt", device="cpu") as f:
+        with safe_open(shard_path, framework="np") as f:
             for key in f.keys():
                 key_to_shard[key] = shard_path
     return key_to_shard
@@ -150,11 +150,11 @@ def _load_keys_batch(
             f"[convert] {label}  opening shard {idx+1}/{total_shards} ({shard_name}, {len(batch)} keys)  keys_so_far={keys_loaded}",
             flush=True,
         )
-        with safe_open(shard_path, framework="pt", device="cpu") as f:
+        with safe_open(shard_path, framework="np") as f:
             for ki, key in enumerate(batch):
-                # .float() handles fp8/fp16/bf16 → float32; numpy() works on float32.
+                # .astype(float32) handles fp8/fp16/bf16 → float32 via ml_dtypes.
                 # Then astype(_BF16) downcasts to bf16 via ml_dtypes.
-                arr_f32 = f.get_tensor(key).float().numpy()
+                arr_f32 = f.get_tensor(key).astype(np.float32)
                 tensors[key] = arr_f32.astype(_BF16) if _BF16 is not None else arr_f32
                 keys_loaded += 1
                 if progress_every > 0 and (ki + 1) % progress_every == 0:
