@@ -250,13 +250,17 @@ def _load_weights_fp8_to_bf16(model, model_path: str):
     — e.g. k_proj uses 96×128 blocks, not 128×128).
     Peak overhead: ~max_shard_size (~4 GB) on top of the ~620 GB BF16 model.
     """
+    import gzip
     import json
     import torch
     from safetensors import safe_open
     from accelerate.utils import set_module_tensor_to_device
 
     index_path = os.path.join(model_path, "model.safetensors.index.json")
-    with open(index_path) as f:
+    with open(index_path, "rb") as _f:
+        _magic = _f.read(2)
+    _open_index = gzip.open if _magic == b'\x1f\x8b' else open
+    with _open_index(index_path, "rt") as f:
         index = json.load(f)
     weight_map = index["weight_map"]  # tensor_name → shard_filename
 
