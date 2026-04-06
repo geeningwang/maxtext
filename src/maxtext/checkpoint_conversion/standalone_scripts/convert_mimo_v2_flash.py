@@ -76,6 +76,17 @@ from maxtext.utils import max_logging
 try:
     import ml_dtypes  # pylint: disable=import-outside-toplevel
     _BF16 = ml_dtypes.bfloat16
+    # safetensors 0.7+ uses np.float8_e4m3fn / np.bfloat16 as attribute lookups.
+    # numpy<2.1 and numpy 2.x don't expose these as top-level attributes, but
+    # ml_dtypes provides them.  Monkey-patch numpy so safetensors can find them.
+    for _fp8_name in (
+        "bfloat16",
+        "float8_e4m3fn", "float8_e4m3fnuz",
+        "float8_e3m4", "float8_e4m3b11fnuz",
+        "float8_e5m2", "float8_e5m2fnuz",
+    ):
+        if not hasattr(np, _fp8_name) and hasattr(ml_dtypes, _fp8_name):
+            setattr(np, _fp8_name, getattr(ml_dtypes, _fp8_name))
 except ImportError:
     _BF16 = None  # fall back to float32 in _MemmapStore
 
