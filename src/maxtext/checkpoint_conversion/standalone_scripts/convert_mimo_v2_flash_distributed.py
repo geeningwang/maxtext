@@ -145,6 +145,8 @@ def convert_and_save_worker(
     worker_rank: int,
     num_workers: int,
     step: int = 0,
+    explicit_layer_range: "tuple[int, int] | None" = None,
+    explicit_skip_global: "bool | None" = None,
 ) -> None:
     """Convert and save the layers owned by this worker.
 
@@ -157,10 +159,14 @@ def convert_and_save_worker(
     import numcodecs  # pylint: disable=import-outside-toplevel
 
     num_layers = params["num_hidden_layers"]
-    layer_start, layer_end = _layer_range_for_worker(worker_rank, num_workers, num_layers)
+    if explicit_layer_range is not None:
+        layer_start, layer_end = explicit_layer_range
+    else:
+        layer_start, layer_end = _layer_range_for_worker(worker_rank, num_workers, num_layers)
+    is_global_writer = explicit_skip_global is False or (explicit_skip_global is None and worker_rank == 0)
     max_logging.log(
         f"[worker {worker_rank}/{num_workers-1}] Assigned layers {layer_start}–{layer_end-1} "
-        f"(+ global weights: {worker_rank == 0})"
+        f"(+ global weights: {is_global_writer})"
     )
     print(
         f"[convert] [worker {worker_rank}/{num_workers-1}] layers {layer_start}–{layer_end-1}",
@@ -212,7 +218,7 @@ def convert_and_save_worker(
         tmpdir=None,
         on_layer_complete=_on_layer_complete,
         layer_range=(layer_start, layer_end),
-        skip_global_weights=(worker_rank != 0),
+        skip_global_weights=(not is_global_writer),
     )
 
     # Write global weights returned in flat (rank 0 only; others return empty).
@@ -237,6 +243,49 @@ def convert_and_save_worker(
         f"[convert] [worker {worker_rank}] Done. {arrays_written[0]} arrays written.",
         flush=True,
     )
+
+
+def scan_and_finalize_checkpoint(
+    maxtext_model_path: str,
+    step: int = 0,
+) -> None:
+    """Rebuild _METADATA by scanning all zarr arrays written to the items dir.
+
+    Use this when partial_meta_*.json files are unavailable (e.g. worker 0 ran
+    the single-worker script) or when you want a full consistency pass.
+    Every subdirectory under items/ that contains a .zarray file is treated as
+    a parameter array.  The key is derived from the directory name by stripping
+    the leading 'params.params.' prefix.
+    """
+    root = pathlib.Path(maxtext_model_path)
+    step_dir = root / str(step)
+    items_dir = step_dir / "items"
+
+    if not items_dir.exists():
+        raise FileNotFoundError(f"items dir not found: {items_dir}")
+
+    tree_meta: dict = {}
+    scanned = 0
+    for zarray_file in sorted(items_dir.rglob(".zarray")):
+        zarr_dir = zarray_file.parent
+        zarr_name = zarr_dir.relative_to(items_dir).as_posix()  # e.g. params.params.decoder.layers.0.mlp.wo
+        if not zarr_name.startswith("params.params."):
+            continue
+        key = zarr_name[len("params.params."):]  # e.g. decoder.layers.0.mlp.wo
+        key_parts = ["params", "params"] + key.split(".")
+        tree_meta[str(tuple(key_parts))] = {
+            "key_metadata": [{"key": p, "key_type": 2} for p in key_parts],
+            "value_metadata": {"value_type": "np.ndarray", "skip_deserialize": False},
+        }
+        scanned += 1
+
+    max_logging.log(f"[scan_finalize] Scanned {scanned} zarr arrays from {items_dir}")
+    print(f"[convert] [scan_finalize] Found {scanned} arrays, writing _METADATA...", flush=True)
+
+    init_ts = int(step_dir.stat().st_mtime * 1e9) if step_dir.exists() else time.time_ns()
+    _write_checkpoint_metadata(step_dir, items_dir, tree_meta, init_ts, scanned)
+    max_logging.log(f"[scan_finalize] Checkpoint finalised at {step_dir}")
+    print(f"[convert] [scan_finalize] Done. Checkpoint at {step_dir}", flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -302,6 +351,10 @@ def main(args) -> None:
         finalize_checkpoint(args.maxtext_model_path, args.num_workers)
         return
 
+    if args.scan_and_finalize:
+        scan_and_finalize_checkpoint(args.maxtext_model_path)
+        return
+
     # Resolve worker rank.
     worker_rank = args.worker_rank
     if args.auto_rank:
@@ -322,12 +375,26 @@ def main(args) -> None:
     if worker_rank is None:
         raise ValueError("Provide --worker_rank or --auto_rank.")
 
+    # Explicit layer_start/layer_end override the automatic rank-based split.
+    if args.layer_start is not None and args.layer_end is not None:
+        explicit_range = (args.layer_start, args.layer_end)
+        explicit_skip_global = args.skip_global_weights
+        max_logging.log(
+            f"[worker {worker_rank}] Explicit layer range: {args.layer_start}–{args.layer_end-1} "
+            f"skip_global={explicit_skip_global}"
+        )
+    else:
+        explicit_range = None
+        explicit_skip_global = (worker_rank != 0)  # rank-based default: only rank 0 writes globals
+
     convert_and_save_worker(
         base_model_path=args.base_model_path,
         maxtext_model_path=args.maxtext_model_path,
         params=params,
         worker_rank=worker_rank,
         num_workers=args.num_workers,
+        explicit_layer_range=explicit_range,
+        explicit_skip_global=explicit_skip_global,
     )
 
 
@@ -382,6 +449,35 @@ if __name__ == "__main__":
         help=(
             "Phase 2: merge partial_meta_*.json files and write final _METADATA / "
             "commit_success.txt.  Run on worker 0 only AFTER all phase-1 jobs complete."
+        ),
+    )
+
+    parser.add_argument(
+        "--layer_start",
+        type=int,
+        default=None,
+        help="Explicit start layer (inclusive). Overrides rank-based split when combined with --layer_end.",
+    )
+    parser.add_argument(
+        "--layer_end",
+        type=int,
+        default=None,
+        help="Explicit end layer (exclusive). Overrides rank-based split when combined with --layer_start.",
+    )
+    parser.add_argument(
+        "--skip_global_weights",
+        action="store_true",
+        default=False,
+        help="Skip writing embeddings/decoder_norm/lm_head. Use for non-rank-0 workers with explicit ranges.",
+    )
+    parser.add_argument(
+        "--scan_and_finalize",
+        action="store_true",
+        default=False,
+        help=(
+            "Rebuild _METADATA by scanning all .zarray files in the items dir. "
+            "Use when partial_meta files are not available (e.g. worker 0 ran "
+            "the single-worker script). Safe to run at any time after all arrays are written."
         ),
     )
 
