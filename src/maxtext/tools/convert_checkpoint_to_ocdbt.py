@@ -41,8 +41,13 @@ from maxtext.utils import max_utils
 from maxtext.utils import max_logging
 
 
-# Output GCS path for the converted OCDBT checkpoint
-_OCDBT_OUTPUT_PATH = "gs://jingnw-mimo-v2-flash-us-east5/mimo-v2-flash-ocdbt/checkpoints/0/items"
+# Output GCS path for the converted OCDBT checkpoint.
+# Override via OCDBT_OUTPUT_PATH env var, e.g.:
+#   OCDBT_OUTPUT_PATH=gs://bucket/new-ocdbt/checkpoints/0/items python3 -m ...
+_OCDBT_OUTPUT_PATH = os.environ.get(
+    "OCDBT_OUTPUT_PATH",
+    "gs://jingnw-mimo-v2-flash-us-east5/mimo-v2-flash-ocdbt/checkpoints/0/items",
+)
 
 
 def main(argv: Sequence[str]) -> None:
