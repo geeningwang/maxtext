@@ -155,6 +155,11 @@ def main(argv: Sequence[str]) -> None:
     has_chat_template = getattr(tokenizer_model.tokenizer, "chat_template", False)  # pytype: disable=attribute-error
   except AttributeError as _:
     has_chat_template = False
+  if config.use_chat_template and has_chat_template:
+    messages = [{"role": "user", "content": text}]
+    text = tokenizer_model.tokenizer.apply_chat_template(  # pytype: disable=attribute-error
+        messages, tokenize=False, add_generation_prompt=True
+    )
   tokens, true_length = tokenizer_model.encode(text, is_bos=not has_chat_template, prefill_lengths=[prefill_length])
 
   position_ids = None
@@ -231,6 +236,7 @@ def main(argv: Sequence[str]) -> None:
   steps = range(config.max_prefill_predict_length, config.max_target_length)
   sampled_tokens_list.append(_batch_first_result_token(first_token_list, batch_size))
   _t_gen_start = time.perf_counter()
+  _eos_token_id = getattr(getattr(tokenizer_model, "tokenizer", None), "eos_token_id", None)
   for i in steps:
     rng, rng_generate = jax.random.split(rng)
     with jax.profiler.StepTraceAnnotation("generate", step=i):
@@ -248,6 +254,13 @@ def main(argv: Sequence[str]) -> None:
       prof_deactivated = True
 
     sampled_tokens_list.append(sampled_tokens)
+
+    # Early-stop when EOS is generated (slot 0, stream 0).
+    if _eos_token_id is not None:
+      _tok = sampled_tokens.get_result_at_slot(0).tokens.item()
+      if _tok == _eos_token_id:
+        print(f"[INFO] EOS token ({_eos_token_id}) generated at step {i}; stopping early.", flush=True)
+        break
 
   _gen_total_s = time.perf_counter() - _t_gen_start
   print(

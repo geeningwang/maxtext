@@ -173,6 +173,11 @@ def build_decode_command(
         # Checkpoint format: zarr3 + OCDBT (produced by convert_checkpoint_to_ocdbt.py)
         "checkpoint_storage_use_ocdbt=true",
         "checkpoint_storage_use_zarr3=true",
+        # Apply the tokenizer chat template so the model produces a single
+        # assistant turn ending with <|im_end|> (EOS), rather than open-ended
+        # text completion.  decode.py will call apply_chat_template() when this
+        # flag is set.  Falls back to raw prompt if the tokenizer has no template.
+        "use_chat_template=true",
     ]
     return cmd
 
@@ -216,7 +221,20 @@ def run_inference(
             f"MaxText inference failed (exit code {result.returncode}).\n"
             f"Stderr:\n{textwrap.indent(stderr, '  ')}"
         )
-    return result.stdout
+    # Truncate generated text at EOS token (<|im_end|>) so callers see only
+    # the clean assistant response, not padding tokens generated after EOS.
+    stdout = result.stdout
+    eos = "<|im_end|>"
+    if eos in stdout:
+        # The output line is: Input `<prompt>` -> `<generated>`
+        # Truncate only inside the generated portion.
+        arrow = " -> `"
+        arrow_idx = stdout.find(arrow)
+        if arrow_idx != -1:
+            eos_idx = stdout.find(eos, arrow_idx)
+            if eos_idx != -1:
+                stdout = stdout[:eos_idx] + "` [EOS]\n" + stdout[stdout.find("\n", eos_idx) + 1:]
+    return stdout
 
 
 def dry_run(checkpoint_path: str, tokenizer_path: str):
