@@ -401,6 +401,7 @@ def generate(
     max_new_tokens: int = 128,
     temperature: float = 0.0,
     top_p: float = 1.0,
+    repetition_penalty: float = 1.3,
 ) -> str:
     """Run greedy (temperature=0) or sampled generation."""
     import torch
@@ -411,6 +412,7 @@ def generate(
     gen_kwargs = {
         "max_new_tokens": max_new_tokens,
         "do_sample": temperature > 0.0,
+        "repetition_penalty": repetition_penalty,
     }
     if temperature > 0.0:
         gen_kwargs["temperature"] = temperature
@@ -452,6 +454,8 @@ def main():
     p.add_argument("--temperature", type=float, default=0.0,
                    help="Sampling temperature; 0.0 = greedy decoding.")
     p.add_argument("--top_p", type=float, default=1.0)
+    p.add_argument("--repetition_penalty", type=float, default=1.3,
+                   help="Repetition penalty (1.0 = off, 1.3 = recommended for greedy).")
     args = p.parse_args()
 
     tokenizer, model = load_model(args.model_path)
@@ -463,6 +467,7 @@ def main():
         max_new_tokens=args.max_new_tokens,
         temperature=args.temperature,
         top_p=args.top_p,
+        repetition_penalty=args.repetition_penalty,
     )
     print(f"Output:\n{output}")
 
