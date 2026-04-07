@@ -406,7 +406,13 @@ def generate(
     """Run greedy (temperature=0) or sampled generation."""
     import torch
 
-    inputs = tokenizer(prompt, return_tensors="pt")
+    # Format as a proper chat turn so the model produces a single assistant
+    # response ending with <|im_end|>, rather than free-form text completion.
+    messages = [{"role": "user", "content": prompt}]
+    formatted = tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
+    inputs = tokenizer(formatted, return_tensors="pt")
     input_ids = inputs["input_ids"]
 
     gen_kwargs = {
