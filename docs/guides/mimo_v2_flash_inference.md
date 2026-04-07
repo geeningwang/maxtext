@@ -345,15 +345,22 @@ gcloud compute tpus tpu-vm ssh <tpu-node> --zone=<zone> --worker=all \
 
 ### HuggingFace reference baseline
 
-For a PyTorch/CPU/GPU reference, use the HF demo:
+For a PyTorch/CPU reference, use the HF demo:
 
 ```bash
 python3 demos/mimo_v2_flash_demo_hf.py \
-    --model_path XiaomiMiMo/MiMo-V2-Flash \
+    --model_path /path/to/hf-model \
     --prompt "Explain backpropagation step by step." \
-    --max_new_tokens 128 \
-    --load_in_4bit   # reduces VRAM to ~80 GB with bitsandbytes
+    --max_new_tokens 2000
 ```
+
+The demo automatically wraps the prompt via `tokenizer.apply_chat_template()` so
+generation ends at `<|im_end|>` rather than running to `max_new_tokens`.
+Typical responses stop well under 500 tokens for reasoning questions.
+
+> **Note:** `model.config.eos_token_id` is `null` in the published weights — the
+> demo explicitly passes `eos_token_id=tokenizer.eos_token_id` to `generate()` to
+> compensate.
 
 ---
 

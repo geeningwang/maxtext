@@ -128,27 +128,54 @@ None to the HF model code. The demo script handles:
 - `ROPE_INIT_FUNCTIONS['default']` shim for Transformers 5.x compatibility
 - `eager_attention_forward` / `compute_default_rope_parameters` monkey-patches
 - Custom `_load_weights_fp8_to_bf16()` shard streamer (avoids `FineGrainedFP8HfQuantizer` 730 GB peak)
+- `tokenizer.apply_chat_template()` to format prompts as proper chat turns (ensures EOS is emitted)
+- Explicit `eos_token_id=tokenizer.eos_token_id` passed to `generate()` (model `config.json` has `eos_token_id: null`)
 
 ### Key command
 ```bash
 python3 demos/mimo_v2_flash_demo_hf.py \
   --model_path /mnt/mimo-weights \
-  --prompt "What is 1+1? The answer is " \
-  --max_new_tokens 10
+  --prompt "What is 1+1?" \
+  --max_new_tokens 2000
 ```
 
-### Performance (measured 2026-04-05)
+The prompt is automatically wrapped via `tokenizer.apply_chat_template()` into:
+```
+<|im_start|>user\nWhat is 1+1?<|im_end|>\n<|im_start|>assistant\n
+```
+This causes the model to produce a single assistant turn ending with `<|im_end|>` (EOS),
+rather than open-ended text completion that runs to `max_new_tokens`.
+
+### Performance (measured 2026-04-07)
 | Metric | Value |
 |---|---|
 | Skeleton init (meta device) | ~13s, ~0 GB |
 | Weight streaming (145 shards) | ~3.5 min, peak ~540 GB RSS |
-| Generation (10 tokens) | 8.83s, **1.1 tok/s** |
+| Generation (EOS-terminated) | 82.74s, **1.9 tok/s**, 156 tokens |
 
-### Output (validated 2026-04-05)
+### Output (validated 2026-04-07)
 ```
-2. But what if we consider it in a
+Of course! The answer to "what is 1 + 1" depends on the context.
+
+**In basic arithmetic:**
+The sum of one plus one is **two (2)**.
+
+However, this simple question can have more complex answers in different fields:
+
+*   In binary code:
+    `1` + `1` = `10`
+
+*   If you combine two drops of water:
+    You get one larger drop of water (`1 + 1 = 1`).
+
+*   In Boolean logic:
+    True OR True equals True.
+
+So while the most common and expected mathematical answer is **2**, there are
+other valid interpretations depending on the system being used.
 ```
-Coherent output — FP8 weights correctly dequantized to BF16 using `weight_scale_inv` block scales.
+Model stopped cleanly at EOS after 156 tokens — FP8 weights correctly dequantized,
+chat template correctly applied.
 
 ---
 
