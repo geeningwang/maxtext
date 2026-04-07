@@ -413,6 +413,7 @@ def generate(
         "max_new_tokens": max_new_tokens,
         "do_sample": temperature > 0.0,
         "repetition_penalty": repetition_penalty,
+        "eos_token_id": tokenizer.eos_token_id,
     }
     if temperature > 0.0:
         gen_kwargs["temperature"] = temperature
