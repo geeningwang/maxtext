@@ -5,10 +5,11 @@ Benchmarks use `src/maxtext/inference/scripts/mimo_v2_flash_bench.py`
 
 ### Benchmark history
 
-| Date | Optimisation applied | Median step | Throughput | Per-seq |
-|---|---|---|---|---|
-| 2026-04-08 | Baseline (no opt) | 71.7 ms | 446.6 tok/s | 2.2 ms/tok |
-| 2026-04-08 | **#1 Remove `jax.debug.print`** ✅ | **56.5 ms** | **566.1 tok/s** | **1.8 ms/tok** |
+| Date | Optimisation applied | Median step | Throughput | Per-seq | Status |
+|---|---|---|---|---|---|
+| 2026-04-08 | Baseline (no opt) | 71.7 ms | 446.6 tok/s | 2.2 ms/tok | — |
+| 2026-04-08 | **#1 Remove `jax.debug.print`** | **56.5 ms** | **566.1 tok/s** | **1.8 ms/tok** | ✅ |
+| 2026-04-08 | #2 Sparse MoE dispatch | — | — | — | ❌ Blocked |
 
 Removing a single debug line eliminated 47 host–device sync barriers per step
 (one per MoE layer), cutting step latency by **21 %** and boosting throughput
@@ -32,21 +33,38 @@ was 47 host roundtrips *per token*.
 
 ---
 
-### 2. Dense MoE dispatch (all 256 experts computed per step)
+### 2. Dense MoE dispatch (all E_local = E/EP = 32 experts computed per token) — ❌ Blocked
 
-`MiMoV2FlashSparseMoeBlock.__call__` uses:
+Each EP shard holds `E_local = 256/8 = 32` experts.  The current dense einsum:
 
 ```python
-gate = jax.nn.silu(jnp.einsum("th,ehi->eti", tokens_fp, wi_0))  # (256, T, I) — all experts
+gate = jax.nn.silu(jnp.einsum("th,ehi->eti", tokens_fp, wi_0))  # (E_local, T, I)
 ```
 
-This dense einsum computes a gemm for **all 256 experts** even though only 8
-are selected per token.  The MaxText config has `megablox=true` /
-`sparse_matmul=true` but the model bypasses it entirely.  During decode
-(T = 1 token) this is 256 gemv ops instead of 8.
+computes all 32 local experts × all T=32 tokens = 1024 (token, expert) pairs per
+device per step, even though only `K × T / E_total = 8 × 32 / 256 = 1` local
+expert is selected per device on average.  This wastes ~31 of 32 expert
+matmuls per device per step (~32× excess compute).
 
-**Fix**: Replace with MaxText's built-in MegaBlox sparse dispatch path or a
-sparse gather–scatter approach over only the top-8 experts.
+**Attempted fix**: Gather-based sparse dispatch (`wi_0[top_k_indices]`) computing
+only K=8 expert slices per token instead of E=256.
+
+**Why it failed (OOM)**:
+- The gather creates `(T, K, H_local, I) = (32, 8, 1024, 2048)` temporaries ≈ 1 GB each
+- With `scan_layers=False` (47 layers fully unrolled), XLA must hold all 47 × 3 = 141
+  matrice intermediates simultaneously → **22 GB HLO temp, 10 GB over the 31.25 GB HBM limit**
+- `scan_layers=True` would bound peak to ~3 GB/layer, but MiMo layers require a
+  per-layer `layer_idx` constructor argument that is incompatible with the scan wrapper
+
+**Correct fix** (requires larger refactoring):
+Use MaxText's **`megablox.gmm`** grouped-matmul kernel (already in `src/maxtext/layers/moe.py`):
+1. Sort tokens by expert assignment within each EP shard
+2. Use `mblx.gmm(tokens_sorted, wi_0, group_sizes)` — a Pallas kernel that avoids
+   materializing the full `(T, K, H, I)` weight gather
+3. `psum_scatter` the output across EP devices
+This pattern is already used by MaxText's `MoeBlock` for Llama4, DeepSeek3, Mixtral, etc.
+Integrating it for MiMo requires adapting the NNX-based `MiMoV2FlashSparseMoeBlock`
+to call `sparse_matmul()` with the gate's `dispatch_mask` and `combine_mask`.
 
 ---
 
