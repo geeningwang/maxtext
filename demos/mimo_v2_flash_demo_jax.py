@@ -211,15 +211,16 @@ def run_inference(
 
     result = subprocess.run(
         cmd,
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=None if verbose else subprocess.PIPE,
         text=True,
         check=False,
     )
     if verbose:
-        print(result.stderr, end="", file=sys.stderr, flush=True)
-        print(result.stdout, end="", flush=True)
+        # stderr was streamed live to terminal; echo the stdout (Input -> line) too.
+        print(result.stdout or "", end="", flush=True)
     if result.returncode != 0:
-        stderr = result.stderr or ""
+        stderr = result.stderr or "(stderr streamed to terminal)"
         raise RuntimeError(
             f"MaxText inference failed (exit code {result.returncode}).\n"
             f"Stderr:\n{textwrap.indent(stderr, '  ')}"
