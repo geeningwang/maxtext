@@ -44,14 +44,12 @@ After the tool completes, verify a couple of tensor shapes:
   "
 """
 
-import gc
 import os
 import socket
 from typing import Sequence
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 import orbax.checkpoint as ocp
 from absl import app
 
@@ -110,27 +108,33 @@ def _probe_hbm(label: str) -> None:
       print(f"[HBM] {label:<45s} N/A: {e}", flush=True)
 
 
+def _stack_donated(*pytrees):
+  """Stack pytrees along axis 0 with donate_argnums — net HBM change ≈ 0.
+
+  Marks all input pytrees as donated, so XLA reuses their device buffers for
+  the stacked output.  Works with multihost sharded jax.Arrays because
+  donation operates per-device (no cross-host transfers).
+  """
+  n = len(pytrees)
+  return jax.jit(
+      lambda *args: jax.tree_util.tree_map(lambda *xs: jnp.stack(xs, axis=0), *args),
+      donate_argnums=tuple(range(n)),
+  )(*pytrees)
+
+
 def _rearrange_params(raw_params: dict) -> dict:
   """Rearrange flat per-layer params into the four-phase scan-ready layout.
 
-  Strategy: immediately transfer all device (HBM) params to CPU numpy, then
-  free the device buffers.  All stacking is done with ``np.stack`` on CPU
-  (host memory).  This keeps peak HBM ≈ 0 during conversion — only the final
-  ``save_ckptr.save`` step re-uploads the stacked arrays to device.
+  Strategy: use jit+donate_argnums for each stack operation so XLA immediately
+  reuses the donated input buffers for the output.  Peak HBM stays ≈ constant
+  (one stacked group replaces its source layers in-place on device).
 
-  Peak CPU RAM required: ~2×18 GiB ≈ 36 GiB (flat + stacked in host memory
-  simultaneously).  That is fine on a TPU worker VM (≥128 GiB RAM).
+  Works on multihost sharded jax.Arrays — donation is per-device; no
+  cross-host transfers needed.
   """
-  _probe_hbm("before_device_get")
-  max_logging.log("Stack tool: transferring flat params to CPU numpy (freeing HBM) ...")
-  np_params = jax.device_get(raw_params)  # nested dict of numpy arrays on CPU
-  del raw_params                           # drop device reference; trigger HBM free
-  jax.effects_barrier()                   # ensure device buffers are released
-  gc.collect()
-  _probe_hbm("after_device_get (HBM should be ~0)")
+  _probe_hbm("before rearrange")
 
-  # Navigate to the layers dict (all numpy now, no HBM pressure).
-  outer = dict(np_params)
+  outer = dict(raw_params)
   inner_params = dict(outer.pop("params"))
   decoder = dict(inner_params.pop("decoder"))
   flat_layers = dict(decoder.pop("layers"))
@@ -141,19 +145,22 @@ def _rearrange_params(raw_params: dict) -> dict:
 
   # ---- Phase B ----
   max_logging.log(f"Stack tool: Phase B — stacking layers {_PHASE_B_INDICES} → (4, ...)")
+  _probe_hbm("before Phase B stack")
   phase_b_list = [flat_layers.pop(str(i)) for i in _PHASE_B_INDICES]
-  layers_b = jax.tree_util.tree_map(lambda *xs: np.stack(xs, axis=0), *phase_b_list)
-  del phase_b_list
+  layers_b = _stack_donated(*phase_b_list)
+  del phase_b_list  # Python refs dropped; XLA buffers already donated
+  _probe_hbm("after Phase B stack (inputs donated)")
 
   # ---- Phase C ----
   layers_c: dict = {}
   for pos, indices in enumerate(_PHASE_C_POSITIONS):
     max_logging.log(f"Stack tool: Phase C pos {pos} — stacking layers {indices} → (7, ...)")
+    _probe_hbm(f"before Phase C pos {pos}")
     pos_layers = [flat_layers.pop(str(i)) for i in indices]
-    stacked = jax.tree_util.tree_map(lambda *xs: np.stack(xs, axis=0), *pos_layers)
-    del pos_layers
+    stacked = _stack_donated(*pos_layers)
+    del pos_layers  # Python refs dropped; XLA buffers already donated
     layers_c[f"layers_{pos}"] = stacked
-    _probe_hbm(f"after Phase C pos {pos} (CPU stack, HBM unchanged)")
+    _probe_hbm(f"after Phase C pos {pos} (inputs donated)")
 
   # ---- Phase D ----
   max_logging.log("Stack tool: Phase D — layer 47 (unique; no stacking)")
@@ -173,7 +180,7 @@ def _rearrange_params(raw_params: dict) -> dict:
 
   inner_params["decoder"] = decoder
   outer["params"] = inner_params
-  _probe_hbm("after full numpy rearrangement (before save)")
+  _probe_hbm("after full rearrangement")
   return outer
 
 
@@ -198,11 +205,11 @@ def main(argv: Sequence[str]) -> None:
   max_logging.log("Stack tool: flat params loaded successfully.")
 
   # 2. Rearrange: stack Phase B and C; rename Phase A and D.
-  # NOTE: _rearrange_params immediately transfers params to CPU numpy and frees
-  # HBM.  Stacking is done entirely on CPU.  Peak HBM during conversion ≈ 0.
+  # NOTE: _rearrange_params uses jit+donate_argnums so each stack operation
+  # reuses the input HBM buffers.  Peak HBM stays ≈ flat model size throughout.
   max_logging.log("Stack tool: rearranging params into four-phase scan layout ...")
   stacked = _rearrange_params(params)
-  del params  # already transferred to CPU inside _rearrange_params (this is a no-op)
+  del params  # Python ref dropped; donated arrays were already freed by jit
   max_logging.log("Stack tool: rearrangement complete.")
 
   # 3. Save stacked checkpoint to new OCDBT+zarr3 path.
