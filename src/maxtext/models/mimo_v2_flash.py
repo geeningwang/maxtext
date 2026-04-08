@@ -508,6 +508,12 @@ MiMoV2FlashDecoderLayerToLinen = nnx_wrappers.to_linen_class(
     base_metadata_fn=variable_to_logically_partitioned,
 )
 
+# MiMoV2FlashScannableBlockToLinen is returned by get_decoder_layers() when
+# scan_layers=True.  The actual iteration (with explicit layer_idx per layer)
+# is handled by _MiMoScanLayersScope inside Decoder.__call__ in decoders.py,
+# so this wrapper can reuse the same single-layer NNX class.
+# TODO(mimo-opt): replace with a true cyclic ScannableBlock (6-layer cycle ×
+# 7 reps + 6-layer preamble) to get peak-HBM benefit from nn.scan.
 MiMoV2FlashScannableBlockToLinen = nnx_wrappers.to_linen_class(
     MiMoV2FlashDecoderLayer,
     base_metadata_fn=variable_to_logically_partitioned,

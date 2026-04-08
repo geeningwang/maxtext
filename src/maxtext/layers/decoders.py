@@ -949,6 +949,50 @@ class Decoder(nn.Module):
               page_state,
               slot,
           )
+        elif cfg.decoder_block == DecoderBlockType.MIMO_V2_FLASH:
+          # MiMo-V2-Flash has an inhomogeneous layer structure (mixed global/SWA
+          # attention and a single dense MLP layer at index 0, all others sparse
+          # MoE), so a uniform nn.scan over all layers is not feasible without
+          # stacking heterogeneous weight shapes.  Instead we iterate layers
+          # sequentially with explicit layer_idx — identical in effect to the
+          # scan_layers=False path — and return (output, None) so that upstream
+          # callers that expect the scan-compatible tuple return work correctly.
+          #
+          # TODO(mimo-opt): implement proper cycle-scan (6-layer cycle × 7 reps
+          # + 6-layer preamble) to actually reduce peak HBM for sparse dispatch.
+          RemattedBlockLayer = RemattedBlockLayers[0]
+
+          class _MiMoScanLayersScope(nn.Module):
+            """Sequential MiMo layers for scan_layers=True; returns (out, None)."""
+
+            @nn.compact
+            def __call__(self_inner, inp, seg_ids, positions, det, m_mode):  # pylint: disable=no-self-argument
+              for lyr in range(cfg.num_decoder_layers):
+                layer = RemattedBlockLayer(
+                    config=cfg,
+                    mesh=mesh,
+                    name=str(lyr),
+                    quant=self.quant,
+                    model_mode=self.model_mode,
+                    layer_idx=lyr,
+                )
+                inp, _ = layer(
+                    inp,
+                    seg_ids,
+                    positions,
+                    det,
+                    m_mode,
+                    previous_chunk=previous_chunk,
+                    page_state=page_state,
+                    slot=slot,
+                    kv_cache=None,
+                    attention_metadata=attention_metadata,
+                )
+              return inp, None
+
+          y, _ = _MiMoScanLayersScope(name="layers")(
+              y, decoder_segment_ids, decoder_positions, deterministic, model_mode
+          )
         else:
           RemattedBlockLayer = RemattedBlockLayers[0]
           scan_length = int(cfg.num_decoder_layers / cfg.inhomogeneous_layer_cycle_interval)
