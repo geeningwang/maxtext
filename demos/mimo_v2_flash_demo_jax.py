@@ -223,7 +223,7 @@ def run_inference(
         )
     # Truncate generated text at EOS token (<|im_end|>) so callers see only
     # the clean assistant response, not padding tokens generated after EOS.
-    stdout = result.stdout
+    stdout = result.stdout or ""
     eos = "<|im_end|>"
     if eos in stdout:
         # The output line is: Input `<prompt>` -> `<generated>`
