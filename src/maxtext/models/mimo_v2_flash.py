@@ -241,55 +241,49 @@ class MiMoV2FlashSparseMoeBlock(nnx.Module):
     """
     orig_shape = hidden_states.shape
     tokens = hidden_states.reshape(-1, self.hidden_size)  # (T, H)
+    K = self.num_experts_per_tok
+    T = tokens.shape[0]
 
     # Route tokens to experts.
     top_k_indices, top_k_weights = self.gate(tokens)  # (T, K), (T, K)
 
-    # Dispatch tokens to their assigned experts using a scatter/gather approach,
-    # which is fully static-shape-friendly and XLA-compilable.
+    # Sparse expert dispatch: gather only the K selected expert weight slices
+    # per token instead of computing all E=256 experts.
     #
-    # Strategy: build an (E, T) weight matrix by scattering top_k_weights into
-    # positions indexed by top_k_indices, then use a single einsum per expert
-    # group. For 256 experts this is the most efficient static approach.
+    # top_k_indices: (T, K) — dynamic indices into axis-0 of the weight tensors
+    # wi_0/wi_1/wo: (E, H, I) / (E, I, H) — EP-sharded on axis-0 (exp mesh axis)
     #
-    # dispatch_weights: (T, E) — weight for each (token, expert) pair (0 if not selected)
-    T = tokens.shape[0]
-    dispatch_weights = jnp.zeros((T, self.num_experts), dtype=jnp.float32)
-    tok_idx = jnp.broadcast_to(
-        jnp.arange(T)[:, jnp.newaxis], (T, self.num_experts_per_tok)
-    )  # (T, K)
-    dispatch_weights = dispatch_weights.at[tok_idx, top_k_indices].add(
-        top_k_weights.astype(jnp.float32)
-    )  # (T, E)
-
+    # XLA/GSPMD performs the EP-distributed gather automatically, routing each
+    # token to the device(s) that own the selected experts.  This reduces
+    # per-step compute from O(E) = O(256) to O(K) = O(8) expert matmuls.
     wi_0 = self.wi_0[...].astype(self.config.dtype)  # (E, H, I)
     wi_1 = self.wi_1[...].astype(self.config.dtype)  # (E, H, I)
-    wo = self.wo[...].astype(self.config.dtype)       # (E, I, H)
+    wo   = self.wo[...].astype(self.config.dtype)     # (E, I, H)
 
-    # For each expert e compute the contribution to each token:
-    #   g_e   = silu(tokens @ wi_0[e])               (T, I)
-    #   u_e   = tokens @ wi_1[e]                      (T, I)
-    #   out_e = (g_e * u_e) @ wo[e]                  (T, H)
-    #   contribution_e = dispatch_weights[:, e:e+1] * out_e  (T, H)
-    #
-    # We vectorise over E using jnp.einsum with the expert axis:
-    #   tokens_all: (T, H) broadcast over all experts.
-    #   gate:  (E, T, I) = silu(einsum('TH,EHI->ETI', tokens, wi_0))
-    #   up:    (E, T, I) =     einsum('TH,EHI->ETI', tokens, wi_1)
-    #   down:  (E, T, H) =     einsum('ETI,EIH->ETH', gate*up, wo)
-    #   out:   (T, H)    =     einsum('TE,ETH->TH',  dispatch_weights, down)
+    # Gather: (T, K) index → (T, K, H, I) / (T, K, I, H)
+    wi_0_sel = wi_0[top_k_indices]   # (T, K, H, I)
+    wi_1_sel = wi_1[top_k_indices]   # (T, K, H, I)
+    wo_sel   = wo[top_k_indices]     # (T, K, I, H)
 
-    tokens_fp = tokens.astype(self.config.dtype)  # (T, H)
-    gate = jax.nn.silu(
-        jnp.einsum("th,ehi->eti", tokens_fp, wi_0, precision=lax.Precision.DEFAULT)
-    )                                                                     # (E, T, I)
-    up = jnp.einsum("th,ehi->eti", tokens_fp, wi_1,
-                    precision=lax.Precision.DEFAULT)                      # (E, T, I)
-    down = jnp.einsum("eti,eih->eth", gate * up, wo,
-                      precision=lax.Precision.DEFAULT)                    # (E, T, H)
-    output = jnp.einsum("te,eth->th",
-                        dispatch_weights.astype(self.config.dtype), down,
-                        precision=lax.Precision.DEFAULT)                  # (T, H)
+    # Broadcast each token to K copies for batched expert matmul.
+    tokens_fp = tokens.astype(self.config.dtype)                           # (T, H)
+    tokens_tk = jnp.broadcast_to(tokens_fp[:, None, :], (T, K, self.hidden_size))
+
+    # SwiGLU: gate projection × up projection → down projection.
+    gate_act = jax.nn.silu(
+        jnp.einsum("tkh,tkhi->tki", tokens_tk, wi_0_sel,
+                   precision=lax.Precision.DEFAULT)
+    )                                                                      # (T, K, I)
+    up_act = jnp.einsum("tkh,tkhi->tki", tokens_tk, wi_1_sel,
+                        precision=lax.Precision.DEFAULT)                   # (T, K, I)
+    expert_out = jnp.einsum("tki,tkih->tkh", gate_act * up_act, wo_sel,
+                            precision=lax.Precision.DEFAULT)               # (T, K, H)
+
+    # Weighted combine across K selected experts.
+    output = jnp.sum(
+        expert_out * top_k_weights[:, :, None].astype(self.config.dtype),
+        axis=1,
+    )  # (T, H)
     return output.reshape(orig_shape)
 
 
