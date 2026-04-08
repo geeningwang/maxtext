@@ -225,19 +225,26 @@ def run_inference(
             f"MaxText inference failed (exit code {result.returncode}).\n"
             f"Stderr:\n{textwrap.indent(stderr, '  ')}"
         )
-    # Truncate generated text at EOS token (<|im_end|>) so callers see only
-    # the clean assistant response, not padding tokens generated after EOS.
+    # Extract only the generated text from the "Input `<prompt>` -> `<output>`"
+    # line, stripping all the MaxText stats that precede it on stdout.
     stdout = result.stdout or ""
     eos = "<|im_end|>"
-    if eos in stdout:
-        # The output line is: Input `<prompt>` -> `<generated>`
-        # Truncate only inside the generated portion.
-        arrow = " -> `"
-        arrow_idx = stdout.find(arrow)
-        if arrow_idx != -1:
-            eos_idx = stdout.find(eos, arrow_idx)
-            if eos_idx != -1:
-                stdout = stdout[:eos_idx] + "` [EOS]\n" + stdout[stdout.find("\n", eos_idx) + 1:]
+    arrow = " -> `"
+    arrow_idx = stdout.find(arrow)
+    if arrow_idx != -1:
+        text_start = arrow_idx + len(arrow)
+        eos_idx = stdout.find(eos, text_start)
+        if eos_idx != -1:
+            # Return clean text truncated at EOS.
+            return stdout[text_start:eos_idx].rstrip("`")
+        # No EOS in output; close at the trailing backtick of the arrow segment.
+        close = stdout.find("`", text_start)
+        if close != -1:
+            return stdout[text_start:close]
+    # Fallback: return the Input -> line verbatim (no stats).
+    for line in stdout.splitlines():
+        if arrow in line:
+            return line
     return stdout
 
 
