@@ -216,8 +216,8 @@ def run_inference(
         check=False,
     )
     if verbose:
-        print(result.stdout, end="", flush=True)
         print(result.stderr, end="", file=sys.stderr, flush=True)
+        print(result.stdout, end="", flush=True)
     if result.returncode != 0:
         stderr = result.stderr or ""
         raise RuntimeError(
