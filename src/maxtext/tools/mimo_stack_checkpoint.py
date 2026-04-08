@@ -114,6 +114,12 @@ def _stack_donated(*pytrees):
   Marks all input pytrees as donated, so XLA reuses their device buffers for
   the stacked output.  Works with multihost sharded jax.Arrays because
   donation operates per-device (no cross-host transfers).
+
+  IMPORTANT: For donation to actually free the source HBM buffers, each leaf
+  jax.Array in ``pytrees`` must have refcount == 1 at call time (i.e. no other
+  Python name or container references the same array).  The caller is
+  responsible for ensuring this by deleting the original params pytree before
+  calling this function.
   """
   n = len(pytrees)
   return jax.jit(
@@ -122,22 +128,25 @@ def _stack_donated(*pytrees):
   )(*pytrees)
 
 
-def _rearrange_params(raw_params: dict) -> dict:
-  """Rearrange flat per-layer params into the four-phase scan-ready layout.
+def _rearrange_layers(flat_layers: dict, decoder_stub: dict,
+                      inner_stub: dict, outer_stub: dict) -> dict:
+  """Stack flat per-layer params into four-phase layout using donated stacking.
 
-  Strategy: use jit+donate_argnums for each stack operation so XLA immediately
-  reuses the donated input buffers for the output.  Peak HBM stays ≈ constant
-  (one stacked group replaces its source layers in-place on device).
+  ``flat_layers`` must be the ONLY Python container referencing the layer leaf
+  jax.Arrays (i.e. the caller must have already deleted the original params
+  pytree so that each leaf has refcount == 1).  This allows ``_stack_donated``
+  to actually reuse the HBM buffers rather than silently copying them.
 
-  Works on multihost sharded jax.Arrays — donation is per-device; no
-  cross-host transfers needed.
+  Args:
+    flat_layers:  mutable dict mapping str(i) → per-layer param pytree.
+    decoder_stub: decoder params except the "layers" key (embed, norm, …).
+    inner_stub:   inner params except the "decoder" key.
+    outer_stub:   outer params except the "params" key.
+
+  Returns:
+    Reconstructed params pytree with four-phase layout.
   """
   _probe_hbm("before rearrange")
-
-  outer = dict(raw_params)
-  inner_params = dict(outer.pop("params"))
-  decoder = dict(inner_params.pop("decoder"))
-  flat_layers = dict(decoder.pop("layers"))
 
   # ---- Phase A ----
   max_logging.log("Stack tool: Phase A — layer 0 (unique; no stacking)")
@@ -173,15 +182,15 @@ def _rearrange_params(raw_params: dict) -> dict:
         f"{sorted(flat_layers.keys())}"
     )
 
-  decoder["layers_a"] = layers_a
-  decoder["layers_b"] = layers_b
-  decoder["layers_c"] = layers_c
-  decoder["layers_d"] = layers_d
+  decoder_stub["layers_a"] = layers_a
+  decoder_stub["layers_b"] = layers_b
+  decoder_stub["layers_c"] = layers_c
+  decoder_stub["layers_d"] = layers_d
 
-  inner_params["decoder"] = decoder
-  outer["params"] = inner_params
+  inner_stub["decoder"] = decoder_stub
+  outer_stub["params"] = inner_stub
   _probe_hbm("after full rearrangement")
-  return outer
+  return outer_stub
 
 
 def main(argv: Sequence[str]) -> None:
@@ -205,11 +214,29 @@ def main(argv: Sequence[str]) -> None:
   max_logging.log("Stack tool: flat params loaded successfully.")
 
   # 2. Rearrange: stack Phase B and C; rename Phase A and D.
-  # NOTE: _rearrange_params uses jit+donate_argnums so each stack operation
-  # reuses the input HBM buffers.  Peak HBM stays ≈ flat model size throughout.
+  #
+  # CRITICAL for donation to work: we must drop ALL references to the original
+  # params pytree before calling _rearrange_layers, so that each leaf jax.Array
+  # has Python refcount == 1 (only our flat_layers dict holds it).  If `params`
+  # (or any alias) is still alive when we call _stack_donated, JAX silently
+  # copies instead of donating, causing HBM to double and OOM.
+  #
+  # Strategy:
+  #   1. Shallow-copy each level of the dict tree so we can mutate/reassemble.
+  #   2. `del params` in THIS scope to drop the only remaining extra ref chain.
+  #   3. CPython's ref-counter immediately frees the original nested dicts,
+  #      leaving each leaf jax.Array with refcount == 1 in flat_layers.
+  max_logging.log("Stack tool: extracting flat layers for donation-based stacking ...")
+  outer_stub = dict(params)
+  inner_stub = dict(outer_stub.pop("params"))
+  decoder_stub = dict(inner_stub.pop("decoder"))
+  flat_layers = dict(decoder_stub.pop("layers"))
+  del params  # drop original pytree; leaf arrays now exclusively in flat_layers
+  _probe_hbm("after load_params + pre-extract (before donation stacking)")
+
   max_logging.log("Stack tool: rearranging params into four-phase scan layout ...")
-  stacked = _rearrange_params(params)
-  del params  # Python ref dropped; donated arrays were already freed by jit
+  stacked = _rearrange_layers(flat_layers, decoder_stub, inner_stub, outer_stub)
+  del flat_layers
   max_logging.log("Stack tool: rearrangement complete.")
 
   # 3. Save stacked checkpoint to new OCDBT+zarr3 path.
