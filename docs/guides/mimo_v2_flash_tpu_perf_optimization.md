@@ -1,6 +1,20 @@
 # MiMo-V2-Flash TPU Inference — Generation Stage Performance Analysis
 
-**Baseline measurement**: ~78 ms/step, ~12.8 tok/s on v6e-32 (TP=4 × EP=8, bf16, batch=1, 2026-04-08)
+**Proper benchmark** (3-step warmup, 50 timed steps, `mimo_v2_flash_bench.py`, 2026-04-08):
+
+| Metric | Value |
+|---|---|
+| Hardware | v6e-32, 8 workers, TP=4 × EP=8, bf16 |
+| Batch size | 32 (1 per device) |
+| Step latency — mean | **71.7 ms** |
+| Step latency — median | **71.7 ms** |
+| Step latency — min / p90 / max | 71.4 / 71.9 / 75.5 ms |
+| Throughput (batch=32) | **446.6 tok/s** |
+| Per-sequence latency | **2.2 ms/tok/seq** |
+
+Note: the demo-script figure of ~78 ms/step was inflated by cold JIT compilation
+on the first few steps.  True steady-state latency is **71.7 ms/step** with
+extremely tight variance (p90 only 0.2 ms above median).
 
 ---
 
