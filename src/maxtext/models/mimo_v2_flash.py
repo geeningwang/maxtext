@@ -500,6 +500,129 @@ class MiMoV2FlashDecoderLayer(nnx.Module):
 
 
 # ---------------------------------------------------------------------------
+# MiMoV2FlashSixLayerCycleBlock
+# ---------------------------------------------------------------------------
+#
+# MiMo-V2-Flash layer structure (48 layers total):
+#
+#   Phase A  layer 0          : unique — global attention + dense MLP
+#   Phase B  layers  1- 4 (4×): SWA-attention + sparse MoE  (homogeneous run)
+#   Phase C  layers  5-46 (7×): repeating 6-layer cycle [G-MoE, SWA-MoE×5]
+#   Phase D  layer 47         : unique — global attention + sparse MoE
+#
+# The 6-layer cycle (Phase C) has identical structure in every repetition:
+#   pos 0 : global attention  + MoE  (KV heads = cfg.num_kv_heads     = 4)
+#   pos 1 : SWA attention     + MoE  (KV heads = cfg.mimo_swa_num_kv_heads = 8)
+#   pos 2 : SWA attention     + MoE
+#   pos 3 : SWA attention     + MoE
+#   pos 4 : SWA attention     + MoE
+#   pos 5 : SWA attention     + MoE
+#
+# Representative global layer indices used for configuration at each position:
+#   pos 0 → layer 5   (hybrid_pattern=0 ⇒ global, moe_freq=1 ⇒ MoE)
+#   pos 1 → layer 6   (hybrid_pattern=1 ⇒ SWA,    moe_freq=1 ⇒ MoE)
+#   ...
+#   pos 5 → layer 10  (hybrid_pattern=1 ⇒ SWA,    moe_freq=1 ⇒ MoE)
+#
+# ROUND 2 NOTE — checkpoint conversion required before nn.scan can be used:
+#   The existing per-layer OCDBT checkpoint stores params at flat paths
+#   decoder/layers/{5..46}/*.  scan_decoder_layers(length=7) expects them
+#   stacked with a leading scan axis of size 7:
+#     cycle_block.layers_0.* shape(7, ...)  ← global layers  5,11,17,23,29,35,41
+#     cycle_block.layers_1.* shape(7, ...)  ← SWA layers     6,12,18,24,30,36,42
+#     ...
+#     cycle_block.layers_5.* shape(7, ...)  ← SWA layers    10,16,22,28,34,40,46
+#   See tools/mimo_stack_checkpoint.py (TBD) for the conversion utility.
+
+# Representative global layer_idx for each in-cycle position (first cycle).
+_CYCLE_REP_LAYER_IDX = (5, 6, 7, 8, 9, 10)
+_CYCLE_LENGTH = 6      # layers per cycle
+_CYCLE_COUNT  = 7      # number of cycle repetitions (layers 5-46)
+_CYCLE_START  = 5      # global index of the first cycle layer
+
+
+class MiMoV2FlashSixLayerCycleBlock(nnx.Module):
+  """One repeating 6-layer cycle of MiMo-V2-Flash (Phase C, layers 5–46).
+
+  Holds 6 ``MiMoV2FlashDecoderLayer`` sublayers named ``layers_0`` …
+  ``layers_5``.  When used as the body of ``scan_decoder_layers(length=7)``,
+  parameters are stacked along the scan axis so XLA compiles the 6-layer body
+  once and loops 7 times, capping peak HLO temp at ~3 GiB instead of ~22 GiB
+  (enabling sparse-gather MoE dispatch without OOM).
+
+  **Round 1 (skeleton):** ``__call__`` is a sequential Python loop over the 6
+  sublayers — identical in effect to the flat per-layer loop.  ``nn.scan`` is
+  NOT yet active; checkpoint loading uses the existing flat naming via the
+  ``_MiMoScanLayersScope`` in ``decoders.py``.
+
+  **Round 2 (scan wiring + checkpoint conversion):**
+    1. Run ``tools/mimo_stack_checkpoint.py`` to stack per-layer params.
+    2. Replace ``_MiMoScanLayersScope`` with ``scan_decoder_layers`` calls.
+    3. The sequential ``__call__`` body below remains unchanged — ``nn.scan``
+       wraps this class externally in ``scan_decoder_layers``.
+  """
+
+  def __init__(
+      self,
+      config: Config,
+      mesh: Mesh,
+      model_mode: str,
+      quant: None | Quant = None,
+      *,
+      rngs: nnx.Rngs,
+  ):
+    self.config = config
+    self.mesh = mesh
+    self.model_mode = model_mode
+    self.quant = quant
+
+    for pos, rep_idx in enumerate(_CYCLE_REP_LAYER_IDX):
+      layer = MiMoV2FlashDecoderLayer(
+          config=config,
+          mesh=mesh,
+          model_mode=model_mode,
+          layer_idx=rep_idx,   # sets is_swa / use_moe for this position
+          quant=quant,
+          rngs=rngs,
+      )
+      setattr(self, f"layers_{pos}", layer)
+
+  def __call__(
+      self,
+      inputs: Array,
+      decoder_segment_ids: None | Array,
+      decoder_positions: None | Array,
+      deterministic: bool,
+      model_mode: str,
+      previous_chunk: Any = None,
+      page_state: Any = None,
+      slot: None | int = None,
+      kv_cache: None | dict[str, Array] = None,
+      attention_metadata: None | dict[str, Any] = None,
+  ):
+    """Apply all 6 cycle layers sequentially; return (output, None).
+
+    The ``(output, None)`` tuple is the scan-body convention: the first element
+    is the carry (hidden states), the second is unused scan output (None).
+    """
+    y = inputs
+    for pos in range(_CYCLE_LENGTH):
+      y, _ = getattr(self, f"layers_{pos}")(
+          y,
+          decoder_segment_ids,
+          decoder_positions,
+          deterministic,
+          model_mode,
+          previous_chunk=previous_chunk,
+          page_state=page_state,
+          slot=slot,
+          kv_cache=kv_cache,
+          attention_metadata=attention_metadata,
+      )
+    return y, None
+
+
+# ---------------------------------------------------------------------------
 # Linen wrappers (required by decoders.py registry)
 # ---------------------------------------------------------------------------
 
@@ -508,13 +631,16 @@ MiMoV2FlashDecoderLayerToLinen = nnx_wrappers.to_linen_class(
     base_metadata_fn=variable_to_logically_partitioned,
 )
 
-# MiMoV2FlashScannableBlockToLinen is returned by get_decoder_layers() when
-# scan_layers=True.  The actual iteration (with explicit layer_idx per layer)
-# is handled by _MiMoScanLayersScope inside Decoder.__call__ in decoders.py,
-# so this wrapper can reuse the same single-layer NNX class.
-# TODO(mimo-opt): replace with a true cyclic ScannableBlock (6-layer cycle ×
-# 7 reps + 6-layer preamble) to get peak-HBM benefit from nn.scan.
-MiMoV2FlashScannableBlockToLinen = nnx_wrappers.to_linen_class(
-    MiMoV2FlashDecoderLayer,
+# Linen wrapper for the 6-layer cycle block.
+# get_decoder_layers() returns this as RemattedBlockLayers[1] when
+# scan_layers=True.  Round 2 will wire it into scan_decoder_layers(length=7).
+MiMoV2FlashSixLayerCycleBlockToLinen = nnx_wrappers.to_linen_class(
+    MiMoV2FlashSixLayerCycleBlock,
     base_metadata_fn=variable_to_logically_partitioned,
 )
+
+# Alias kept for backward compatibility.  The scan_layers=True path in
+# decoders.py currently uses RemattedBlockLayers[0] (MiMoV2FlashDecoderLayerToLinen)
+# for the sequential fallback, not this alias.  In Round 2 this alias will be
+# retired in favour of direct use of MiMoV2FlashSixLayerCycleBlockToLinen.
+MiMoV2FlashScannableBlockToLinen = MiMoV2FlashSixLayerCycleBlockToLinen

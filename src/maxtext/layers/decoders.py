@@ -483,7 +483,19 @@ class Decoder(nn.Module):
       case DecoderBlockType.OLMO3:
         return [olmo3.Olmo3ScannableBlockToLinen] if self.config.scan_layers else [olmo3.Olmo3DecoderLayerToLinen]
       case DecoderBlockType.MIMO_V2_FLASH:
-        return [mimo_v2_flash.MiMoV2FlashScannableBlockToLinen] if self.config.scan_layers else [mimo_v2_flash.MiMoV2FlashDecoderLayerToLinen]
+        if self.config.scan_layers:
+          # Two layer types exposed for the structured 4-phase scan path:
+          #   [0] MiMoV2FlashDecoderLayerToLinen      — single layer (takes layer_idx);
+          #       used by Phase A (layer 0), Phase B (layers 1-4), Phase D (layer 47),
+          #       and the Round-1 sequential fallback in _MiMoScanLayersScope.
+          #   [1] MiMoV2FlashSixLayerCycleBlockToLinen — 6-layer cycle block;
+          #       Round 2 will use this as the scan body for Phase C (layers 5-46)
+          #       via scan_decoder_layers(length=7) after checkpoint param stacking.
+          return [
+              mimo_v2_flash.MiMoV2FlashDecoderLayerToLinen,
+              mimo_v2_flash.MiMoV2FlashSixLayerCycleBlockToLinen,
+          ]
+        return [mimo_v2_flash.MiMoV2FlashDecoderLayerToLinen]
 
       case _:
         # Default case to handle any unknown decoder block types.
@@ -950,17 +962,17 @@ class Decoder(nn.Module):
               slot,
           )
         elif cfg.decoder_block == DecoderBlockType.MIMO_V2_FLASH:
-          # MiMo-V2-Flash has an inhomogeneous layer structure (mixed global/SWA
-          # attention and a single dense MLP layer at index 0, all others sparse
-          # MoE), so a uniform nn.scan over all layers is not feasible without
-          # stacking heterogeneous weight shapes.  Instead we iterate layers
-          # sequentially with explicit layer_idx — identical in effect to the
-          # scan_layers=False path — and return (output, None) so that upstream
-          # callers that expect the scan-compatible tuple return work correctly.
+          # Round-1 sequential fallback.  Executes all 48 layers sequentially
+          # with explicit layer_idx so checkpoint keys (decoder/layers/{i}/)
+          # match the existing per-layer OCDBT checkpoint.
           #
-          # TODO(mimo-opt): implement proper cycle-scan (6-layer cycle × 7 reps
-          # + 6-layer preamble) to actually reduce peak HBM for sparse dispatch.
-          RemattedBlockLayer = RemattedBlockLayers[0]
+          # Round 2 replaces this with structured nn.scan calls:
+          #   Phase A  layer 0         sequential  (RemattedBlockLayers[0])
+          #   Phase B  layers 1-4      scan_decoder_layers(length=4)
+          #   Phase C  layers 5-46     scan_decoder_layers(length=7, body=RemattedBlockLayers[1])
+          #   Phase D  layer 47        sequential  (RemattedBlockLayers[0])
+          # Requires checkpoint param stacking; see tools/mimo_stack_checkpoint.py (TBD).
+          RemattedBlockLayer = RemattedBlockLayers[0]  # MiMoV2FlashDecoderLayerToLinen
 
           class _MiMoScanLayersScope(nn.Module):
             """Sequential MiMo layers for scan_layers=True; returns (out, None)."""
