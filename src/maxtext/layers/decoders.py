@@ -484,13 +484,12 @@ class Decoder(nn.Module):
         return [olmo3.Olmo3ScannableBlockToLinen] if self.config.scan_layers else [olmo3.Olmo3DecoderLayerToLinen]
       case DecoderBlockType.MIMO_V2_FLASH:
         if self.config.scan_layers:
-          # Two layer types exposed for the structured 4-phase scan path:
+          # Two layer types for the 4-phase nn.scan path (Round 2):
           #   [0] MiMoV2FlashDecoderLayerToLinen      — single layer (takes layer_idx);
-          #       used by Phase A (layer 0), Phase B (layers 1-4), Phase D (layer 47),
-          #       and the Round-1 sequential fallback in _MiMoScanLayersScope.
+          #       used for Phase A (layer 0), Phase B scan (4× SWA-MoE), Phase D (layer 47).
           #   [1] MiMoV2FlashSixLayerCycleBlockToLinen — 6-layer cycle block;
-          #       Round 2 will use this as the scan body for Phase C (layers 5-46)
-          #       via scan_decoder_layers(length=7) after checkpoint param stacking.
+          #       used as the scan body for Phase C via scan_decoder_layers(length=7).
+          # Checkpoint must be pre-stacked with tools/mimo_stack_checkpoint.py.
           return [
               mimo_v2_flash.MiMoV2FlashDecoderLayerToLinen,
               mimo_v2_flash.MiMoV2FlashSixLayerCycleBlockToLinen,
@@ -962,49 +961,84 @@ class Decoder(nn.Module):
               slot,
           )
         elif cfg.decoder_block == DecoderBlockType.MIMO_V2_FLASH:
-          # Round-1 sequential fallback.  Executes all 48 layers sequentially
-          # with explicit layer_idx so checkpoint keys (decoder/layers/{i}/)
-          # match the existing per-layer OCDBT checkpoint.
+          # Round 2: four-phase structured nn.scan for MiMo-V2-Flash.
+          # Reduces peak HLO temp from ~22 GiB (47 unrolled layers) to ~3 GiB
+          # (7-iteration scan body), enabling sparse-gather MoE dispatch.
           #
-          # Round 2 replaces this with structured nn.scan calls:
-          #   Phase A  layer 0         sequential  (RemattedBlockLayers[0])
-          #   Phase B  layers 1-4      scan_decoder_layers(length=4)
-          #   Phase C  layers 5-46     scan_decoder_layers(length=7, body=RemattedBlockLayers[1])
-          #   Phase D  layer 47        sequential  (RemattedBlockLayers[0])
-          # Requires checkpoint param stacking; see tools/mimo_stack_checkpoint.py (TBD).
-          RemattedBlockLayer = RemattedBlockLayers[0]  # MiMoV2FlashDecoderLayerToLinen
-
-          class _MiMoScanLayersScope(nn.Module):
-            """Sequential MiMo layers for scan_layers=True; returns (out, None)."""
-
-            @nn.compact
-            def __call__(self_inner, inp, seg_ids, positions, det, m_mode):  # pylint: disable=no-self-argument
-              for lyr in range(cfg.num_decoder_layers):
-                layer = RemattedBlockLayer(
-                    config=cfg,
-                    mesh=mesh,
-                    name=str(lyr),
-                    quant=self.quant,
-                    model_mode=self.model_mode,
-                    layer_idx=lyr,
-                )
-                inp, _ = layer(
-                    inp,
-                    seg_ids,
-                    positions,
-                    det,
-                    m_mode,
-                    previous_chunk=previous_chunk,
-                    page_state=page_state,
-                    slot=slot,
-                    kv_cache=None,
-                    attention_metadata=attention_metadata,
-                )
-              return inp, None
-
-          y, _ = _MiMoScanLayersScope(name="layers")(
-              y, decoder_segment_ids, decoder_positions, deterministic, model_mode
+          # Checkpoint layout produced by tools/mimo_stack_checkpoint.py:
+          #   Phase A  layer 0         → decoder.layers_a.*          (single)
+          #   Phase B  layers 1-4      → decoder.layers_b.*          stacked (4, ...)
+          #   Phase C  layers 5-46     → decoder.layers_c.layers_0.* stacked (7, ...)
+          #                              …
+          #                              decoder.layers_c.layers_5.* stacked (7, ...)
+          #   Phase D  layer 47        → decoder.layers_d.*          (single)
+          assert len(RemattedBlockLayers) == 2, (
+              "scan_layers=True for MIMO_V2_FLASH requires exactly 2 layer types: "
+              "[MiMoV2FlashDecoderLayerToLinen, MiMoV2FlashSixLayerCycleBlockToLinen]. "
+              "Check get_decoder_layers() in this file."
           )
+          single_layer = RemattedBlockLayers[0]  # MiMoV2FlashDecoderLayerToLinen
+          cycle_block = RemattedBlockLayers[1]   # MiMoV2FlashSixLayerCycleBlockToLinen
+
+          # Pre-bind non-broadcast kwargs so the scan body's positional signature
+          # is (carry, seg_ids, positions, deterministic, model_mode).
+          # This follows the same pattern as DeepSeek's layer_call_kwargs.
+          _mimo_layer_call_kwargs = {
+              "page_state": page_state,
+              "previous_chunk": previous_chunk,
+              "slot": slot,
+              "kv_cache": None,
+              "attention_metadata": attention_metadata,
+          }
+          single_layer.__call__ = functools.partial(
+              single_layer.__call__, **_mimo_layer_call_kwargs
+          )
+          cycle_block.__call__ = functools.partial(
+              cycle_block.__call__, **_mimo_layer_call_kwargs
+          )
+
+          # Phase A — layer 0 (unique: global attention + dense MLP)
+          y, _ = single_layer(
+              config=cfg,
+              mesh=mesh,
+              name="layers_a",
+              quant=self.quant,
+              model_mode=self.model_mode,
+              layer_idx=0,
+          )(y, *broadcast_args)
+
+          # Phase B — layers 1-4 (4× SWA-MoE, structurally homogeneous)
+          y, _ = self.scan_decoder_layers(
+              cfg,
+              single_layer,
+              4,
+              "layers_b",
+              mesh,
+              in_axes_tuple=(nn.broadcast,) * len(broadcast_args),
+              model_mode=model_mode,
+              layer_idx=1,  # representative: all Phase B layers are SWA-MoE
+          )(y, *broadcast_args)
+
+          # Phase C — layers 5-46 (7× 6-layer cycle: [G-MoE + 5× SWA-MoE])
+          y, _ = self.scan_decoder_layers(
+              cfg,
+              cycle_block,
+              7,
+              "layers_c",
+              mesh,
+              in_axes_tuple=(nn.broadcast,) * len(broadcast_args),
+              model_mode=model_mode,
+          )(y, *broadcast_args)
+
+          # Phase D — layer 47 (unique: global attention + sparse MoE)
+          y, _ = single_layer(
+              config=cfg,
+              mesh=mesh,
+              name="layers_d",
+              quant=self.quant,
+              model_mode=self.model_mode,
+              layer_idx=47,
+          )(y, *broadcast_args)
         else:
           RemattedBlockLayer = RemattedBlockLayers[0]
           scan_length = int(cfg.num_decoder_layers / cfg.inhomogeneous_layer_cycle_interval)

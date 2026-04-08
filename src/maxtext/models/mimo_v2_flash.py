@@ -524,15 +524,16 @@ class MiMoV2FlashDecoderLayer(nnx.Module):
 #   ...
 #   pos 5 → layer 10  (hybrid_pattern=1 ⇒ SWA,    moe_freq=1 ⇒ MoE)
 #
-# ROUND 2 NOTE — checkpoint conversion required before nn.scan can be used:
-#   The existing per-layer OCDBT checkpoint stores params at flat paths
-#   decoder/layers/{5..46}/*.  scan_decoder_layers(length=7) expects them
-#   stacked with a leading scan axis of size 7:
-#     cycle_block.layers_0.* shape(7, ...)  ← global layers  5,11,17,23,29,35,41
-#     cycle_block.layers_1.* shape(7, ...)  ← SWA layers     6,12,18,24,30,36,42
+# ROUND 2 CHECKPOINT LAYOUT — produced by tools/mimo_stack_checkpoint.py:
+#   The flat per-layer OCDBT checkpoint (decoder/layers/{i}/*) must be
+#   restacked before using scan_layers=True Round 2.  After conversion the
+#   stacked checkpoint has:
+#     decoder.layers_c.layers_0.*  shape (7, ...)  ← layers  5,11,17,23,29,35,41
+#     decoder.layers_c.layers_1.*  shape (7, ...)  ← layers  6,12,18,24,30,36,42
 #     ...
-#     cycle_block.layers_5.* shape(7, ...)  ← SWA layers    10,16,22,28,34,40,46
-#   See tools/mimo_stack_checkpoint.py (TBD) for the conversion utility.
+#     decoder.layers_c.layers_5.*  shape (7, ...)  ← layers 10,16,22,28,34,40,46
+#   scan_decoder_layers(length=7) in decoders.py then scans over the
+#   leading axis of size 7, calling this 6-layer cycle body 7 times.
 
 # Representative global layer_idx for each in-cycle position (first cycle).
 _CYCLE_REP_LAYER_IDX = (5, 6, 7, 8, 9, 10)
@@ -550,16 +551,15 @@ class MiMoV2FlashSixLayerCycleBlock(nnx.Module):
   once and loops 7 times, capping peak HLO temp at ~3 GiB instead of ~22 GiB
   (enabling sparse-gather MoE dispatch without OOM).
 
-  **Round 1 (skeleton):** ``__call__`` is a sequential Python loop over the 6
-  sublayers — identical in effect to the flat per-layer loop.  ``nn.scan`` is
-  NOT yet active; checkpoint loading uses the existing flat naming via the
-  ``_MiMoScanLayersScope`` in ``decoders.py``.
+  ``__call__`` is a sequential Python loop over the 6 sublayers.  ``nn.scan``
+  wraps this class externally via ``scan_decoder_layers(length=7)`` in
+  ``decoders.py``, so XLA compiles the 6-layer body once and loops 7 times
+  (capping peak HLO temp at ~3 GiB instead of ~22 GiB).
 
-  **Round 2 (scan wiring + checkpoint conversion):**
-    1. Run ``tools/mimo_stack_checkpoint.py`` to stack per-layer params.
-    2. Replace ``_MiMoScanLayersScope`` with ``scan_decoder_layers`` calls.
-    3. The sequential ``__call__`` body below remains unchanged — ``nn.scan``
-       wraps this class externally in ``scan_decoder_layers``.
+  **Prerequisite:** Run ``tools/mimo_stack_checkpoint.py`` once to convert the
+  flat per-layer checkpoint to the stacked (7, ...) layout expected by
+  ``scan_decoder_layers``; then point ``load_parameters_path`` to the new
+  stacked checkpoint path.
   """
 
   def __init__(
