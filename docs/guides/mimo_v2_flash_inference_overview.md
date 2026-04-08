@@ -55,7 +55,8 @@ End-to-end autoregressive generation is **validated** (as of 2026-04-08).  The
 demo script `demos/mimo_v2_flash_demo_jax.py` runs on v6e-32 (8 workers,
 `ici_tensor_parallelism=4 ici_expert_parallelism=8`) and produces coherent
 output.  Proper benchmark (3-step warmup + 50 timed steps at batch=32):
-**71.7 ms/step median**, **446.6 tok/s**, **2.2 ms/tok/seq** (2026-04-08).
+**56.5 ms/step median**, **566.1 tok/s**, **1.8 ms/tok/seq** (2026-04-08,
+after opt #1: removed `jax.debug.print` from MoE gate).
 The model is prompted via
 `tokenizer.apply_chat_template()` (`use_chat_template=true`) and stops cleanly
 at EOS (`<|im_end|>`, token id 151645) without running to `max_new_tokens`.
@@ -84,7 +85,7 @@ near-argmax and producing completely garbled token predictions.  Fix: added
 | Checkpoint load (OCDBT, 8-process) | ~36 s |
 | Prefill (512 tokens) | ~22 s |
 | Generate (~600 tokens, EOS stop) | ~43 s (cold, includes JIT compile) |
-| Generation speed (steady-state, batch=32) | **71.7 ms/step · 446.6 tok/s · 2.2 ms/tok/seq** |
+| Generation speed (steady-state, batch=32) | **56.5 ms/step · 566.1 tok/s · 1.8 ms/tok/seq** |
 | HBM per chip after load | ~18.0 GB / 31.25 GB (57.5%) |
 | Parallelism | TP=4 × EP=8 |
 

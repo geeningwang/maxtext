@@ -1,34 +1,34 @@
 # MiMo-V2-Flash TPU Inference — Generation Stage Performance Analysis
 
-**Proper benchmark** (3-step warmup, 50 timed steps, `mimo_v2_flash_bench.py`, 2026-04-08):
+Benchmarks use `src/maxtext/inference/scripts/mimo_v2_flash_bench.py`
+(3-step warmup, 50 timed steps, v6e-32 TP=4 × EP=8, bf16, batch=32).
 
-| Metric | Value |
-|---|---|
-| Hardware | v6e-32, 8 workers, TP=4 × EP=8, bf16 |
-| Batch size | 32 (1 per device) |
-| Step latency — mean | **71.7 ms** |
-| Step latency — median | **71.7 ms** |
-| Step latency — min / p90 / max | 71.4 / 71.9 / 75.5 ms |
-| Throughput (batch=32) | **446.6 tok/s** |
-| Per-sequence latency | **2.2 ms/tok/seq** |
+### Benchmark history
+
+| Date | Optimisation applied | Median step | Throughput | Per-seq |
+|---|---|---|---|---|
+| 2026-04-08 | Baseline (no opt) | 71.7 ms | 446.6 tok/s | 2.2 ms/tok |
+| 2026-04-08 | **#1 Remove `jax.debug.print`** ✅ | **56.5 ms** | **566.1 tok/s** | **1.8 ms/tok** |
+
+Removing a single debug line eliminated 47 host–device sync barriers per step
+(one per MoE layer), cutting step latency by **21 %** and boosting throughput
+by **27 %**.  Variance also tightened significantly (max − min: 0.6 ms vs 4.1 ms).
 
 Note: the demo-script figure of ~78 ms/step was inflated by cold JIT compilation
-on the first few steps.  True steady-state latency is **71.7 ms/step** with
-extremely tight variance (p90 only 0.2 ms above median).
+on the first few steps; benchmark numbers above exclude warmup.
 
 ---
 
 ## Root-Cause Bottlenecks (in priority order)
 
-### 1. `jax.debug.print` in the MoE gate hot path — blocks every step
+### 1. ~~`jax.debug.print` in the MoE gate hot path~~ ✅ Fixed (commit `00998532`)
 
-`MiMoV2FlashMoEGate.__call__` (`src/maxtext/models/mimo_v2_flash.py`) fires
-`jax.debug.print(...)` on every forward pass.  This is an **effects callback**
-— JAX inserts a host–device synchronisation barrier for it.  With 47 MoE
-layers per generate step, that is 47 host roundtrips *per token*.  This is the
-single most impactful bug.
+`MiMoV2FlashMoEGate.__call__` (`src/maxtext/models/mimo_v2_flash.py`) was firing
+`jax.debug.print(...)` on every forward pass — an **effects callback** that
+inserts a host–device sync barrier.  With 47 MoE layers per generate step that
+was 47 host roundtrips *per token*.
 
-**Fix**: Remove or gate behind a debug flag.
+**Result**: 71.7 ms → **56.5 ms/step** (↓21 %), 446.6 → **566.1 tok/s** (↑27 %).
 
 ---
 
