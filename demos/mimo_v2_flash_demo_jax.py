@@ -30,7 +30,7 @@ Prerequisites
        --simulated_cpu_devices_count 1
 
 2. This script calls MaxText's ``maxtext.inference.decode`` module which
-   requires an initialised TPU environment (jax >= 0.4.30, libtpu).
+   requires an initialised TPU environment (jax >= 0.8, libtpu).
 
 Usage
 -----
@@ -47,7 +47,7 @@ python3 demos/mimo_v2_flash_demo_jax.py \
 #   simultaneously.  Launch with --worker=all from the manager VM:
 #
 gcloud compute tpus tpu-vm ssh <tpu-name> --zone=<zone> --worker=all \
-    --command="cd maxtext && source maxtext_venv/bin/activate && \
+    --command="cd maxtext && source maxtext_tpu_venv/bin/activate && \
         python3 demos/mimo_v2_flash_demo_jax.py \
             --checkpoint_path gs://<bucket>/mimo-v2-flash/checkpoints/0/items \
             --tokenizer_path XiaomiMiMo/MiMo-V2-Flash \
@@ -72,6 +72,25 @@ MiMo-V2-Flash key properties relevant to TPU inference:
     - sigmoid scoring with noaux-TC correction bias
   • Dense MLP only on layer 0 (intermediate = 16 384)
   • MoE intermediate size: 2 048
+
+Chat template and EOS
+---------------------
+The script always passes ``use_chat_template=true`` to decode.py, which calls
+``tokenizer.apply_chat_template()`` to wrap the raw prompt as a proper
+chat turn::
+
+    <|im_start|>system\nYou are MiMo...\n<|im_end|><|im_start|>user\n<prompt><|im_end|><|im_start|>assistant\n
+
+This ensures the model emits a single assistant reply ending with
+``<|im_end|>`` (EOS token id 151645) rather than running to ``max_new_tokens``.
+decode.py checks for EOS at every generate step and stops early.
+
+Measured performance (v6e-32, 8 workers, TP=4 × EP=8, 2026-04-08)
+------------------------------------------------------------------
+  Checkpoint load (OCDBT, 8-process): ~36 s
+  Prefill (512 tokens):               ~22 s
+  Generate (~600 tokens, EOS stop):   ~43 s   (~78 ms/step, ~12.8 tok/s)
+  HBM per chip after load:            ~18.0 GB / 31.25 GB (57.5%)
 """
 
 import argparse

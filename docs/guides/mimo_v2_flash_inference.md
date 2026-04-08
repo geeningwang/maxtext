@@ -72,9 +72,14 @@ unbiased sigmoid scores, then L1-normalised.
      bfloat16) with ~150 GB headroom for KV cache and activations.  Larger
      slices (Ironwood-8, Ironwood-16, Ironwood-32, …) improve throughput and
      batch size.  Each Ironwood chip delivers ~4,614 BF16 TFLOPS.
-2. MaxText installed:
+2. MaxText installed (Python 3.12 required):
    ```bash
-   cd maxtext && pip install -e "src/[gpu]"
+   pip install uv
+   cd maxtext
+   uv venv --python 3.12 --seed maxtext_tpu_venv
+   source maxtext_tpu_venv/bin/activate
+   uv pip install -e ".[tpu]" --resolution=lowest
+   install_maxtext_tpu_github_deps
    ```
 3. Checkpoint conversion dependencies (`zarr`, `numcodecs`, `tqdm` — required for
    conversion scripts; usually installed as part of the MaxText venv but can be
@@ -294,14 +299,19 @@ python3 demos/mimo_v2_flash_demo_jax.py \
 
 ```bash
 gcloud compute tpus tpu-vm ssh <tpu-node> --zone=<zone> --worker=all \
-    --command="cd maxtext && source maxtext_venv/bin/activate && \
+    --command="cd maxtext && source maxtext_tpu_venv/bin/activate && \
         python3 demos/mimo_v2_flash_demo_jax.py \
-            --checkpoint_path gs://<your-bucket>/mimo-v2-flash/checkpoints/0/items \
+            --checkpoint_path gs://<your-bucket>/mimo-v2-flash-fixed-ocdbt/checkpoints/0/items \
             --tokenizer_path XiaomiMiMo/MiMo-V2-Flash \
-            --ici_tensor_parallelism 32 \
+            --ici_tensor_parallelism 4 \
+            --ici_expert_parallelism 8 \
             --prompt 'Solve step by step: if a rectangle has perimeter 48 and one side 10, what is its area?' \
             --max_new_tokens 256"
 ```
+
+> **Note:** `use_chat_template=true` is built into the demo script — the prompt is
+> automatically wrapped via `tokenizer.apply_chat_template()` so the model stops
+> cleanly at EOS rather than running to `max_new_tokens`.
 
 ### Using `maxtext.inference.decode` directly
 

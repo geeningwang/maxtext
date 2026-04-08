@@ -51,10 +51,12 @@ re-encodes FP8 to Q8_0 at conversion time.
 - noaux-TC sigmoid MoE routing (sigmoid scores, not softmax; L1-normalised final weights)
 
 ### Status
-End-to-end autoregressive generation is **validated** (as of 2026-04-06).  The
+End-to-end autoregressive generation is **validated** (as of 2026-04-08).  The
 demo script `demos/mimo_v2_flash_demo_jax.py` runs on v6e-32 (8 workers,
 `ici_tensor_parallelism=4 ici_expert_parallelism=8`) and produces coherent
-output at ~71 ms/step (~14 tok/s).
+output at ~78 ms/step (~12.8 tok/s).  The model is prompted via
+`tokenizer.apply_chat_template()` (`use_chat_template=true`) and stops cleanly
+at EOS (`<|im_end|>`, token id 151645) without running to `max_new_tokens`.
 
 Checkpoint conversion is **complete** (as of 2026-04-06).  The full pipeline ran
 using a distributed approach: worker 0 ran `convert_mimo_v2_flash.py` over all
@@ -74,33 +76,41 @@ it, attention logits were `sqrt(192) ≈ 13.9×` too large, driving softmax to
 near-argmax and producing completely garbled token predictions.  Fix: added
 `query_pre_attn_scalar=cfg.head_dim**-0.5` (commit `6051205a`).
 
-### Performance (measured 2026-04-06, v6e-32)
+### Performance (measured 2026-04-08, v6e-32)
 | Metric | Value |
 |---|---|
-| Checkpoint load | ~32 s |
-| Generation (steady-state) | **~71 ms/step (~14 tok/s)** |
+| Checkpoint load (OCDBT, 8-process) | ~36 s |
+| Prefill (512 tokens) | ~22 s |
+| Generate (~600 tokens, EOS stop) | ~43 s |
+| Generation speed (steady-state) | **~78 ms/step (~12.8 tok/s)** |
+| HBM per chip after load | ~18.0 GB / 31.25 GB (57.5%) |
 | Parallelism | TP=4 × EP=8 |
 
-### Output (validated 2026-04-06)
+### Output (validated 2026-04-08)
 ```
-2. But what if we are in binary? In binary, 1+1=10, which is 2 in decimal. So the answer depends on the context.
+The answer is **2**.
+
+However, depending on the context, it could also be:
+*   **11** (if you are concatenating text/strings)
+*   **1** (in Boolean algebra or 1 OR 1 is true)
+*   **0** (in Boolean algebra with XOR operation: 1 exclusive-or 1)
+*   **1** (in modular arithmetic modulo 2)
 ```
-Coherent — matches HF reference output for the same prompt.
+Model stopped cleanly at EOS after 597 generate steps (~600 tokens).
+Chat template applied; prompt: `"What is 1+1?"`.
 
 ### Key command
 ```bash
-gcloud compute tpus tpu-vm ssh <tpu-node> --worker=all --zone=<zone> --internal-ip \
-  --command="cd ~/maxtext && python3 -m maxtext.inference.decode \
-    src/maxtext/configs/base.yml \
-    model_name=mimo-v2-flash \
-    run_name=mimo_inference \
-    load_parameters_path=gs://jingnw-mimo-v2-flash-us-east5/mimo-v2-flash-fixed-ocdbt/checkpoints/0/items \
-    checkpoint_storage_use_ocdbt=true \
-    checkpoint_storage_use_zarr3=true \
-    ici_tensor_parallelism=4 \
-    ici_expert_parallelism=8 \
-    scan_layers=false \
-    per_device_batch_size=1"
+gcloud compute tpus tpu-vm ssh <tpu-node> --worker=all --zone=<zone> \
+  --command="cd ~/maxtext && source maxtext_tpu_venv/bin/activate && \
+    python3 demos/mimo_v2_flash_demo_jax.py \
+      --checkpoint_path gs://jingnw-mimo-v2-flash-us-east5/mimo-v2-flash-fixed-ocdbt/checkpoints/0/items \
+      --tokenizer_path XiaomiMiMo/MiMo-V2-Flash \
+      --prompt 'What is 1+1?' \
+      --max_new_tokens 2000 \
+      --max_prefill 512 \
+      --ici_tensor_parallelism 4 \
+      --ici_expert_parallelism 8"
 ```
 
 ---
