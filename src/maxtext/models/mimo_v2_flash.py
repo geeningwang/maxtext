@@ -141,7 +141,6 @@ class MiMoV2FlashMoEGate(nnx.Module):
     logits = jax.lax.with_sharding_constraint(
         logits, NamedSharding(self.mesh, PartitionSpec(None, None))
     )
-    jax.debug.print("MoE gate logits shape[-1] (expect 256 with fix): {v}", v=logits.shape[-1])
 
     # Sigmoid scores (used for final expert weighting).
     scores = jax.nn.sigmoid(logits)
