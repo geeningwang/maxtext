@@ -211,10 +211,13 @@ def run_inference(
 
     result = subprocess.run(
         cmd,
-        capture_output=not verbose,
+        capture_output=True,
         text=True,
         check=False,
     )
+    if verbose:
+        print(result.stdout, end="", flush=True)
+        print(result.stderr, end="", file=sys.stderr, flush=True)
     if result.returncode != 0:
         stderr = result.stderr or ""
         raise RuntimeError(
