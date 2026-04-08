@@ -15,7 +15,7 @@ flags used during inference (``ici_tensor_parallelism=4 ici_expert_parallelism=8
 
 Usage example (run on all 8 workers):
 
-  STACKED_PATH=gs://jingnw-mimo-v2-flash-us-east5/mimo-v2-flash-scan-ocdbt/checkpoints/0/items
+  STACKED_PATH=gs://jingnw-mimo-v2-flash-us-east5/mimo-v2-flash-4phase-stacked/checkpoints/0/items
   gcloud compute tpus tpu-vm ssh jingnw-node --zone=us-east5-a --worker=all \\
     --command="
       source ~/maxtext/maxtext_tpu_venv/bin/activate && cd ~/maxtext &&
@@ -63,7 +63,7 @@ from maxtext.utils import max_utils
 # ---------------------------------------------------------------------------
 _STACKED_OUTPUT_PATH = os.environ.get(
     "STACKED_OUTPUT_PATH",
-    "gs://jingnw-mimo-v2-flash-us-east5/mimo-v2-flash-scan-ocdbt/checkpoints/0/items",
+    "gs://jingnw-mimo-v2-flash-us-east5/mimo-v2-flash-4phase-stacked/checkpoints/0/items",
 )
 
 
