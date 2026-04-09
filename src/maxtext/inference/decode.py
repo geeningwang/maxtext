@@ -160,6 +160,12 @@ def main(argv: Sequence[str]) -> None:
     text = tokenizer_model.tokenizer.apply_chat_template(  # pytype: disable=attribute-error
         messages, tokenize=False, add_generation_prompt=True, enable_thinking=True
     )
+    # For reasoning models (e.g. MiMo-V2-Flash), apply_chat_template with
+    # enable_thinking=True yields a bare assistant prefix; the model does NOT
+    # self-start <think> reliably.  Manually prepend <think> so the model is
+    # already inside a thinking block and must generate the reasoning chain.
+    if not text.endswith("<think>") and not text.endswith("<think>\n"):
+      text = text + "<think>\n"
   tokens, true_length = tokenizer_model.encode(text, is_bos=not has_chat_template, prefill_lengths=[prefill_length])
 
   position_ids = None
