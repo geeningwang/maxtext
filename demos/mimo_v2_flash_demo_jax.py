@@ -142,7 +142,7 @@ MIMO_BASE_FLAGS = {
 
 # Default generation settings
 DEFAULT_PREFILL_LENGTH = 512
-DEFAULT_MAX_NEW_TOKENS = 128
+DEFAULT_MAX_NEW_TOKENS = 2048
 
 
 def build_decode_command(

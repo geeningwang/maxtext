@@ -158,7 +158,7 @@ def main(argv: Sequence[str]) -> None:
   if config.use_chat_template and has_chat_template:
     messages = [{"role": "user", "content": text}]
     text = tokenizer_model.tokenizer.apply_chat_template(  # pytype: disable=attribute-error
-        messages, tokenize=False, add_generation_prompt=True
+        messages, tokenize=False, add_generation_prompt=True, enable_thinking=True
     )
   tokens, true_length = tokenizer_model.encode(text, is_bos=not has_chat_template, prefill_lengths=[prefill_length])
 
