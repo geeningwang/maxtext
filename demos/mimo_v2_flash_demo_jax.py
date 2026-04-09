@@ -187,6 +187,12 @@ def build_decode_command(
         f"ici_tensor_parallelism={ici_tensor_parallelism}",
         f"ici_expert_parallelism={ici_expert_parallelism}",
         f"scan_layers={'true' if scan_layers else 'false'}",
+    ]
+    if scan_layers:
+        # The 4phase-stacked checkpoint was produced with jnp.stack(axis=0),
+        # so the scan axis is at dimension 0.  Override MaxText's default of 1.
+        cmd.append("param_scan_axis=0")
+    cmd += [
         # Use dot_product attention to avoid splash attention block-size alignment
         # requirements (splash requires max_target_length % q_block_size == 0).
         "attention=dot_product",
