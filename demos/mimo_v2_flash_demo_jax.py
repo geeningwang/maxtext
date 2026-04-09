@@ -156,6 +156,7 @@ def build_decode_command(
     dtype: str = "bfloat16",
     ici_tensor_parallelism: int = 4,
     ici_expert_parallelism: int = 8,
+    scan_layers: bool = False,
 ) -> list[str]:
     """Build the shell command for maxtext.inference.decode.
 
@@ -185,7 +186,7 @@ def build_decode_command(
         # must not exceed 4.  Use expert parallelism for the 256 MoE experts instead.
         f"ici_tensor_parallelism={ici_tensor_parallelism}",
         f"ici_expert_parallelism={ici_expert_parallelism}",
-        "scan_layers=false",
+        f"scan_layers={'true' if scan_layers else 'false'}",
         # Use dot_product attention to avoid splash attention block-size alignment
         # requirements (splash requires max_target_length % q_block_size == 0).
         "attention=dot_product",
@@ -211,6 +212,7 @@ def run_inference(
     verbose: bool = False,
     ici_tensor_parallelism: int = 4,
     ici_expert_parallelism: int = 8,
+    scan_layers: bool = False,
 ) -> str:
     """Execute MaxText inference and return the generated text."""
     cmd = build_decode_command(
@@ -222,6 +224,7 @@ def run_inference(
         dtype=dtype,
         ici_tensor_parallelism=ici_tensor_parallelism,
         ici_expert_parallelism=ici_expert_parallelism,
+        scan_layers=scan_layers,
     )
     if verbose:
         print("Running command:")
@@ -419,6 +422,13 @@ def main():
              "Combined with ici_tensor_parallelism=4 gives 4×8=32 chips total on v6e-32.",
     )
     parser.add_argument(
+        "--scan_layers",
+        action="store_true",
+        default=False,
+        help="Use scan_layers=true (requires the 4-phase stacked checkpoint "
+             "produced by mimo_stack_checkpoint.py).",
+    )
+    parser.add_argument(
         "--print_arch",
         action="store_true",
         default=False,
@@ -448,6 +458,7 @@ def main():
         verbose=args.verbose,
         ici_tensor_parallelism=args.ici_tensor_parallelism,
         ici_expert_parallelism=args.ici_expert_parallelism,
+        scan_layers=args.scan_layers,
     )
     print(f"Output:\n{output}")
 
