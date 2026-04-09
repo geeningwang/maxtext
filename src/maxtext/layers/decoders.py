@@ -980,9 +980,8 @@ class Decoder(nn.Module):
           single_layer = RemattedBlockLayers[0]  # MiMoV2FlashDecoderLayerToLinen
           cycle_block = RemattedBlockLayers[1]   # MiMoV2FlashSixLayerCycleBlockToLinen
 
-          # Pre-bind non-broadcast kwargs so the scan body's positional signature
-          # is (carry, seg_ids, positions, deterministic, model_mode).
-          # This follows the same pattern as DeepSeek's layer_call_kwargs.
+          # kwargs passed to each single-layer forward call (Phase A, D) and
+          # pre-filled into the scan body via functools.partial (Phase B, C).
           _mimo_layer_call_kwargs = {
               "page_state": page_state,
               "previous_chunk": previous_chunk,
@@ -990,24 +989,26 @@ class Decoder(nn.Module):
               "kv_cache": None,
               "attention_metadata": attention_metadata,
           }
-          single_layer.__call__ = functools.partial(
-              single_layer.__call__, **_mimo_layer_call_kwargs
-          )
-          cycle_block.__call__ = functools.partial(
-              cycle_block.__call__, **_mimo_layer_call_kwargs
-          )
 
           # Phase A — layer 0 (unique: global attention + dense MLP)
-          y, _ = single_layer(
+          # Direct call with explicit kwargs — functools.partial is NOT used
+          # here because patching cls.__call__ breaks Flax Linen's descriptor
+          # protocol when the layer is called directly (not through nn.scan).
+          layer_a = single_layer(
               config=cfg,
               mesh=mesh,
               name="layers_a",
               quant=self.quant,
               model_mode=self.model_mode,
               layer_idx=0,
-          )(y, *broadcast_args)
+          )
+          y, _ = layer_a(y, *broadcast_args, **_mimo_layer_call_kwargs)
 
-          # Phase B — layers 1-4 (4× SWA-MoE, structurally homogeneous)
+          # Phase B — layers 1-4 (4× SWA-MoE, structurally homogeneous).
+          # Uses the DeepSeek-style functools.partial pattern which is safe
+          # inside nn.scan but not for direct single-layer calls.
+          _original_single_call = single_layer.__call__
+          single_layer.__call__ = functools.partial(_original_single_call, **_mimo_layer_call_kwargs)
           y, _ = self.scan_decoder_layers(
               cfg,
               single_layer,
@@ -1018,8 +1019,11 @@ class Decoder(nn.Module):
               model_mode=model_mode,
               layer_idx=1,  # representative: all Phase B layers are SWA-MoE
           )(y, *broadcast_args)
+          single_layer.__call__ = _original_single_call  # restore for Phase D
 
           # Phase C — layers 5-46 (7× 6-layer cycle: [G-MoE + 5× SWA-MoE])
+          _original_cycle_call = cycle_block.__call__
+          cycle_block.__call__ = functools.partial(_original_cycle_call, **_mimo_layer_call_kwargs)
           y, _ = self.scan_decoder_layers(
               cfg,
               cycle_block,
@@ -1029,16 +1033,19 @@ class Decoder(nn.Module):
               in_axes_tuple=(nn.broadcast,) * len(broadcast_args),
               model_mode=model_mode,
           )(y, *broadcast_args)
+          cycle_block.__call__ = _original_cycle_call  # restore
 
           # Phase D — layer 47 (unique: global attention + sparse MoE)
-          y, _ = single_layer(
+          # Direct call with explicit kwargs, same as Phase A.
+          layer_d = single_layer(
               config=cfg,
               mesh=mesh,
               name="layers_d",
               quant=self.quant,
               model_mode=self.model_mode,
               layer_idx=47,
-          )(y, *broadcast_args)
+          )
+          y, _ = layer_d(y, *broadcast_args, **_mimo_layer_call_kwargs)
         else:
           RemattedBlockLayer = RemattedBlockLayers[0]
           scan_length = int(cfg.num_decoder_layers / cfg.inhomogeneous_layer_cycle_interval)
