@@ -157,12 +157,15 @@ def main(argv: Sequence[str]) -> None:
     has_chat_template = False
   if config.use_chat_template and has_chat_template:
     messages = [{"role": "user", "content": text}]
-    # enable_thinking=False produces "<|im_start|>assistant\n<think></think>\n"
-    # so the model generates a direct answer (no reasoning chain).  This matches
-    # the tpu_demo6 reference run and avoids degeneration on complex prompts.
+    # enable_thinking=True produces the bare assistant prefix; we then manually
+    # append <think>\n so the model generates a proper reasoning chain before
+    # answering.  This is required for MiMo-V2-Flash to correctly attend to
+    # (and copy) specific numbers from the prefill (e.g. "120 km/h").
     text = tokenizer_model.tokenizer.apply_chat_template(  # pytype: disable=attribute-error
-        messages, tokenize=False, add_generation_prompt=True, enable_thinking=False
+        messages, tokenize=False, add_generation_prompt=True, enable_thinking=True
     )
+    if not text.endswith("<think>") and not text.endswith("<think>\n"):
+      text = text + "<think>\n"
   tokens, true_length = tokenizer_model.encode(text, is_bos=not has_chat_template, prefill_lengths=[prefill_length])
 
   position_ids = None
