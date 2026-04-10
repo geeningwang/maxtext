@@ -250,7 +250,9 @@ def main(argv: Sequence[str]) -> None:
       decode_state, sampled_tokens = engine.generate(params, decode_state, rng=rng_generate)
       jax.effects_barrier()
       _step_ms = (time.perf_counter() - _t_step) * 1000
-    print(f"[TIME] generate_step_{i:04d}              host={socket.gethostname()} step_ms={_step_ms:.1f}", flush=True)
+    _tok_id = sampled_tokens.get_result_at_slot(0).tokens.item()
+    _tok_str = tokenizer_model.decode([_tok_id])
+    print(f"[TIME] generate_step_{i:04d}  tok={_tok_id}  str={repr(_tok_str)}  host={socket.gethostname()} step_ms={_step_ms:.1f}", flush=True)
     if i == steps[0] or (i - steps[0]) % 50 == 0:
       _probe_hbm(f"generate_step_{i:04d}")
 
