@@ -4,13 +4,15 @@
 
 | Step | Description | Status |
 |---|---|---|
-| **1** | Fix the stacked checkpoint shape mismatch | ❌ To do |
-| **2** | Implement sparse dispatch in `MiMoV2FlashSparseMoeBlock` | ❌ Blocked on Step 1 |
+| **1** | Fix the stacked checkpoint shape mismatch | ✅ Done (`f9635502`) |
+| **2** | Implement sparse dispatch in `MiMoV2FlashSparseMoeBlock` | ❌ To do |
 | **3** | Benchmark with `scan_layers=True` + sparse dispatch | ❌ Blocked on Step 2 |
 
-**Step 1** — The `mimo-v2-flash-4phase-stacked` checkpoint has a `(4096,4)` vs `(4,4096)` shape
-mismatch on `layers_d.mlp.wo`. Re-run `mimo_stack_checkpoint.py` from the flat
-`fixed-ocdbt` checkpoint using current HEAD code.
+**Step 1** — ✅ Complete. The stacked checkpoint is live at
+`gs://jingnw-mimo-v2-flash-us-east5/mimo-v2-flash-4phase-stacked/checkpoints/0/items`.
+Load test passed on 2026-04-11: `generate_step_0130` decoded `'2'`, `generate_step_0133`
+decoded `'4'` for "What is 2+2?". HBM used: 18.91 GB / 31.25 GB per chip.
+See [Lessons from Step 1](#lessons-from-step-1) for the three bugs encountered.
 
 **Step 2** — Replace the current dense einsum block in `MiMoV2FlashSparseMoeBlock.__call__`
 with the `permute → mblx.gmm (w0, w1, wo) → unpermute` pattern from
@@ -25,8 +27,10 @@ with the `permute → mblx.gmm (w0, w1, wo) → unpermute` pattern from
 
 ## Status
 
-❌ **Blocked on Step 1** — stacked checkpoint (`mimo-v2-flash-4phase-stacked`) has a shape
-mismatch on `layers_d.mlp.wo` and must be regenerated before the sparse dispatch code can be tested.
+✅ **Step 1 complete** — stacked checkpoint valid, load test passed (2026-04-11, HEAD `f9635502`).
+
+❌ **Step 2 in progress** — implement sparse dispatch (`permute → mblx.gmm × 3 → unpermute`) in
+`MiMoV2FlashSparseMoeBlock.__call__`. Step 3 blocked on this.
 
 ---
 
@@ -57,30 +61,26 @@ It requires a correctly-stacked checkpoint.
 
 ---
 
-## Part 1 — Fix the Stacked Checkpoint
+## Part 1 — Fix the Stacked Checkpoint ✅ DONE
 
-### Root cause
+### What was done (2026-04-11)
 
-The existing `mimo-v2-flash-4phase-stacked` checkpoint was written by an older
-version of the stacking tool (likely at commit `03ed01ab` or `0637c783`) where the
-weight axis convention for `wo` in Phase D differed from current HEAD.  The tool
-just copies Phase D (no stacking), so whatever transposition issue was in that run
-is baked into the checkpoint.  The flat `fixed-ocdbt` checkpoint is untouched and
-correct — it is the source of truth.
+Three iterations were needed to produce a working stacked checkpoint:
 
-### Tool to use
-
-There are two versions of the stacking tool; always use the **latest** (`src/maxtext/tools/`):
-
-| File | Strategy | Commit | Status |
+| Bug | Root cause | Fix | Commit |
 |---|---|---|---|
-| `tools/mimo_stack_checkpoint.py` | Donation-based HBM stacking (JAX JIT) | `05c22878` | Older — do not use |
-| **`src/maxtext/tools/mimo_stack_checkpoint.py`** | CPU numpy stacking (`jax.device_get` + `np.stack`) | `0637c783` | **Latest — use this** |
+| GCS save failed | Old broken checkpoint still present at destination | `gsutil -m rm -r` + rerun | — |
+| Shape mismatch `(4096,4)` vs `(4,4096)` | `np.stack(axis=0)` but `param_scan_axis: 1` (base.yml default) → leading dim in wrong place | Changed `param_scan_axis: 0` in `mimo-v2-flash.yml`; tool uses `axis=0` | `c214c3f9` |
+| HBM OOM on load (`1.75G`, 544M free) | `weight_dtype: float32` (base.yml default) → orbax allocated stacked MoE weights as float32; `[7,32,512,4096]×f32 = 1.75 GiB` × 18 concurrent arrays = 31.5 GiB > 31.25 GiB chip limit | Set `weight_dtype: bfloat16` in `mimo-v2-flash.yml` | `f9635502` |
 
-The latest tool transfers all params to CPU first (`jax.device_get`), stacks with
-`np.stack`, then saves.  No HBM pressure during stacking.
+### Stacking tool (for future reference)
 
-### Step 1 — Run the stacking tool on all 8 workers
+The canonical tool is `src/maxtext/tools/mimo_stack_checkpoint.py` — the only copy
+(the older `tools/mimo_stack_checkpoint.py` was deleted in `13500844`). Strategy:
+transfer all params to CPU via `jax.device_get` + `np.stack(axis=0)`, then save.
+No HBM pressure during stacking.
+
+Command template (run on all 8 workers):
 
 ```bash
 gcloud compute tpus tpu-vm ssh jingnw-node --zone=us-east5-b --worker=all \
@@ -94,52 +94,22 @@ gcloud compute tpus tpu-vm ssh jingnw-node --zone=us-east5-b --worker=all \
       base_output_directory=gs://jingnw-mimo-v2-flash-us-east5/ \
       run_name=mimo_stack_convert per_device_batch_size=1 \
       max_target_length=512 max_prefill_predict_length=128 \
-      attention=dot_product scan_layers=false weight_dtype=bfloat16 \
+      attention=dot_product scan_layers=false \
       ici_tensor_parallelism=4 ici_expert_parallelism=8 async_checkpointing=false \
       > /tmp/mimo_stack.log 2>&1 &
     echo "pid=$!"
   '
 ```
 
-Note: loading 586 GB of params over GCS takes ~10–15 minutes.
+Note: `weight_dtype` and `param_scan_axis` are now set in `mimo-v2-flash.yml`
+directly, so no need to pass them on the command line.
 
-### Step 2 — Poll progress
+### Exit criteria (all verified ✅ 2026-04-11)
 
-```bash
-gcloud compute tpus tpu-vm ssh jingnw-node --zone=us-east5-b --worker=0 \
-  --command="grep -E 'Stack tool:|HBM|Error|Traceback' /tmp/mimo_stack.log | tail -10"
-```
-
-### Exit criteria for Part 1
-
-All three checks must pass:
-
-**Check 1 — Shape verification** (run on operator VM after tool exits):
-
-```bash
-python3 -c "
-import orbax.checkpoint as ocp
-from etils import epath
-STACKED = 'gs://jingnw-mimo-v2-flash-us-east5/mimo-v2-flash-4phase-stacked'
-ckpt = ocp.PyTreeCheckpointer()
-meta = ckpt.metadata(epath.Path(STACKED))
-target_keys = ['decoder.layers_b', 'decoder.layers_c.layers_0', 'decoder.layers_d.mlp.wo']
-for k, v in sorted(meta.items()):
-    if any(t in k for t in target_keys):
-        print(k, v.shape)
-"
-```
-
-Expected:
-- `decoder.layers_b.*`: leading dim `4`
-- `decoder.layers_c.layers_*.*`: leading dim `7`
-- `decoder.layers_d.mlp.wo`: shape `(I, H)` with no transposition (matches `scan_layers=false`)
-
-**Check 2 — Load test**: run `decode.py` with the stacked checkpoint and
-`scan_layers=true`; must load without `ValueError: Requested shape ... not compatible`.
-
-**Check 3 — First generate step completes**: at least one token produced without
-shape error or OOM.
+- ✅ Shape: `layers_b.*` leading dim `4`; `layers_c.layers_*.*` leading dim `7`
+- ✅ Load test: no `ValueError` during restore
+- ✅ First generate step: `generate_step_0130` decoded `'2'`, next decoded `'4'` → "2+2=4"
+- ✅ HBM: 18.91 GB / 31.25 GB used (60%, 12.34 GB headroom)
 
 ---
 
