@@ -123,7 +123,7 @@ def _stack_donated(*pytrees):
   """
   n = len(pytrees)
   return jax.jit(
-      lambda *args: jax.tree_util.tree_map(lambda *xs: jnp.stack(xs, axis=0), *args),
+      lambda *args: jax.tree_util.tree_map(lambda *xs: jnp.stack(xs, axis=1), *args),
       donate_argnums=tuple(range(n)),
   )(*pytrees)
 
