@@ -60,7 +60,102 @@ from maxtext.layers.quantizations import AqtQuantization as Quant
 from maxtext.layers.linears import MlpBlock
 from maxtext.layers.attentions import Attention, AttentionType
 from maxtext.utils import max_utils
+from maxtext.kernels import megablox as mblx
 
+
+# ---------------------------------------------------------------------------
+# Sparse MoE dispatch helpers
+# ---------------------------------------------------------------------------
+
+def _mimo_permute(
+    tokens: Array,
+    top_k_indices: Array,
+    e_local: int,
+    shard_id: Array,
+) -> tuple[Array, Array, Array, Array]:
+  """Sort tokens by local expert assignment within one EP shard.
+
+  Args:
+    tokens:         (T, H) — flat token matrix for this forward pass.
+    top_k_indices:  (T, K) — global expert indices [0, E_total), replicated
+                    across all EP shards (gate forces full replication).
+    e_local:        Number of experts owned by this EP shard (E_total / EP).
+    shard_id:       Scalar integer, index of this EP shard (0 … EP-1).
+
+  Returns:
+    sorted_tokens:  (T*K, H) — tokens sorted by their local expert assignment.
+                    Tokens not routed to this shard appear with a zero local
+                    index and will produce outputs that are masked to zero via
+                    local_weights.
+    sort_order:     (T*K,) — argsort indices used to reconstruct original order.
+    group_sizes:    (e_local,) — number of (token, expert) pairs per local
+                    expert (used by mblx.gmm).
+    local_weights:  (T*K,) — per-sorted-slot weight; 0.0 for slots not routed
+                    to this shard, so their contribution is zeroed during unpermute.
+  """
+  T, K = top_k_indices.shape
+  local_start = shard_id * e_local
+
+  # Boolean mask: which (token, k) slots route to this shard's experts.
+  local_mask = (top_k_indices >= local_start) & (top_k_indices < local_start + e_local)  # (T, K)
+
+  # Re-index global expert IDs to shard-local [0, e_local).
+  # Slots not belonging to this shard are mapped to 0 (will be masked out).
+  local_indices = jnp.where(local_mask, top_k_indices - local_start, 0)  # (T, K)
+
+  # Flatten to (T*K,) for argsort.
+  flat_local   = local_indices.ravel()  # (T*K,)
+  flat_mask    = local_mask.ravel()     # (T*K,)
+
+  # Sort by local expert ID so gmm receives contiguous groups.
+  sort_order   = jnp.argsort(flat_local)  # (T*K,)
+
+  # Replicate each token K times then sort.
+  repeated = jnp.repeat(tokens, K, axis=0)   # (T*K, H)
+  sorted_tokens = repeated[sort_order]         # (T*K, H)
+
+  # group_sizes: bincount over local expert IDs [0, e_local).
+  # Non-local slots are mapped to local index 0 (they'll be zero-weighted
+  # during unpermute but mblx.gmm needs them included in the buffer).
+  group_sizes = jnp.bincount(flat_local, length=e_local)  # (e_local,)
+
+  # Per-slot weight (0 for non-local slots so their output is zeroed).
+  local_weights = jnp.where(flat_mask, jnp.ones(T * K, dtype=jnp.float32), 0.0)  # (T*K,)
+
+  return sorted_tokens, sort_order, group_sizes, local_weights
+
+
+def _mimo_unpermute(
+    sorted_output: Array,
+    sort_order: Array,
+    top_k_weights: Array,
+    local_weights: Array,
+    T: int,
+    K: int,
+) -> Array:
+  """Reverse the permutation, apply routing weights, and sum over K.
+
+  Args:
+    sorted_output:  (T*K, H) — output of the down-projection gmm.
+    sort_order:     (T*K,) — the argsort from _mimo_permute.
+    top_k_weights:  (T, K) — normalised routing weights from the gate.
+    local_weights:  (T*K,) — mask (0 for slots not on this shard).
+    T:              Number of tokens.
+    K:              Top-k experts per token.
+
+  Returns:
+    (T, H) — token outputs for this EP shard (needs psum over expert axis).
+  """
+  H = sorted_output.shape[-1]
+  # Reverse the sort.
+  unsort_order  = jnp.argsort(sort_order)              # (T*K,)
+  unsorte_out   = sorted_output[unsort_order]           # (T*K, H)
+  # Zero out contributions from slots not routed to this shard.
+  unsorte_out   = unsorte_out * local_weights[:, None]  # (T*K, H)
+  # Reshape to (T, K, H) and apply routing weights, then sum over K.
+  reshaped  = unsorte_out.reshape(T, K, H)              # (T, K, H)
+  weights   = top_k_weights.reshape(T, K, 1)            # (T, K, 1)
+  return (reshaped * weights).sum(axis=1)               # (T, H)
 
 
 # ---------------------------------------------------------------------------
