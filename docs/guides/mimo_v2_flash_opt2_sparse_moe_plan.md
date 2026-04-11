@@ -137,33 +137,100 @@ Replace the four dense einsums in `MiMoV2FlashSparseMoeBlock.__call__` with the
 5. **`unpermute(output, weights)`** — restores original token order and applies
    top-k combination weights.
 
-#### Key adaptation work
-
-`MiMoV2FlashSparseMoeBlock` is NNX-based while `MoeBlock` is Linen.  The gmm
-call itself is framework-agnostic; the adaptation involves:
-
-- Plugging in `top_k_indices` and `top_k_weights` from `MiMoV2FlashMoEGate` as
-  the `selected_experts` / `weights` fed to the permute/unpermute helpers.
-- Setting `group_sizes = jnp.bincount(top_k_indices.ravel(), length=self.num_experts)`
-  scoped to the local EP shard's expert range.
-- Calling `mblx.gmm` with `preferred_element_type=self.config.dtype` and
-  `tiling` tuned for v6e (start with `(128, 128, 128)`).
-- `jax.lax.psum_scatter` or `jax.lax.psum` over the EP axis for the output
-  all-reduce (same as the existing dense einsum's implicit EP reduction).
-
 #### Why this is safe with `scan_layers=True`
 
 `mblx.gmm` materializes only one layer's worth of temporaries at a time.  With
 the 4-phase scan body (6-layer cycle, compiled once and looped 7×), peak HLO
 temp stays at ~3 GB vs. ~22 GB for the unrolled gather approach.
 
+### Sub-steps
+
+**Sub-step 1 — Understand EP token routing** _(read-only, ~15 min)_
+
+`MoeBlock.permute` in `moe.py` re-runs its own `top_k` from raw gate logits and
+branches on ring-of-experts / all-to-all paths that MiMo doesn't use.
+`MiMoV2FlashSparseMoeBlock` already has `top_k_indices (T,K)` and
+`top_k_weights (T,K)` from `MiMoV2FlashMoEGate`.  Confirm that MiMo's EP
+dispatch only needs the *local_permute* path (no cross-shard all-to-all needed
+because the dense einsum already handles cross-EP reduction implicitly and the
+sparse path will use `jax.lax.psum` for the output).
+
+**Sub-step 2 — Write `_mimo_permute` + `_mimo_unpermute` helpers** _(~30 min)_
+
+Inline minimal helpers inside `mimo_v2_flash.py` (no dependency on `MoeBlock`):
+
+```python
+# permute: sort tokens by their selected expert (within EP shard)
+flat_experts  = top_k_indices.ravel()                          # (T*K,)
+sort_order    = jnp.argsort(flat_experts)
+sorted_tokens = jnp.repeat(tokens, K, axis=0)[sort_order]     # (T*K, H)
+group_sizes   = jnp.bincount(flat_experts, length=E_local)    # (E_local,)
+
+# unpermute: reverse sort, reshape, weight-sum over K
+unsorted = sorted_output[jnp.argsort(sort_order)]             # (T*K, H)
+output   = (unsorted.reshape(T, K, H) * top_k_weights[..., None]).sum(axis=1)
+```
+
+**Sub-step 3 — Replace the three dense einsums with `mblx.gmm`** _(~45 min, core change)_
+
+In `MiMoV2FlashSparseMoeBlock.__call__` replace:
+```python
+gate = silu(einsum("th,ehi->eti", tokens_fp, wi_0))   # (E_local, T, I)
+up   = einsum("th,ehi->eti", tokens_fp, wi_1)
+down = einsum("eti,eih->eth", gate * up, wo)
+out  = einsum("te,eth->th", dispatch_weights, down)
+```
+With:
+```python
+sorted_tokens, sort_order, group_sizes = _mimo_permute(tokens, top_k_local, E_local)
+g  = mblx.gmm(sorted_tokens, wi_0_local, group_sizes=group_sizes,
+               preferred_element_type=cfg.dtype, tiling=(128, 128, 128))
+u  = mblx.gmm(sorted_tokens, wi_1_local, group_sizes=group_sizes,
+               preferred_element_type=cfg.dtype, tiling=(128, 128, 128))
+h  = jax.nn.silu(g) * u
+d  = mblx.gmm(h, wo_local, group_sizes=group_sizes,
+               preferred_element_type=cfg.dtype, tiling=(128, 128, 128))
+output = _mimo_unpermute(d, sort_order, top_k_weights_local, T, K)
+```
+Add `from maxtext.kernels import megablox as mblx` to imports.
+
+**Sub-step 4 — Handle the EP-local expert ID mapping** _(~20 min, tricky)_
+
+`top_k_indices` is global `[0, 256)`. Each EP shard owns expert IDs
+`[shard_id × E_local, (shard_id+1) × E_local)`. Need to:
+- Compute `shard_id = jax.lax.axis_index("expert")`.
+- Mask `top_k_indices` to only those hitting this shard:
+  `local_mask = (top_k_indices >= shard_id * E_local) & (top_k_indices < (shard_id+1) * E_local)`.
+- Re-index to `[0, E_local)`: `top_k_local = top_k_indices - shard_id * E_local` (masked).
+- After `_mimo_unpermute`, reduce across EP via `jax.lax.psum(output, axis_name="expert")`
+  (same reduction the dense `dispatch_weights` einsum performs implicitly).
+
+**Sub-step 5 — Correctness test** _(~30 min)_
+
+Run decode with `scan_layers=false` (fast iteration — no stacked checkpoint needed)
+and the flat checkpoint.  Compare output tokens for a known prompt against the
+dense dispatch baseline.  At minimum verify the "2+2=4" and harmonic mean
+(120 km each leg → 80 km/h avg) prompts produce identical answers.
+
+**Sub-step 6 — OOM elimination test with `scan_layers=true`** _(~15 min)_
+
+Run decode with `scan_layers=true` + stacked checkpoint.  Confirm:
+- No `RESOURCE_EXHAUSTED` during XLA compilation.
+- `generate_step_0000` appears cleanly.
+
+**Sub-step 7 — Benchmark** _(~15 min)_
+
+Run `src/maxtext/inference/scripts/mimo_v2_flash_bench.py` (3-step warmup,
+50 timed steps, batch=32, TP=4 EP=8) with stacked checkpoint + `scan_layers=true`.
+Record median step latency and compare to **56.5 ms** post-opt-#1 baseline.
+
 ### Implementation files to change
 
 | File | Change |
 |---|---|
-| `src/maxtext/models/mimo_v2_flash.py` | Replace dense einsums in `MiMoV2FlashSparseMoeBlock.__call__` with `permute → mblx.gmm × 3 → unpermute` |
-| `src/maxtext/models/mimo_v2_flash.py` | Import `from maxtext.kernels import megablox as mblx` |
-| `src/maxtext/models/mimo_v2_flash.py` | Import sort helpers from `moe.py` or inline `jnp.argsort`-based permute |
+| `src/maxtext/models/mimo_v2_flash.py` | Add `from maxtext.kernels import megablox as mblx` |
+| `src/maxtext/models/mimo_v2_flash.py` | Add `_mimo_permute` / `_mimo_unpermute` module-level helpers |
+| `src/maxtext/models/mimo_v2_flash.py` | Replace dense einsums in `MiMoV2FlashSparseMoeBlock.__call__` with `permute → mblx.gmm × 3 → unpermute` (sub-steps 2–4) |
 
 ### Exit criteria for Part 2
 
