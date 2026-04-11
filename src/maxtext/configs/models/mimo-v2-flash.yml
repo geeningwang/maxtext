@@ -95,3 +95,7 @@ tokenizer_type: "huggingface"
 # Training/inference defaults
 enable_dropout: false
 scan_layers: false
+param_scan_axis: 0  # Override base default of 1; axis=0 means scan dim is leading (N_scan, *param_shape).
+                    # Required for efficient orbax loading: axis=0 lets zarr chunk at 1 per scan step
+                    # (e.g. (1,32,512,4096)=250MB) vs axis=1 chunks that span the full scan stack
+                    # (e.g. (32,7,512,4096)=1.75GB) which OOMs during parallel deserialization.

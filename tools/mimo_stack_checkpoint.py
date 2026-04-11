@@ -142,7 +142,7 @@ def _rearrange_params(raw_params: dict) -> dict:
   # ---- Phase B ----
   max_logging.log(f"Stack tool: Phase B — stacking layers {_PHASE_B_INDICES} → (4, ...)")
   phase_b_list = [flat_layers.pop(str(i)) for i in _PHASE_B_INDICES]
-  layers_b = jax.tree_util.tree_map(lambda *xs: np.stack(xs, axis=1), *phase_b_list)
+  layers_b = jax.tree_util.tree_map(lambda *xs: np.stack(xs, axis=0), *phase_b_list)
   del phase_b_list
 
   # ---- Phase C ----
@@ -150,7 +150,7 @@ def _rearrange_params(raw_params: dict) -> dict:
   for pos, indices in enumerate(_PHASE_C_POSITIONS):
     max_logging.log(f"Stack tool: Phase C pos {pos} — stacking layers {indices} → (7, ...)")
     pos_layers = [flat_layers.pop(str(i)) for i in indices]
-    stacked = jax.tree_util.tree_map(lambda *xs: np.stack(xs, axis=1), *pos_layers)
+    stacked = jax.tree_util.tree_map(lambda *xs: np.stack(xs, axis=0), *pos_layers)
     del pos_layers
     layers_c[f"layers_{pos}"] = stacked
     _probe_hbm(f"after Phase C pos {pos} (CPU stack, HBM unchanged)")
