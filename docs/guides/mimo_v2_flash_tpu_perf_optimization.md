@@ -9,7 +9,7 @@ Benchmarks use `src/maxtext/inference/scripts/mimo_v2_flash_bench.py`
 |---|---|---|---|---|---|
 | 2026-04-08 | Baseline (no opt) | 71.7 ms | 446.6 tok/s | 2.2 ms/tok | — |
 | 2026-04-08 | **#1 Remove `jax.debug.print`** | **56.5 ms** | **566.1 tok/s** | **1.8 ms/tok** | ✅ |
-| 2026-04-08 | #2 Sparse MoE dispatch | — | — | — | ❌ Blocked |
+| 2026-04-12 | #2 Sparse MoE dispatch (`mblx.gmm`, `scan_layers=true`, stacked ckpt) | 56.1 ms | 570.4 tok/s | 1.8 ms/tok | ✅ |
 
 Removing a single debug line eliminated 47 host–device sync barriers per step
 (one per MoE layer), cutting step latency by **21 %** and boosting throughput
@@ -33,7 +33,7 @@ was 47 host roundtrips *per token*.
 
 ---
 
-### 2. Dense MoE dispatch (all E_local = E/EP = 32 experts computed per token) — ❌ Blocked
+### 2. Dense MoE dispatch (all E_local = E/EP = 32 experts computed per token) — ✅ Fixed (commit `4cb181c3`)
 
 Each EP shard holds `E_local = 256/8 = 32` experts.  The current dense einsum:
 
@@ -56,15 +56,20 @@ only K=8 expert slices per token instead of E=256.
 - `scan_layers=True` would bound peak to ~3 GB/layer, but MiMo layers require a
   per-layer `layer_idx` constructor argument that is incompatible with the scan wrapper
 
-**Correct fix** (requires larger refactoring):
+**Final fix implemented**:
 Use MaxText's **`megablox.gmm`** grouped-matmul kernel (already in `src/maxtext/layers/moe.py`):
 1. Sort tokens by expert assignment within each EP shard
 2. Use `mblx.gmm(tokens_sorted, wi_0, group_sizes)` — a Pallas kernel that avoids
    materializing the full `(T, K, H, I)` weight gather
 3. `psum_scatter` the output across EP devices
 This pattern is already used by MaxText's `MoeBlock` for Llama4, DeepSeek3, Mixtral, etc.
-Integrating it for MiMo requires adapting the NNX-based `MiMoV2FlashSparseMoeBlock`
-to call `sparse_matmul()` with the gate's `dispatch_mask` and `combine_mask`.
+For MiMo, the sparse path was integrated directly into `MiMoV2FlashSparseMoeBlock`
+with local permute/unpermute helpers and `jax.lax.psum(..., axis_name="expert")`.
+
+**Measured result (2026-04-12, v6e-32 TP=4 EP=8, batch=32, 3 warmup + 50 timed):**
+- Median: **56.1 ms**
+- Throughput: **570.4 tok/s**
+- Delta vs #1 baseline (56.5 ms): **-0.4 ms** (~0.7% faster)
 
 ---
 

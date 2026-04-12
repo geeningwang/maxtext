@@ -5,8 +5,8 @@
 | Step | Description | Status |
 |---|---|---|
 | **1** | Fix the stacked checkpoint shape mismatch | ✅ Done (`f9635502`) |
-| **2** | Implement sparse dispatch in `MiMoV2FlashSparseMoeBlock` | ❌ To do |
-| **3** | Benchmark with `scan_layers=True` + sparse dispatch | ❌ Blocked on Step 2 |
+| **2** | Implement sparse dispatch in `MiMoV2FlashSparseMoeBlock` | ✅ Done (`4cb181c3`) |
+| **3** | Benchmark with `scan_layers=True` + sparse dispatch | ✅ Done (2026-04-12, median 56.1 ms) |
 
 **Step 1** — ✅ Complete. The stacked checkpoint is live at
 `gs://jingnw-mimo-v2-flash-us-east5/mimo-v2-flash-4phase-stacked/checkpoints/0/items`.
@@ -29,8 +29,11 @@ with the `permute → mblx.gmm (w0, w1, wo) → unpermute` pattern from
 
 ✅ **Step 1 complete** — stacked checkpoint valid, load test passed (2026-04-11, HEAD `f9635502`).
 
-❌ **Step 2 in progress** — implement sparse dispatch (`permute → mblx.gmm × 3 → unpermute`) in
-`MiMoV2FlashSparseMoeBlock.__call__`. Step 3 blocked on this.
+✅ **Step 2 complete** — sparse dispatch (`permute → mblx.gmm × 3 → unpermute`) integrated in
+`MiMoV2FlashSparseMoeBlock.__call__` (commit `4cb181c3`).
+
+✅ **Step 3 complete** — benchmark run on 2026-04-12 (`scan_layers=true`, stacked checkpoint):
+median **56.1 ms**, throughput **570.4 tok/s**, per-seq **1.8 ms/tok**.
 
 ---
 
