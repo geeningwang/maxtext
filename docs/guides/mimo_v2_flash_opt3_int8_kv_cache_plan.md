@@ -3,6 +3,24 @@
 This runbook defines a complete, reproducible path to evaluate and (if safe)
 adopt int8 KV-cache quantization for MiMo-V2-Flash TPU inference.
 
+## Experiment Outcome (2026-04-13)
+
+Status: **Rejected for default enablement**.
+
+Summary of measured results:
+1. `scan_layers=true` + stacked checkpoint with KV-int8 is stable (no OOM/crash).
+2. Quality gate failed on harmonic-mean prompt:
+   - KV OFF: `80 km/h`
+   - KV ON: `64 km/h`
+3. Benchmark regressed:
+   - KV OFF: median `56.1 ms`, throughput `~570.2 tok/s`
+   - KV ON: median `60.1 ms`, throughput `~532.7 tok/s`
+   - Delta: about `+7.1%` slower latency, about `-6.6%` lower throughput.
+
+Decision:
+1. Keep KV-int8 **disabled by default**.
+2. Keep optional flag support for controlled experiments only.
+
 Scope:
 - Inference-only optimization (no training changes)
 - Primary target: decode-stage latency and throughput
@@ -272,9 +290,9 @@ For each run, capture:
 
 ## Current Recommendation
 
-Proceed with this plan in order:
-1. Implement CLI toggles + decode flag injection
-2. Run smoke test
-3. Run `scan_layers=true` validation
-4. Run benchmark A/B
-5. Decide default policy based on speed + quality criteria
+For the current MiMo setup on v6e-32, do **not** enable KV-int8 by default.
+
+Next recommended work:
+1. Prioritize SWA KV cache truncation (per-layer cache length).
+2. Remove per-step host syncs (`effects_barrier`/synchronous token fetch) in decode loop.
+3. Revisit KV-int8 only after those changes, and retest with the same prompt gate and A/B benchmark protocol.

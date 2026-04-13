@@ -10,6 +10,7 @@ Benchmarks use `src/maxtext/inference/scripts/mimo_v2_flash_bench.py`
 | 2026-04-08 | Baseline (no opt) | 71.7 ms | 446.6 tok/s | 2.2 ms/tok | — |
 | 2026-04-08 | **#1 Remove `jax.debug.print`** | **56.5 ms** | **566.1 tok/s** | **1.8 ms/tok** | ✅ |
 | 2026-04-12 | #2 Sparse MoE dispatch (`mblx.gmm`, `scan_layers=true`, stacked ckpt) | 56.1 ms | 570.4 tok/s | 1.8 ms/tok | ✅ |
+| 2026-04-13 | #3 Int8 KV cache quantisation (`quantize_kvcache=true`) | 60.1 ms | 532.7 tok/s | 1.9 ms/tok | ❌ Rejected |
 
 Removing a single debug line eliminated 47 host–device sync barriers per step
 (one per MoE layer), cutting step latency by **21 %** and boosting throughput
@@ -98,13 +99,28 @@ from HBM).
 autoregressive decode the dominant cost is **reading cached KV from HBM**, not
 compute.  Enabling int8 KV quantisation halves KV-read bandwidth.
 
-**Immediate fix** (no model change needed):
+**Tested result (2026-04-13, current MiMo setup):**
+
+KV-int8 was evaluated with:
+`quantize_kvcache=true kv_quant_dtype=int8 kv_quant_axis=heads_and_dkv`.
+
+Observed outcome:
+1. **Performance regression** in benchmark:
+  - `56.1 ms` -> `60.1 ms` median (about `+7.1%` slower)
+  - `570.2 tok/s` -> `532.7 tok/s` throughput (about `-6.6%`)
+2. **Quality regression** on harmonic-mean prompt:
+  - KV OFF: `80 km/h`
+  - KV ON: `64 km/h`
+
+Decision: keep KV-int8 **disabled by default** for now.
+
+Prior hypothesis / configuration tested:
 
 ```
 quantize_kvcache=true  kv_quant_dtype=int8  kv_quant_axis=heads_and_dkv
 ```
 
-Accuracy degradation is typically < 0.3 % on reasoning tasks at int8.
+Accuracy/perf behavior appears workload- and implementation-sensitive in this setup.
 
 ---
 
@@ -129,34 +145,32 @@ token check to avoid the per-step host roundtrip.
 
 ---
 
-## Optimisation Methods (ranked by expected impact)
+## Optimisation Methods (re-ranked after measured Opt #3 outcome)
 
-| # | Method | Config / Code change | Expected speedup |
+| # | Method | Config / Code change | Expected impact now |
 |---|--------|----------------------|-----------------|
 | 1 | **Remove `jax.debug.print` from MoE gate** | Delete debug line in `mimo_v2_flash.py` | **Large** — eliminates 47 sync roundtrips/step |
 | 2 | **Sparse MoE dispatch (top-8 only)** | Use MaxText MegaBlox path or gather-based sparse dispatch | **Large** — 256 → 8 expert compute (32×) |
-| 3 | **Int8 KV cache quantisation** | `quantize_kvcache=true kv_quant_dtype=int8` | ~2× on KV-bandwidth-bound steps |
-| 4 | **Truncate SWA KV cache to window size** | Decouple `cache_seq_len` per layer for 39 SWA layers | ~10–20 % HBM reduction, faster KV reads |
-| 5 | **Batch size > 1 (throughput mode)** | `per_device_batch_size=2` or more | Linear throughput scaling at low batch cost |
-| 6 | **Paged attention** | `attention=paged` — enables continuous batching | Required for production multi-request serving |
-| 7 | **Int8 weight quantisation** | `quantization=int8` | ~2× weight-read bandwidth |
-| 8 | **Remove per-step `effects_barrier` / async EOS** | Move EOS check on-device (`lax.cond`) | Removes host stall, enables step overlap |
-| 9 | **AOT compilation + buffer donation** | `engine._compile_generate_and_get_layouts()` with `donate_argnames` | Eliminates per-step buffer alloc |
-| 10 | **Ring-of-experts for EP all-reduce** | `use_ring_of_experts=true` | Overlaps MoE EP communication with compute |
-| 11 | **Speculative decoding** | Draft model (smaller MiMo) + verifier | 2–4× latency reduction for greedy/near-greedy |
-| 12 | **Reduce `max_target_length`** | Set to `prefill + actual_budget` (e.g. 1024 instead of 2512) | Smaller KV allocation, faster first-step compile |
-| 13 | **Chunked prefill** | `use_chunked_prefill=True` | Overlaps prefill and generate for multi-request |
-| 14 | **Shardy partitioner** | `shardy=True` | May find better sharding strategies |
+| 3 | **Truncate SWA KV cache to window size** | Decouple `cache_seq_len` per layer for 39 SWA layers | Medium-High (memory and bandwidth) |
+| 4 | **Remove per-step `effects_barrier` / async EOS** | Move EOS check on-device (`lax.cond`) | Medium (host sync removal in token loop) |
+| 5 | **Speculative decoding** | Draft model (smaller MiMo) + verifier | High potential, higher implementation complexity |
+| 6 | **Paged attention** | `attention=paged` — enables continuous batching | Medium for single-stream, high for serving throughput |
+| 7 | **Reduce `max_target_length`** | Set to `prefill + actual_budget` (e.g. 1024 instead of 2512) | Medium for startup/first-token and memory footprint |
+| 8 | **Batch size > 1 (throughput mode)** | `per_device_batch_size=2` or more | High throughput gain; not a per-sequence latency optimization |
+| 9 | **Int8 weight quantisation** | `quantization=int8` | Low-Medium for this decode path |
+| 10 | **Ring-of-experts for EP all-reduce** | `use_ring_of_experts=true` | Low-Medium, depends on comm/compute balance |
+| 11 | **AOT compilation + buffer donation** | `engine._compile_generate_and_get_layouts()` with `donate_argnames` | Low-Medium steady-state, useful startup/allocator wins |
+| 12 | **Chunked prefill** | `use_chunked_prefill=True` | Workload-dependent; more relevant for multi-request serving |
+| 13 | **Shardy partitioner** | `shardy=True` | Uncertain; can help if current partitioning is suboptimal |
+| 14 | **Int8 KV cache quantisation** | `quantize_kvcache=true kv_quant_dtype=int8 kv_quant_axis=heads_and_dkv` | Rejected in current setup (slower + quality regression) |
 
 ---
 
-## Most Impactful Immediate Fixes
+## Most Impactful Next Fixes
 
-Optimisations **#1** (debug.print removal) and **#2** (sparse MoE dispatch)
-are bugs / regressions, not trade-offs — they should be fixed before any
-tuning.  Combined, they likely account for the majority of the ~78 ms/step
-latency.
-
-After fixing those two, **#3** (int8 KV cache) is the highest-leverage tuning
-knob with zero model-quality change — it requires only adding two flags to the
-`build_decode_command` call in `demos/mimo_v2_flash_demo_jax.py`.
+With opt #1 and #2 complete and opt #3 rejected in current form, the highest
+priority remaining items are:
+1. SWA KV cache truncation to window-size-driven lengths.
+2. Removing per-step host sync points in decode (`effects_barrier` / token `.item()`).
+3. Re-test KV-int8 only after the two changes above, using the same prompt gate
+  and benchmark protocol.

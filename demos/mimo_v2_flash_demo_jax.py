@@ -157,6 +157,9 @@ def build_decode_command(
     ici_tensor_parallelism: int = 4,
     ici_expert_parallelism: int = 8,
     scan_layers: bool = False,
+    quantize_kvcache: bool = False,
+    kv_quant_dtype: str = "int8",
+    kv_quant_axis: str = "heads_and_dkv",
 ) -> list[str]:
     """Build the shell command for maxtext.inference.decode.
 
@@ -210,6 +213,12 @@ def build_decode_command(
         "decode_sampling_nucleus_p=0.95",
         "decode_sampling_temperature=0.6",
     ]
+    if quantize_kvcache:
+        cmd += [
+            "quantize_kvcache=true",
+            f"kv_quant_dtype={kv_quant_dtype}",
+            f"kv_quant_axis={kv_quant_axis}",
+        ]
     return cmd
 
 
@@ -224,6 +233,9 @@ def run_inference(
     ici_tensor_parallelism: int = 4,
     ici_expert_parallelism: int = 8,
     scan_layers: bool = False,
+    quantize_kvcache: bool = False,
+    kv_quant_dtype: str = "int8",
+    kv_quant_axis: str = "heads_and_dkv",
 ) -> str:
     """Execute MaxText inference and return the generated text."""
     cmd = build_decode_command(
@@ -236,6 +248,9 @@ def run_inference(
         ici_tensor_parallelism=ici_tensor_parallelism,
         ici_expert_parallelism=ici_expert_parallelism,
         scan_layers=scan_layers,
+        quantize_kvcache=quantize_kvcache,
+        kv_quant_dtype=kv_quant_dtype,
+        kv_quant_axis=kv_quant_axis,
     )
     if verbose:
         print("Running command:")
@@ -440,6 +455,26 @@ def main():
              "produced by mimo_stack_checkpoint.py).",
     )
     parser.add_argument(
+        "--quantize_kvcache",
+        action="store_true",
+        default=False,
+        help="Enable KV cache quantization for decode.",
+    )
+    parser.add_argument(
+        "--kv_quant_dtype",
+        type=str,
+        default="int8",
+        choices=["int8"],
+        help="KV cache quantization dtype.",
+    )
+    parser.add_argument(
+        "--kv_quant_axis",
+        type=str,
+        default="heads_and_dkv",
+        choices=["heads_and_dkv", "dkv", "heads_and_kv", ""],
+        help="KV cache quantization axis mode.",
+    )
+    parser.add_argument(
         "--print_arch",
         action="store_true",
         default=False,
@@ -470,6 +505,9 @@ def main():
         ici_tensor_parallelism=args.ici_tensor_parallelism,
         ici_expert_parallelism=args.ici_expert_parallelism,
         scan_layers=args.scan_layers,
+        quantize_kvcache=args.quantize_kvcache,
+        kv_quant_dtype=args.kv_quant_dtype,
+        kv_quant_axis=args.kv_quant_axis,
     )
     print(f"Output:\n{output}")
 
