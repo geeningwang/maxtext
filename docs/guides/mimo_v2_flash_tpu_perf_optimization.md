@@ -11,6 +11,11 @@ Benchmarks use `src/maxtext/inference/scripts/mimo_v2_flash_bench.py`
 | 2026-04-08 | **#1 Remove `jax.debug.print`** | **56.5 ms** | **566.1 tok/s** | **1.8 ms/tok** | ✅ |
 | 2026-04-12 | #2 Sparse MoE dispatch (`mblx.gmm`, `scan_layers=true`, stacked ckpt) | 56.1 ms | 570.4 tok/s | 1.8 ms/tok | ✅ |
 | 2026-04-13 | #3 Int8 KV cache quantisation (`quantize_kvcache=true`) | 60.1 ms | 532.7 tok/s | 1.9 ms/tok | ❌ Rejected |
+| 2026-04-13 | #4 SWA KV cache truncation (`mimo_truncate_swa_kv_cache=true`) | 1797.6 ms† | 17.8 tok/s† | 56.2 ms/tok† | ❌ Rejected |
+
+† A/B comparison (true vs false) shows **0% Δ** in both median step latency and throughput.
+The absolute numbers are 32× lower than the opt #2 baseline — a separate regression (see
+investigation note below) that affects both variants equally and is unrelated to this change.
 
 Removing a single debug line eliminated 47 host–device sync barriers per step
 (one per MoE layer), cutting step latency by **21 %** and boosting throughput
@@ -74,22 +79,75 @@ with local permute/unpermute helpers and `jax.lax.psum(..., axis_name="expert")`
 
 ---
 
-### 3. SWA KV cache allocated for full `max_target_length`
+### 3. ~~SWA KV cache allocated for full `max_target_length`~~ ❌ Rejected (zero throughput gain)
 
 39 of 48 layers use sliding-window attention (128-token window).  The KV cache
 for each SWA layer is still allocated at `max_target_length = 2512`.  That is
 19.5× more HBM than needed for those layers.  Excess HBM per device:
 
-$$39 \times 2 \times (2512 - 128) \times 8\,\text{heads} \times 128\,\text{dim} \times 2\,\text{bytes} \approx 1.4\,\text{GB/device}$$
+$$39 \times 2 \times (2512 - 128) \times 8\,\text{heads} \times 128\,\text{dim} \times 2\,\text{bytes} \approx 0.36\,\text{GB/device}$$
 
 More importantly, every generate step reads the full `max_target_length` KV
 buffer for each SWA layer even though only the 128-token window is relevant
 (the attention mask zeroes the rest, but the data still needs to be streamed
 from HBM).
 
-**Fix**: Decouple `cache_seq_len` per layer; set SWA layers to
-`window_size + prefill_length` (e.g. 640) and global layers to
-`max_target_length`.
+**Fix implemented**: `mimo_truncate_swa_kv_cache=true` (config flag) decouples
+`cache_seq_len` per layer; SWA layers get `window_size + prefill_length` (= 640)
+and global layers keep `max_target_length`.
+
+**Measured result (2026-04-13, v6e-32 TP=4 EP=8, batch=32, 3 warmup + 50 timed):**
+
+A/B benchmark with same hardware and config, only toggling `mimo_truncate_swa_kv_cache`:
+
+| Variant | Median step | Throughput | Per-seq |
+|---|---|---|---|
+| `false` (baseline) | 1797.7 ms | 17.8 tok/s | 56.2 ms/tok/seq |
+| `true` (truncation) | 1797.6 ms | 17.8 tok/s | 56.2 ms/tok/seq |
+| **Delta** | **−0.1 ms (0%)** | **0%** | **0%** |
+
+- **Throughput**: Zero improvement.  Both variants perform identically within noise.
+- **HBM**: Expected savings ~0.36 GB/device; not reflected in `after_setup_decode_state`
+  readings (both showed 17.98 GB).  At this sequence length the KV cache is a small
+  fraction of total HBM (~0.35 GB vs 17.98 GB params), limiting the impact.
+- **Step latency note**: The absolute 1797 ms is 32× higher than the opt #2 baseline
+  (56.1 ms) — this is a separate infrastructure regression (see investigation note
+  below); it affects both variants equally and does not bias the A/B comparison.
+
+**Decision**: ❌ **Rejected**.  Adds code complexity for zero confirmed throughput
+or HBM benefit at the tested configuration.  The `mimo_truncate_swa_kv_cache`
+flag defaults to `false`; can be revisited if HBM pressure becomes the limiting
+factor (e.g. at larger effective batch sizes or longer sequence budgets).
+
+---
+
+### ⚠️ Investigation: 32× step-latency regression (April 13)
+
+The April 13 benchmark shows median step = 1797 ms versus the April 12 opt #2
+baseline of 56.1 ms — a **32× slowdown** exactly equal to `batch_size`.  Key
+observations:
+
+- Both `true` and `false` variants are affected equally → NOT caused by the SWA
+  truncation change.
+- Per-seq metric: 56.2 ms/tok/seq = old step time, suggesting each of the 32
+  batch tokens is processed **sequentially** (56 ms each) instead of in parallel.
+- Timing variance is extremely tight (max − min ≈ 1.3 ms across 50 steps) →
+  steady-state compiled execution, not JIT overhead.
+- All 8 workers give identical results → consistent across the full pod.
+
+**Likely causes to investigate**:
+1. XLA schedule change (batch dim serialised over 32 elements) — could be caused
+   by a dynamic shape in the sparse MoE routing that forces sequential dispatch.
+2. JAX / XLA version bump that changed the default scheduling heuristic for
+   `lax.scan` + Pallas kernels on v6e.
+3. TPU BIOS or driver update overnight changing compute frequency.
+
+**Diagnostic next steps**:
+- Re-run with `sparse_matmul=false megablox=false` to check if mblx.gmm is the
+  source of serialisation.
+- Re-run with `scan_layers=false` to see if the layer-scan interacts with the
+  Pallas kernel scheduling.
+- Compare XLA HLO / profiler trace between April 12 and April 13 runs.
 
 ---
 
@@ -151,7 +209,7 @@ token check to avoid the per-step host roundtrip.
 |---|---|---|---|---|---|
 | 1 | opt #1 | **Remove `jax.debug.print` from MoE gate** | Delete debug line in `mimo_v2_flash.py` | **Large** — eliminates 47 sync roundtrips/step | ✅ Accepted (56.5 ms) |
 | 2 | opt #2 | **Sparse MoE dispatch (top-8 only)** | Use MaxText MegaBlox path or gather-based sparse dispatch | **Large** — 256 → 8 expert compute (32×) | ✅ Accepted (56.1 ms) |
-| 3 | N/A | **Truncate SWA KV cache to window size** | Decouple `cache_seq_len` per layer for 39 SWA layers | Medium-High (memory and bandwidth) | Not run |
+| 3 | N/A | **Truncate SWA KV cache to window size** | Decouple `cache_seq_len` per layer for 39 SWA layers | Medium-High (memory and bandwidth) | ❌ Rejected (0% Δ, ~0.36 GB/dev savings too small) |
 | 4 | N/A | **Remove per-step `effects_barrier` / async EOS** | Move EOS check on-device (`lax.cond`) | Medium (host sync removal in token loop) | Not run |
 | 5 | N/A | **Speculative decoding** | Draft model (smaller MiMo) + verifier | High potential, higher implementation complexity | Not run |
 | 6 | N/A | **Paged attention** | `attention=paged` — enables continuous batching | Medium for single-stream, high for serving throughput | Not run |

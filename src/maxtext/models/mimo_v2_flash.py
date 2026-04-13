@@ -350,7 +350,12 @@ class MiMoV2FlashSparseMoeBlock(nnx.Module):
     # non-zero value per token-expert pair).
     T = tokens.shape[0]
     K = self.num_experts_per_tok
-    shard_id = jax.lax.axis_index("expert")
+    try:
+      shard_id = jax.lax.axis_index("expert")
+      has_expert_axis = True
+    except NameError:
+      shard_id = jnp.array(0, dtype=jnp.int32)
+      has_expert_axis = False
 
     wi_0 = self.wi_0[...].astype(self.config.dtype)  # (E_local, H, I)
     wi_1 = self.wi_1[...].astype(self.config.dtype)  # (E_local, H, I)
@@ -359,36 +364,51 @@ class MiMoV2FlashSparseMoeBlock(nnx.Module):
 
     tokens_fp = tokens.astype(self.config.dtype)  # (T, H)
 
-    # Permute tokens into expert-contiguous order for gmm.
-    sorted_tokens, sort_order, group_sizes, local_weights = _mimo_permute(
+    if has_expert_axis:
+      # Permute tokens into expert-contiguous order for gmm.
+      sorted_tokens, sort_order, group_sizes, local_weights = _mimo_permute(
         tokens_fp, top_k_indices, E_local, shard_id
-    )  # sorted_tokens: (T*K, H), group_sizes: (E_local,)
+      )  # sorted_tokens: (T*K, H), group_sizes: (E_local,)
 
-    # Three grouped matmuls: gate projection (wi_0), up projection (wi_1),
-    # and down projection (wo).
-    g = mblx.gmm(
+      # Three grouped matmuls: gate projection (wi_0), up projection (wi_1),
+      # and down projection (wo).
+      g = mblx.gmm(
         sorted_tokens, wi_0, group_sizes,
         preferred_element_type=self.config.dtype,
-    )  # (T*K, I)
-    u = mblx.gmm(
+      )  # (T*K, I)
+      u = mblx.gmm(
         sorted_tokens, wi_1, group_sizes,
         preferred_element_type=self.config.dtype,
-    )  # (T*K, I)
-    h = jax.nn.silu(g) * u                              # (T*K, I)
-    d = mblx.gmm(
+      )  # (T*K, I)
+      h = jax.nn.silu(g) * u                              # (T*K, I)
+      d = mblx.gmm(
         h, wo, group_sizes,
         preferred_element_type=self.config.dtype,
-    )  # (T*K, H)
+      )  # (T*K, H)
 
-    # Unpermute, apply routing weights, and sum over K.
-    local_out = _mimo_unpermute(
+      # Unpermute, apply routing weights, and sum over K.
+      local_out = _mimo_unpermute(
         d, sort_order, top_k_weights, local_weights, T, K
-    )  # (T, H)
+      )  # (T, H)
 
-    # Sum contributions across EP shards — each token gets exactly K non-zero
-    # shard contributions (one per selected expert).
-    output = jax.lax.psum(local_out, axis_name="expert")  # (T, H)
-    return output.reshape(orig_shape)
+      # Sum contributions across EP shards — each token gets exactly K non-zero
+      # shard contributions (one per selected expert).
+      output = jax.lax.psum(local_out, axis_name="expert")  # (T, H)
+    else:
+      # Dense fallback when the expert axis is unavailable.
+      # This keeps inference functional without Megablox shard_map context.
+      selected_wi_0 = wi_0[top_k_indices]  # (T, K, H, I)
+      selected_wi_1 = wi_1[top_k_indices]  # (T, K, H, I)
+      selected_wo = wo[top_k_indices]      # (T, K, I, H)
+
+      tokens_tk = tokens_fp[:, None, :]  # (T, 1, H)
+      g = jnp.einsum("tkh,tkhi->tki", tokens_tk, selected_wi_0)
+      u = jnp.einsum("tkh,tkhi->tki", tokens_tk, selected_wi_1)
+      h = jax.nn.silu(g) * u
+      d = jnp.einsum("tki,tkih->tkh", h, selected_wo)
+      output = jnp.sum(d * top_k_weights[..., None].astype(d.dtype), axis=1)  # (T, H)
+
+    return output.astype(self.config.dtype).reshape(orig_shape)
 
 
 # ---------------------------------------------------------------------------
