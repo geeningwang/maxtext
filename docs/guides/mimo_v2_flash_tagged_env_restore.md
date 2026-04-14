@@ -9,8 +9,8 @@ snapshot `mimo-v2-flash-2026-04-08`, including:
 - the Python 3.12 TPU runtime environment
 - the demo-based TPU inference throughput benchmark
 
-The commands below assume you run resource creation and file copy from your
-local workstation with `gcloud` already installed and authenticated.
+The commands below assume you are already logged in to the manager VM
+`jingnw-tpu-op` and run everything from that VM.
 
 ## Fixed Settings
 
@@ -31,126 +31,53 @@ local workstation with `gcloud` already installed and authenticated.
 
 ## Important Notes
 
-1. The tag `mimo-v2-flash-2026-04-08` exists in this repo lineage but is not
-   available on the public GitHub remote. Do not rely on `git clone --branch
-   mimo-v2-flash-2026-04-08 ...` on the recreated machines. Instead, create a
-   local tar archive from the tag and copy that archive to the VM and TPU
-   workers.
+1. The tag `mimo-v2-flash-2026-04-08` exists locally and is published on this
+  checkout's configured `origin` remote (`https://github.com/geeningwang/maxtext`).
+  Do not use the upstream `AI-Hypercomputer/maxtext` GitHub repository for
+  MiMo-V2-Flash related work.
 2. Do not use `pkill` in this environment. If you must stop a process, find the
    exact PID and use `kill <pid>`.
-3. For multi-worker copy or SSH commands, run `ssh-add ~/.ssh/google_compute_engine`
-   first on your local workstation.
+3. For multi-worker SSH commands, run `ssh-add ~/.ssh/google_compute_engine`
+  on `jingnw-tpu-op` first.
 4. When polling a long-running benchmark, check every 20 to 30 seconds. Do not
    use long sleeps.
 
 ## 1. Set Local Shell Variables
 
-Run this on your local workstation:
+Run this on `jingnw-tpu-op`:
 
 ```bash
-export PROJECT=tpu-launchpad-playground
 export ZONE=us-east5-b
 export TPU_NAME=jingnw-node
-export OPS_VM=jingnw-tpu-op
 export TAG=mimo-v2-flash-2026-04-08
-export ARCHIVE="$HOME/maxtext-${TAG}.tar.gz"
 export CKPT=gs://jingnw-mimo-v2-flash-us-east5/mimo-v2-flash-fixed-ocdbt/checkpoints/0/items
 export TOKENIZER=XiaomiMiMo/MiMo-V2-Flash
 
-gcloud config set project "$PROJECT"
+gcloud config set project tpu-launchpad-playground
 ssh-add ~/.ssh/google_compute_engine
 ```
 
-## 2. Recreate The Manager VM
+## 2. Restore The Tagged Environment On The Ops VM
 
-Run this on your local workstation:
-
-```bash
-gcloud compute instances create "$OPS_VM" \
-  --project="$PROJECT" \
-  --zone="$ZONE" \
-  --machine-type=e2-small \
-  --image-family=debian-12 \
-  --image-project=debian-cloud \
-  --boot-disk-size=10GB \
-  --subnet=default \
-  --scopes=https://www.googleapis.com/auth/cloud-platform
-```
-
-Sanity check:
+Run this on `jingnw-tpu-op`:
 
 ```bash
-gcloud compute ssh "$OPS_VM" --zone "$ZONE" --command='hostname && python3 --version && git --version'
-```
-
-## 3. Recreate The TPU Slice
-
-Run this on your local workstation:
-
-```bash
-gcloud compute tpus tpu-vm create "$TPU_NAME" \
-  --project="$PROJECT" \
-  --zone="$ZONE" \
-  --accelerator-type=v6e-32 \
-  --version=v2-alpha-tpuv6e \
-  --network=default \
-  --subnetwork=default
-```
-
-Sanity check:
-
-```bash
-gcloud compute tpus tpu-vm describe "$TPU_NAME" --zone "$ZONE" \
-  --format='value(state,health,acceleratorType,runtimeVersion)'
-
-gcloud compute tpus tpu-vm ssh "$TPU_NAME" --zone "$ZONE" --worker=all \
-  --command='hostname && python3 --version && git --version'
-```
-
-## 4. Create An Exact Source Archive From The Tag
-
-Run this in your local repo checkout:
-
-```bash
-cd ~/maxtext
-git rev-parse --verify "refs/tags/${TAG}^{commit}"
-git archive --format=tar.gz --prefix=maxtext/ -o "$ARCHIVE" "$TAG"
-ls -lh "$ARCHIVE"
-```
-
-This archive is the source of truth for the recreated machines.
-
-## 5. Copy The Archive To The Ops VM And TPU Workers
-
-Run this on your local workstation:
-
-```bash
-gcloud compute scp "$ARCHIVE" "$OPS_VM":~ --zone "$ZONE"
-
-gcloud compute tpus tpu-vm scp "$ARCHIVE" "$TPU_NAME": --zone "$ZONE" --worker=all
-```
-
-## 6. Restore The Tagged Environment On The Ops VM
-
-Run this on your local workstation:
-
-```bash
-gcloud compute ssh "$OPS_VM" --zone "$ZONE" --command='set -e
 export PATH="$HOME/.local/bin:$PATH"
 if ! command -v uv >/dev/null 2>&1; then
   curl -LsSf https://astral.sh/uv/install.sh | sh
   export PATH="$HOME/.local/bin:$PATH"
 fi
 rm -rf "$HOME/maxtext"
-mkdir -p "$HOME/maxtext"
-tar -xzf "$HOME/maxtext-'"$TAG"'.tar.gz" -C "$HOME/maxtext"
+git clone https://github.com/geeningwang/maxtext.git "$HOME/maxtext"
+cd "$HOME/maxtext"
+git fetch --tags --force
+git checkout "$TAG"
 uv venv --python 3.12 --seed "$HOME/maxtext/maxtext_tpu_venv"
 . "$HOME/maxtext/maxtext_tpu_venv/bin/activate"
-cd "$HOME/maxtext"
 uv pip install -e ".[tpu]" --resolution=lowest
 install_maxtext_tpu_github_deps
 uv pip install transformers safetensors huggingface_hub
-python -c "import maxtext; print(\"OPS_IMPORT_OK\")"'
+python -c "import maxtext; print(\"OPS_IMPORT_OK\")"
 ```
 
 Notes:
@@ -160,9 +87,9 @@ Notes:
 - The ops VM does not run the distributed TPU job, but keeping a matching
   checkout there is useful for inspection and ad hoc commands.
 
-## 7. Restore The Tagged Environment On All TPU Workers
+## 3. Restore The Tagged Environment On All TPU Workers
 
-Run this on your local workstation:
+Run this on `jingnw-tpu-op`:
 
 ```bash
 gcloud compute tpus tpu-vm ssh "$TPU_NAME" --zone "$ZONE" --worker=all --command='set -e
@@ -172,20 +99,21 @@ if ! command -v uv >/dev/null 2>&1; then
   export PATH="$HOME/.local/bin:$PATH"
 fi
 rm -rf "$HOME/maxtext"
-mkdir -p "$HOME/maxtext"
-tar -xzf "$HOME/maxtext-'"$TAG"'.tar.gz" -C "$HOME/maxtext"
+git clone https://github.com/geeningwang/maxtext.git "$HOME/maxtext"
+cd "$HOME/maxtext"
+git fetch --tags --force
+git checkout "$TAG"
 uv venv --python 3.12 --seed "$HOME/maxtext/maxtext_tpu_venv"
 . "$HOME/maxtext/maxtext_tpu_venv/bin/activate"
-cd "$HOME/maxtext"
 uv pip install -e ".[tpu]" --resolution=lowest
 install_maxtext_tpu_github_deps
 uv pip install transformers safetensors huggingface_hub
 python -c "import maxtext; print(\"TPU_IMPORT_OK\")"'
 ```
 
-## 8. Smoke Test The Tagged JAX Demo
+## 4. Smoke Test The Tagged JAX Demo
 
-Run this on your local workstation:
+Run this on `jingnw-tpu-op`:
 
 ```bash
 gcloud compute tpus tpu-vm ssh "$TPU_NAME" --zone "$ZONE" --worker=all --command='set -e
@@ -200,13 +128,13 @@ python demos/mimo_v2_flash_demo_jax.py \
 
 Expected result: the model prints a response for the default arithmetic prompt.
 
-## 9. Run The TPU Performance Benchmark
+## 5. Run The TPU Performance Benchmark
 
 The tagged demo does not print a direct `tok/s` line unless you preserve the
 underlying decode timings. Use `--verbose` so the worker log contains the
 `[TIME] generate_step_...` lines.
 
-Run this on your local workstation:
+Run this on `jingnw-tpu-op`:
 
 ```bash
 gcloud compute tpus tpu-vm ssh "$TPU_NAME" --zone "$ZONE" --worker=all --command='set -e
@@ -225,10 +153,9 @@ echo "LOG_PATH=$LOG"'
 
 This is the exact tagged demo path used for the TPU benchmark.
 
-## 10. Poll The Benchmark
+## 6. Poll The Benchmark
 
-While the job is running, poll every 20 to 30 seconds from your local
-workstation:
+While the job is running, poll every 20 to 30 seconds from `jingnw-tpu-op`:
 
 ```bash
 gcloud compute tpus tpu-vm ssh "$TPU_NAME" --zone "$ZONE" --worker=0 --command='set -e
@@ -243,7 +170,7 @@ ls -lt "$HOME"/mimo_v2_flash_demo_jax_verbose_*.log | head -n 1
 tail -n 80 $(ls -t "$HOME"/mimo_v2_flash_demo_jax_verbose_*.log | head -n 1)'
 ```
 
-## 11. Extract The Inference Tok/s Result
+## 7. Extract The Inference Tok/s Result
 
 After the run finishes, parse the latest verbose log from worker 0:
 
@@ -287,7 +214,7 @@ Interpretation:
 - `end_to_end_generate_tok_per_s` includes the first-step compile penalty and
   is always much lower.
 
-## 12. Reference Result For This Exact Setup
+## 8. Reference Result For This Exact Setup
 
 For the recreated environment on 2026-04-14, the tagged demo produced:
 
@@ -302,30 +229,36 @@ For the recreated environment on 2026-04-14, the tagged demo produced:
 If your rerun is close to those numbers, the environment is behaving as
 expected for this tagged snapshot.
 
-## 13. Safe Cleanup
+## 9. Safe Cleanup
 
 If you need to stop a running demo, identify the exact PID first, then use
 `kill`, not `pkill`.
 
-Inspect PIDs on worker 0:
+Inspect PIDs on all workers:
 
 ```bash
-gcloud compute tpus tpu-vm ssh "$TPU_NAME" --zone "$ZONE" --worker=0 --command='set -e
+gcloud compute tpus tpu-vm ssh "$TPU_NAME" --zone "$ZONE" --worker=all --command='set -e
 ps -eo pid,etimes,args | grep "mimo_v2_flash_demo_jax.py\|maxtext.inference.decode" | grep -v grep || true'
 ```
 
-Stop one PID safely:
+Stop explicit PIDs on all workers safely:
+
+Replace `<pid1> <pid2> ...` with the exact PIDs shown for each worker.
 
 ```bash
-gcloud compute tpus tpu-vm ssh "$TPU_NAME" --zone "$ZONE" --worker=0 --command='kill <pid>'
+gcloud compute tpus tpu-vm ssh "$TPU_NAME" --zone "$ZONE" --worker=all --command='set -e
+PIDS="<pid1> <pid2> ..."
+if [[ -n "$PIDS" ]]; then
+  kill $PIDS
+fi'
 ```
 
-## 14. Troubleshooting
+## 10. Troubleshooting
 
 ### Tag checkout fails on recreated hosts
 
-That is expected if you try to clone from the public GitHub remote. Use the tar
-archive flow from this guide.
+Make sure you cloned from `https://github.com/geeningwang/maxtext.git`, not the
+upstream `AI-Hypercomputer/maxtext` repository.
 
 ### `uv venv --python 3.12` fails
 
@@ -337,7 +270,7 @@ export PATH="$HOME/.local/bin:$PATH"
 
 ### SSH returns code `255`
 
-Refresh your local SSH agent and key:
+Refresh the SSH agent and key on `jingnw-tpu-op`:
 
 ```bash
 eval "$(ssh-agent -s)"
