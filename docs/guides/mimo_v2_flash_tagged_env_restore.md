@@ -29,7 +29,7 @@ The commands below assume you are already logged in to the manager VM
 - checkpoint for inference (demo): `gs://jingnw-mimo-v2-flash-us-east5/mimo-v2-flash-fixed-ocdbt/checkpoints/0/items`
 - checkpoint for benchmark (stacked): `gs://jingnw-mimo-v2-flash-us-east5/mimo-v2-flash-4phase-stacked/checkpoints/0/items`
 - tokenizer: `XiaomiMiMo/MiMo-V2-Flash`
-- benchmark commit: `5ad76eac` (branch `MiMo-V2-Flash`)
+- benchmark commit: `2ae1dc41` (branch `MiMo-V2-Flash`)
 
 ### Runtime Package Versions (TPU Workers)
 
@@ -80,7 +80,7 @@ Run this on `jingnw-tpu-op`:
 export ZONE=us-east5-b
 export TPU_NAME=jingnw-node
 export TAG=mimo-v2-flash-2026-04-08
-export BENCH_COMMIT=5ad76eac
+export BENCH_COMMIT=2ae1dc41
 export CKPT=gs://jingnw-mimo-v2-flash-us-east5/mimo-v2-flash-fixed-ocdbt/checkpoints/0/items
 export BENCH_CKPT=gs://jingnw-mimo-v2-flash-us-east5/mimo-v2-flash-4phase-stacked/checkpoints/0/items
 export TOKENIZER=XiaomiMiMo/MiMo-V2-Flash
@@ -175,9 +175,13 @@ Expected result: the model prints a response for the default arithmetic prompt.
 ## 5. Switch Workers to the Benchmark Commit
 
 The dedicated benchmark script is not present in the tagged snapshot. Switch all
-workers to commit `$BENCH_COMMIT` (`5ad76eac`, branch `MiMo-V2-Flash`) before
+workers to commit `$BENCH_COMMIT` (`2ae1dc41`, branch `MiMo-V2-Flash`) before
 running the benchmark. The Python virtual environment installed in sections 1–3
 remains fully operational after this checkout.
+
+This commit includes the EP+TP-aware `shard_map` sparse MoE dispatch fix
+(required for JAX 0.8.1, where `jax.lax.axis_index("expert")` must be called
+inside `jax.shard_map`).
 
 Run this on `jingnw-tpu-op`:
 
@@ -270,22 +274,33 @@ Key fields in the JSON output:
 | `throughput_tok_per_s` | decoded tokens per second across all devices |
 | `batch_size` | total batch slots across all 32 devices |
 
-## 9. Reference Result For Commit 5ad76eac
+## 9. Reference Result For Commit 2ae1dc41
 
 Measured on 2026-04-15 with `jingnw-node` (v6e-32), stacked checkpoint,
 `scan_layers=true`, `per_device_batch_size=1`, `ici_tensor_parallelism=4`,
 `ici_expert_parallelism=8`:
 
+- `load_params`: about `29.4 s`
+- timed steps: `50`
+- step latency (median): about `160 ms`
+- step latency (min): about `130 ms`
+- step latency (p90): about `165 ms`
+- total throughput: about `200 tok/s` (batch=32)
+
+Results from all 8 workers are nearly identical, which is expected for a
+synchronous collective workload.
+
+### Prior Reference Result For Commit 5ad76eac (regression baseline)
+
+Measured on 2026-04-15 with the same configuration. This commit contained the
+32× performance regression caused by the dense MoE fallback (see perf doc):
+
 - `load_params`: about `27.2 s`
 - HBM after decode-state init: `17.98 GB / 31.25 GB` per device
 - timed steps: `50`
 - step latency (median): about `1757 ms`
-- step latency range: `min ~1757 ms`, `p90 ~1757 ms` (very stable)
 - total throughput: about `18.2 tok/s` (batch=32)
 - per-sequence latency: about `54.9 ms/tok`
-
-Results from all 8 workers are nearly identical (variance < 1 ms), which is
-expected for a synchronous collective workload.
 
 ## 10. Safe Cleanup
 
