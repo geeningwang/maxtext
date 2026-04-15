@@ -29,7 +29,7 @@ The commands below assume you are already logged in to the manager VM
 - checkpoint for inference (demo): `gs://jingnw-mimo-v2-flash-us-east5/mimo-v2-flash-fixed-ocdbt/checkpoints/0/items`
 - checkpoint for benchmark (stacked): `gs://jingnw-mimo-v2-flash-us-east5/mimo-v2-flash-4phase-stacked/checkpoints/0/items`
 - tokenizer: `XiaomiMiMo/MiMo-V2-Flash`
-- benchmark commit: `2ae1dc41` (branch `MiMo-V2-Flash`)
+- benchmark commit: latest `MiMo-V2-Flash` branch HEAD
 
 ### Runtime Package Versions (TPU Workers)
 
@@ -80,7 +80,7 @@ Run this on `jingnw-tpu-op`:
 export ZONE=us-east5-b
 export TPU_NAME=jingnw-node
 export TAG=mimo-v2-flash-2026-04-08
-export BENCH_COMMIT=2ae1dc41
+export BENCH_COMMIT=origin/MiMo-V2-Flash
 export CKPT=gs://jingnw-mimo-v2-flash-us-east5/mimo-v2-flash-fixed-ocdbt/checkpoints/0/items
 export BENCH_CKPT=gs://jingnw-mimo-v2-flash-us-east5/mimo-v2-flash-4phase-stacked/checkpoints/0/items
 export TOKENIZER=XiaomiMiMo/MiMo-V2-Flash
@@ -175,13 +175,9 @@ Expected result: the model prints a response for the default arithmetic prompt.
 ## 5. Switch Workers to the Benchmark Commit
 
 The dedicated benchmark script is not present in the tagged snapshot. Switch all
-workers to commit `$BENCH_COMMIT` (`2ae1dc41`, branch `MiMo-V2-Flash`) before
+workers to the latest `MiMo-V2-Flash` branch HEAD (`$BENCH_COMMIT`) before
 running the benchmark. The Python virtual environment installed in sections 1–3
 remains fully operational after this checkout.
-
-This commit includes the EP+TP-aware `shard_map` sparse MoE dispatch fix
-(required for JAX 0.8.1, where `jax.lax.axis_index("expert")` must be called
-inside `jax.shard_map`).
 
 Run this on `jingnw-tpu-op`:
 
