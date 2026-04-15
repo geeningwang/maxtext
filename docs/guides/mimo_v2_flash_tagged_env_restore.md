@@ -80,6 +80,7 @@ Run this on `jingnw-tpu-op`:
 export ZONE=us-east5-b
 export TPU_NAME=jingnw-node
 export TAG=mimo-v2-flash-2026-04-08
+export BENCH_COMMIT=5ad76eac
 export CKPT=gs://jingnw-mimo-v2-flash-us-east5/mimo-v2-flash-fixed-ocdbt/checkpoints/0/items
 export BENCH_CKPT=gs://jingnw-mimo-v2-flash-us-east5/mimo-v2-flash-4phase-stacked/checkpoints/0/items
 export TOKENIZER=XiaomiMiMo/MiMo-V2-Flash
@@ -87,6 +88,7 @@ export TOKENIZER=XiaomiMiMo/MiMo-V2-Flash
 gcloud config set project tpu-launchpad-playground
 if [[ ! -f "$HOME/.ssh/google_compute_engine" ]]; then
   ssh-keygen -t ed25519 -f "$HOME/.ssh/google_compute_engine" -N ""
+  gcloud compute os-login ssh-keys add --key-file="$HOME/.ssh/google_compute_engine.pub"
 fi
 eval "$(ssh-agent -s)"
 ssh-add ~/.ssh/google_compute_engine
@@ -124,6 +126,12 @@ Notes:
   checkout there is useful for inspection and ad hoc commands.
 
 ## 3. Restore The Tagged Environment On All TPU Workers
+
+> **Note:** All section 1 `export` variables (`TAG`, `TPU_NAME`, `ZONE`, etc.) must be
+> live in your current shell. If you reconnected or opened a new terminal, re-run
+> section 1 before continuing. The `'"$TAG"'` construct in the command below
+> interpolates `$TAG` on the ops VM before the string is sent over SSH — if `TAG`
+> is unset the checkout will silently target an empty ref and fail.
 
 Run this on `jingnw-tpu-op`:
 
@@ -167,9 +175,9 @@ Expected result: the model prints a response for the default arithmetic prompt.
 ## 5. Switch Workers to the Benchmark Commit
 
 The dedicated benchmark script is not present in the tagged snapshot. Switch all
-workers to commit `5ad76eac` (branch `MiMo-V2-Flash`) before running the
-benchmark. The Python virtual environment installed in sections 1–3 remains
-fully operational after this checkout.
+workers to commit `$BENCH_COMMIT` (`5ad76eac`, branch `MiMo-V2-Flash`) before
+running the benchmark. The Python virtual environment installed in sections 1–3
+remains fully operational after this checkout.
 
 Run this on `jingnw-tpu-op`:
 
@@ -178,7 +186,7 @@ gcloud compute tpus tpu-vm ssh "$TPU_NAME" --zone "$ZONE" --worker=all \
   --command='set -e
 cd "$HOME/maxtext"
 git fetch origin
-git checkout 5ad76eac'
+git checkout '"$BENCH_COMMIT"''
 ```
 
 ## 6. Run The Dedicated TPU Performance Benchmark
@@ -331,7 +339,21 @@ ssh-add ~/.ssh/google_compute_engine
 gcloud compute os-login ssh-keys add --key-file="$HOME/.ssh/google_compute_engine.pub"
 ```
 
-### The benchmark prints only model output and no timings
+### The benchmark script prints model output but no `[BENCH]` timing markers
 
-Re-run with `--verbose`. The non-verbose demo output is not sufficient for tok/s
-calculation.
+You may be running the demo script (`demos/mimo_v2_flash_demo_jax.py`) instead
+of the dedicated benchmark module. The benchmark is invoked as:
+
+```bash
+python3 -m maxtext.inference.scripts.mimo_v2_flash_bench ...
+```
+
+The benchmark module always prints `[BENCH]` markers and does not accept a
+`--verbose` flag. Confirm workers are on commit `$BENCH_COMMIT` (section 5)
+before re-running.
+
+### The demo script (`mimo_v2_flash_demo_jax.py`) produces garbled or repetitive output
+
+This is a known generation-quality quirk in the tagged snapshot. It does not
+affect benchmark measurements. For quality-evaluated runs, use the current
+`MiMo-V2-Flash` branch HEAD.
