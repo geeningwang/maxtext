@@ -389,7 +389,7 @@ class MiMoV2FlashSparseMoeBlock(nnx.Module):
             P("expert", None, None),  # wo    — sharded on expert axis
         ),
         out_specs=P(),        # output        — replicated (after psum)
-        check_rep=False,
+        check_vma=False,
     )(tokens_fp, top_k_indices, top_k_weights, wi_0, wi_1, wo)
 
     return output.astype(cfg.dtype).reshape(orig_shape)
