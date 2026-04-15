@@ -326,7 +326,7 @@ class MiMoV2FlashSparseMoeBlock(nnx.Module):
     )
 
   def __call__(self, hidden_states: Array, deterministic: bool) -> Array:
-    """Apply the MoE block.
+    """Apply the MoE block with EP+TP-aware shard_map sparse dispatch.
 
     Args:
       hidden_states: Shape (batch, seq_len, emb_dim).
@@ -336,59 +336,98 @@ class MiMoV2FlashSparseMoeBlock(nnx.Module):
       Output of shape (batch, seq_len, emb_dim).
     """
     orig_shape = hidden_states.shape
-    tokens = hidden_states.reshape(-1, self.hidden_size)  # (T, H)
+    tokens = hidden_states.reshape(-1, self.hidden_size)  # (T, H) global
 
-    # Route tokens to experts.
-    top_k_indices, top_k_weights = self.gate(tokens)  # (T, K), (T, K)
+    # Route tokens to experts.  The gate forces its logits to P(None, None),
+    # so top_k_indices / top_k_weights hold the full (T, K) routing for ALL
+    # tokens, replicated on every device.
+    top_k_indices, top_k_weights = self.gate(tokens)  # (T, K) replicated
 
-    # Sparse EP-parallel dispatch via megablox grouped matmul.
-    #
-    # Each EP shard owns E_local = E/EP experts.  Tokens are permuted so that
-    # they are contiguous by local expert assignment; mblx.gmm then computes
-    # only the locally-owned expert matmuls.  Non-local token slots are zeroed
-    # by local_weights during unpermute.  A psum across the "expert" axis
-    # collects each token's true output (exactly one EP shard contributes a
-    # non-zero value per token-expert pair).
-    T = tokens.shape[0]
-    K = self.num_experts_per_tok
-    shard_id = jax.lax.axis_index("expert")
+    cfg = self.config
 
-    wi_0 = self.wi_0[...].astype(self.config.dtype)  # (E_local, H, I)
-    wi_1 = self.wi_1[...].astype(self.config.dtype)  # (E_local, H, I)
-    wo   = self.wo[...].astype(self.config.dtype)     # (E_local, I, H)
-    E_local = wi_0.shape[0]
+    def _sparse_dispatch(tokens_local, top_k_indices, top_k_weights, wi_0, wi_1, wo):
+      """Sparse MoE dispatch run inside jax.shard_map.
 
-    tokens_fp = tokens.astype(self.config.dtype)  # (T, H)
+      Physical (per-device) input shapes for TP=4, EP=8 on v6e-32:
+        tokens_local  : (T/EP, H/TP)          — EP-batch + TP-embed sharded
+        top_k_indices : (T, K)                 — globally replicated
+        top_k_weights : (T, K)                 — globally replicated
+        wi_0          : (E_local, H, I/TP)     — EP-expert, full-H, TP-intermediate
+        wi_1          : same as wi_0
+        wo            : (E_local, I/TP, H)     — EP-expert, TP-intermediate, full-H
 
-    # Permute tokens into expert-contiguous order for gmm.
-    sorted_tokens, sort_order, group_sizes, local_weights = _mimo_permute(
-        tokens_fp, top_k_indices, E_local, shard_id
-    )  # sorted_tokens: (T*K, H), group_sizes: (E_local,)
+      The function:
+        1. All-gathers tokens to (T, H) on each device (H then T dim).
+        2. Permutes tokens into expert-contiguous order.
+        3. Runs three grouped matmuls (wi_0, wi_1, wo).
+        4. psum("tensor") reduces the partial row-parallel down-projection.
+        5. psum("expert") collects each token's expert contribution.
+        6. Slices the output back to the local (T/EP, H/TP) shard.
+      """
+      T_local = tokens_local.shape[0]   # T / EP
+      H_local = tokens_local.shape[1]   # H / TP
+      T = top_k_indices.shape[0]        # global token count
+      K = top_k_indices.shape[1]        # top-k experts per token
+      E_local = wi_0.shape[0]           # experts per EP shard
 
-    # Three grouped matmuls: gate projection (wi_0), up projection (wi_1),
-    # and down projection (wo).
-    g = mblx.gmm(
-        sorted_tokens, wi_0, group_sizes,
-        preferred_element_type=self.config.dtype,
-    )  # (T*K, I)
-    u = mblx.gmm(
-        sorted_tokens, wi_1, group_sizes,
-        preferred_element_type=self.config.dtype,
-    )  # (T*K, I)
-    h = jax.nn.silu(g) * u                              # (T*K, I)
-    d = mblx.gmm(
-        h, wo, group_sizes,
-        preferred_element_type=self.config.dtype,
-    )  # (T*K, H)
+      # Step 1 — assemble the full (T, H) token matrix.
+      # All-gather H first (across TP), then T (across EP).
+      tokens_h    = jax.lax.all_gather(tokens_local, "tensor", axis=1, tiled=True)  # (T_local, H)
+      tokens_full = jax.lax.all_gather(tokens_h,     "expert", axis=0, tiled=True)  # (T,       H)
 
-    # Unpermute, apply routing weights, and sum over K.
-    local_out = _mimo_unpermute(
-        d, sort_order, top_k_weights, local_weights, T, K
-    )  # (T, H)
+      # Step 2 — permute tokens into expert-contiguous order.
+      shard_id = jax.lax.axis_index("expert")
+      sorted_tokens, sort_order, group_sizes, local_weights = _mimo_permute(
+          tokens_full, top_k_indices, E_local, shard_id
+      )  # sorted_tokens: (T*K, H), group_sizes: (E_local,)
 
-    # Sum contributions across EP shards — each token gets exactly K non-zero
-    # shard contributions (one per selected expert).
-    output = jax.lax.psum(local_out, axis_name="expert")  # (T, H)
+      # Step 3 — three grouped matmuls.
+      # wi_0, wi_1 have TP-partitioned I dimension → output is (T*K, I/TP).
+      g = mblx.gmm(sorted_tokens, wi_0, group_sizes,
+                   preferred_element_type=cfg.dtype)          # (T*K, I/TP)
+      u = mblx.gmm(sorted_tokens, wi_1, group_sizes,
+                   preferred_element_type=cfg.dtype)          # (T*K, I/TP)
+      h = jax.nn.silu(g) * u                                  # (T*K, I/TP)
+      # wo has TP-partitioned I rows → output is a partial (T*K, H) sum.
+      d = mblx.gmm(h, wo, group_sizes,
+                   preferred_element_type=cfg.dtype)          # (T*K, H) partial
+
+      # Step 4 — sum TP shards to complete the row-parallel down-projection.
+      d = jax.lax.psum(d, "tensor")                           # (T*K, H) full
+
+      # Step 5 — unpermute, apply routing weights, collect EP contributions.
+      local_out = _mimo_unpermute(
+          d, sort_order, top_k_weights, local_weights, T, K
+      )                                                        # (T, H)
+      output = jax.lax.psum(local_out, "expert")              # (T, H) full
+
+      # Step 6 — slice back to the local (T/EP, H/TP) shard.
+      ep_idx = jax.lax.axis_index("expert")
+      tp_idx = jax.lax.axis_index("tensor")
+      return jax.lax.dynamic_slice(
+          output, (ep_idx * T_local, tp_idx * H_local), (T_local, H_local)
+      )                                                        # (T/EP, H/TP)
+
+    tokens_fp = tokens.astype(cfg.dtype)
+    wi_0 = self.wi_0[...].astype(cfg.dtype)   # (E, H, I) global; P("expert", None, "tensor")
+    wi_1 = self.wi_1[...].astype(cfg.dtype)   # same
+    wo   = self.wo[...].astype(cfg.dtype)     # (E, I, H) global; P("expert", "tensor", None)
+
+    output = jax.shard_map(
+        _sparse_dispatch,
+        mesh=self.mesh,
+        in_specs=(
+            P("expert", "tensor"),        # tokens_fp: (T/EP, H/TP)
+            P(None, None),                # top_k_indices: (T, K) replicated
+            P(None, None),                # top_k_weights: (T, K) replicated
+            P("expert", None, "tensor"),  # wi_0: (E_local, H, I/TP)
+            P("expert", None, "tensor"),  # wi_1: same
+            P("expert", "tensor", None),  # wo:   (E_local, I/TP, H)
+        ),
+        out_specs=P("expert", "tensor"),  # (T/EP, H/TP) — matches input token sharding
+        check_vma=False,
+    )(tokens_fp, top_k_indices, top_k_weights, wi_0, wi_1, wo)
+
     return output.reshape(orig_shape)
 
 
