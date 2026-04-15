@@ -42,7 +42,6 @@ import functools
 import jax
 import jax.numpy as jnp
 from jax import lax
-from jax.experimental.shard_map import shard_map
 from jax.sharding import PartitionSpec as P
 
 from flax import linen as nn
@@ -378,7 +377,7 @@ class MiMoV2FlashSparseMoeBlock(nnx.Module):
     wi_1 = self.wi_1[...].astype(cfg.dtype)
     wo   = self.wo[...].astype(cfg.dtype)
 
-    output = shard_map(
+    output = jax.shard_map(
         _sparse_dispatch,
         mesh=self.mesh,
         in_specs=(
@@ -390,7 +389,7 @@ class MiMoV2FlashSparseMoeBlock(nnx.Module):
             P("expert", None, None),  # wo    — sharded on expert axis
         ),
         out_specs=P(),        # output        — replicated (after psum)
-        check_vma=False,
+        check_rep=False,
     )(tokens_fp, top_k_indices, top_k_weights, wi_0, wi_1, wo)
 
     return output.astype(cfg.dtype).reshape(orig_shape)
