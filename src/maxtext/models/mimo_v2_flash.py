@@ -46,6 +46,7 @@ from jax import lax
 from flax import linen as nn
 from flax import nnx
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
+from jax.sharding import PartitionSpec as P
 
 from maxtext.common.common_types import (
     Config,
