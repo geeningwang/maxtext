@@ -1,0 +1,359 @@
+# MiMo-V2-Flash Tagged Environment Restore And TPU Benchmark
+
+This guide recreates the exact environment used for the tagged MiMo-V2-Flash
+snapshot `mimo-v2-flash-2026-04-08`, including:
+
+- the manager VM `jingnw-tpu-op`
+- the TPU slice `jingnw-node`
+- the tagged MaxText source tree on both the VM and TPU workers
+- the Python 3.12 TPU runtime environment
+- the demo-based TPU inference throughput benchmark
+
+The commands below assume you are already logged in to the manager VM
+`jingnw-tpu-op` and run everything from that VM.
+
+## Fixed Settings
+
+- project: `tpu-launchpad-playground`
+- zone: `us-east5-b`
+- ops VM name: `jingnw-tpu-op`
+- ops VM machine type: `e2-small`
+- ops VM image: Debian 12 Bookworm
+- ops VM boot disk: 10 GB
+- TPU name: `jingnw-node`
+- TPU accelerator type: `v6e-32`
+- TPU runtime version: `v2-alpha-tpuv6e`
+- network: `default`
+- subnetwork: `default`
+- tag to restore: `mimo-v2-flash-2026-04-08`
+- checkpoint for inference (demo): `gs://jingnw-mimo-v2-flash-us-east5/mimo-v2-flash-fixed-ocdbt/checkpoints/0/items`
+- checkpoint for benchmark (stacked): `gs://jingnw-mimo-v2-flash-us-east5/mimo-v2-flash-4phase-stacked/checkpoints/0/items`
+- tokenizer: `XiaomiMiMo/MiMo-V2-Flash`
+- benchmark commit: `5ad76eac` (branch `MiMo-V2-Flash`)
+
+### Runtime Package Versions (TPU Workers)
+
+Verified on 2026-04-15 from worker 0 after a full install via `uv pip install -e ".[tpu]" --resolution=lowest`:
+
+| Package | Version |
+|---|---|
+| Python | 3.12.13 |
+| jax | 0.8.1 |
+| jaxlib | 0.8.1 |
+| flax | 0.12.1 |
+| libtpu | 0.0.30 |
+| orbax-checkpoint | 0.11.33 |
+| numpy | 2.0.2 |
+| transformers | 4.57.3 |
+| tokenizers | 0.22.1 |
+| sentencepiece | 0.2.1 |
+| optax | 0.2.6 |
+| chex | 0.1.91 |
+| etils | 1.13.0 |
+| grain | 0.2.15 |
+| tensorstore | 0.1.79 |
+| protobuf | 5.29.5 |
+| grpcio | 1.76.0 |
+| google-cloud-storage | 3.6.0 |
+| google-cloud-aiplatform | 1.128.0 |
+
+## Important Notes
+
+1. The tag `mimo-v2-flash-2026-04-08` exists locally and is published on this
+  checkout's configured `origin` remote (`https://github.com/geeningwang/maxtext`).
+  Do not use the upstream `AI-Hypercomputer/maxtext` GitHub repository for
+  MiMo-V2-Flash related work.
+2. Always pass `--worker=all` when running a JAX program on the TPU slice.
+   Targeting a single worker will cause the collective to hang indefinitely.
+3. Do not use `pkill` in this environment. If you must stop a process, find the
+   exact PID and use `kill <pid>`.
+4. For multi-worker SSH commands, run `ssh-add ~/.ssh/google_compute_engine`
+  on `jingnw-tpu-op` first.
+5. When polling a long-running benchmark, check every 20 to 30 seconds. Do not
+   use long sleeps.
+
+## 1. Set Local Shell Variables
+
+Run this on `jingnw-tpu-op`:
+
+```bash
+export ZONE=us-east5-b
+export TPU_NAME=jingnw-node
+export TAG=mimo-v2-flash-2026-04-08
+export BENCH_COMMIT=5ad76eac
+export CKPT=gs://jingnw-mimo-v2-flash-us-east5/mimo-v2-flash-fixed-ocdbt/checkpoints/0/items
+export BENCH_CKPT=gs://jingnw-mimo-v2-flash-us-east5/mimo-v2-flash-4phase-stacked/checkpoints/0/items
+export TOKENIZER=XiaomiMiMo/MiMo-V2-Flash
+
+gcloud config set project tpu-launchpad-playground
+if [[ ! -f "$HOME/.ssh/google_compute_engine" ]]; then
+  ssh-keygen -t ed25519 -f "$HOME/.ssh/google_compute_engine" -N ""
+  gcloud compute os-login ssh-keys add --key-file="$HOME/.ssh/google_compute_engine.pub"
+fi
+eval "$(ssh-agent -s)"
+ssh-add ~/.ssh/google_compute_engine
+```
+
+## 2. Restore The Tagged Environment On The Ops VM
+
+Run this on `jingnw-tpu-op`:
+
+```bash
+export PATH="$HOME/.local/bin:$PATH"
+if ! command -v uv >/dev/null 2>&1; then
+  curl -LsSf https://astral.sh/uv/install.sh | sh
+  export PATH="$HOME/.local/bin:$PATH"
+fi
+cd "$HOME"
+rm -rf "$HOME/maxtext"
+git clone https://github.com/geeningwang/maxtext.git "$HOME/maxtext"
+cd "$HOME/maxtext"
+git fetch --tags --force
+git checkout "$TAG"
+uv venv --python 3.12 --seed "$HOME/maxtext/maxtext_tpu_venv"
+. "$HOME/maxtext/maxtext_tpu_venv/bin/activate"
+uv pip install -e ".[tpu]" --resolution=lowest
+install_maxtext_tpu_github_deps
+uv pip install transformers safetensors huggingface_hub
+python -c "import maxtext; print(\"OPS_IMPORT_OK\")"
+```
+
+Notes:
+
+- `uv venv --python 3.12` is intentional. The recreated hosts may not ship with
+  Python 3.12 preinstalled.
+- The ops VM does not run the distributed TPU job, but keeping a matching
+  checkout there is useful for inspection and ad hoc commands.
+
+## 3. Restore The Tagged Environment On All TPU Workers
+
+> **Note:** All section 1 `export` variables (`TAG`, `TPU_NAME`, `ZONE`, etc.) must be
+> live in your current shell. If you reconnected or opened a new terminal, re-run
+> section 1 before continuing. The `'"$TAG"'` construct in the command below
+> interpolates `$TAG` on the ops VM before the string is sent over SSH — if `TAG`
+> is unset the checkout will silently target an empty ref and fail.
+
+Run this on `jingnw-tpu-op`:
+
+```bash
+gcloud compute tpus tpu-vm ssh "$TPU_NAME" --zone "$ZONE" --worker=all --command='set -e
+export PATH="$HOME/.local/bin:$PATH"
+if ! command -v uv >/dev/null 2>&1; then
+  curl -LsSf https://astral.sh/uv/install.sh | sh
+  export PATH="$HOME/.local/bin:$PATH"
+fi
+rm -rf "$HOME/maxtext"
+git clone https://github.com/geeningwang/maxtext.git "$HOME/maxtext"
+cd "$HOME/maxtext"
+git fetch --tags --force
+git checkout '"$TAG"'
+uv venv --python 3.12 --seed "$HOME/maxtext/maxtext_tpu_venv"
+. "$HOME/maxtext/maxtext_tpu_venv/bin/activate"
+uv pip install -e ".[tpu]" --resolution=lowest
+install_maxtext_tpu_github_deps
+uv pip install transformers safetensors huggingface_hub
+python -c "import maxtext; print(\"TPU_IMPORT_OK\")"'
+```
+
+## 4. Smoke Test The Tagged JAX Demo
+
+Run this on `jingnw-tpu-op`:
+
+```bash
+gcloud compute tpus tpu-vm ssh "$TPU_NAME" --zone "$ZONE" --worker=all --command='set -e
+. "$HOME/maxtext/maxtext_tpu_venv/bin/activate"
+cd "$HOME/maxtext"
+python demos/mimo_v2_flash_demo_jax.py \
+  --checkpoint_path '"$CKPT"' \
+  --tokenizer_path '"$TOKENIZER"' \
+  --ici_tensor_parallelism 4 \
+  --ici_expert_parallelism 8'
+```
+
+Expected result: the model prints a response for the default arithmetic prompt.
+
+## 5. Switch Workers to the Benchmark Commit
+
+The dedicated benchmark script is not present in the tagged snapshot. Switch all
+workers to commit `$BENCH_COMMIT` (`5ad76eac`, branch `MiMo-V2-Flash`) before
+running the benchmark. The Python virtual environment installed in sections 1–3
+remains fully operational after this checkout.
+
+Run this on `jingnw-tpu-op`:
+
+```bash
+gcloud compute tpus tpu-vm ssh "$TPU_NAME" --zone "$ZONE" --worker=all \
+  --command='set -e
+cd "$HOME/maxtext"
+git fetch origin
+git checkout '"$BENCH_COMMIT"''
+```
+
+## 6. Run The Dedicated TPU Performance Benchmark
+
+The dedicated benchmark script runs 3 warmup steps followed by 50 timed
+`engine.generate()` steps and writes a JSON result file to
+`/tmp/bench_result.json` on each worker.
+
+The stacked checkpoint (`BENCH_CKPT`) is required when using `scan_layers=true`.
+The demo checkpoint used in sections 1–4 will raise a `ValueError` with the
+scan wrapper.
+
+Run this on `jingnw-tpu-op`:
+
+```bash
+gcloud compute tpus tpu-vm ssh "$TPU_NAME" --zone "$ZONE" --worker=all \
+  --command='set -e
+. "$HOME/maxtext/maxtext_tpu_venv/bin/activate"
+cd "$HOME/maxtext"
+export PYTHONUNBUFFERED=1
+python3 -m maxtext.inference.scripts.mimo_v2_flash_bench \
+  src/maxtext/configs/base.yml \
+  model_name=mimo-v2-flash \
+  run_name=mimo_v2_flash_bench \
+  load_parameters_path='"$BENCH_CKPT"' \
+  tokenizer_path='"$TOKENIZER"' \
+  max_prefill_predict_length=512 \
+  max_target_length=640 \
+  per_device_batch_size=1 \
+  dtype=bfloat16 \
+  weight_dtype=bfloat16 \
+  ici_tensor_parallelism=4 \
+  ici_expert_parallelism=8 \
+  scan_layers=true \
+  attention=dot_product \
+  checkpoint_storage_use_ocdbt=true \
+  checkpoint_storage_use_zarr3=true \
+  inference_microbenchmark_log_file_path=/tmp/bench_result.json'
+```
+
+Expected progress markers printed to stdout as the job runs:
+
+```
+[BENCH] load_params: <N>s
+[BENCH] decode_state initialised
+[BENCH] warmup (3 steps) ...
+[BENCH] warmup done
+[BENCH] timing 50 steps ...
+```
+
+The timed-steps loop takes several minutes. Output from all 8 workers appears
+interleaved.
+
+## 7. Poll The Benchmark
+
+While the job is running, verify processes are alive on all workers every 20 to
+30 seconds from `jingnw-tpu-op`:
+
+```bash
+gcloud compute tpus tpu-vm ssh "$TPU_NAME" --zone "$ZONE" --worker=all \
+  --command='ps -eo pid,etimes,pcpu,args | grep mimo_v2_flash_bench | grep -v grep || true'
+```
+
+## 8. Read The Benchmark Results
+
+After the run completes (all workers print `BENCH_EXIT=0`), read the JSON
+result from each worker:
+
+```bash
+gcloud compute tpus tpu-vm ssh "$TPU_NAME" --zone "$ZONE" --worker=all \
+  --command='cat /tmp/bench_result.json 2>/dev/null || echo "no result yet"'
+```
+
+Key fields in the JSON output:
+
+| Field | Meaning |
+|---|---|
+| `step_ms_median` | median per-step latency in milliseconds |
+| `step_ms_min` | minimum observed step latency |
+| `step_ms_p90` | 90th-percentile step latency |
+| `throughput_tok_per_s` | decoded tokens per second across all devices |
+| `batch_size` | total batch slots across all 32 devices |
+
+## 9. Reference Result For Commit 5ad76eac
+
+Measured on 2026-04-15 with `jingnw-node` (v6e-32), stacked checkpoint,
+`scan_layers=true`, `per_device_batch_size=1`, `ici_tensor_parallelism=4`,
+`ici_expert_parallelism=8`:
+
+- `load_params`: about `27.2 s`
+- HBM after decode-state init: `17.98 GB / 31.25 GB` per device
+- timed steps: `50`
+- step latency (median): about `1757 ms`
+- step latency range: `min ~1757 ms`, `p90 ~1757 ms` (very stable)
+- total throughput: about `18.2 tok/s` (batch=32)
+- per-sequence latency: about `54.9 ms/tok`
+
+Results from all 8 workers are nearly identical (variance < 1 ms), which is
+expected for a synchronous collective workload.
+
+## 10. Safe Cleanup
+
+If you need to stop a running job, identify the exact PID first, then use
+`kill`, not `pkill`.
+
+Inspect PIDs on all workers:
+
+```bash
+gcloud compute tpus tpu-vm ssh "$TPU_NAME" --zone "$ZONE" --worker=all --command='set -e
+ps -eo pid,etimes,args | grep "mimo_v2_flash_demo_jax.py\|mimo_v2_flash_bench\|maxtext.inference" | grep -v grep || true'
+```
+
+Stop explicit PIDs on all workers safely:
+
+Replace `<pid1> <pid2> ...` with the exact PIDs shown for each worker.
+
+```bash
+gcloud compute tpus tpu-vm ssh "$TPU_NAME" --zone "$ZONE" --worker=all --command='set -e
+PIDS="<pid1> <pid2> ..."
+if [[ -n "$PIDS" ]]; then
+  kill $PIDS
+fi'
+```
+
+## 11. Troubleshooting
+
+### Tag checkout fails on recreated hosts
+
+Make sure you cloned from `https://github.com/geeningwang/maxtext.git`, not the
+upstream `AI-Hypercomputer/maxtext` repository.
+
+### `uv venv --python 3.12` fails
+
+Re-run after ensuring `uv` is on `PATH`:
+
+```bash
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+### SSH returns code `255`
+
+Refresh the SSH agent and key on `jingnw-tpu-op`:
+
+```bash
+if [[ ! -f "$HOME/.ssh/google_compute_engine" ]]; then
+  ssh-keygen -t ed25519 -f "$HOME/.ssh/google_compute_engine" -N ""
+fi
+eval "$(ssh-agent -s)"
+ssh-add ~/.ssh/google_compute_engine
+gcloud compute os-login ssh-keys add --key-file="$HOME/.ssh/google_compute_engine.pub"
+```
+
+### The benchmark script prints model output but no `[BENCH]` timing markers
+
+You may be running the demo script (`demos/mimo_v2_flash_demo_jax.py`) instead
+of the dedicated benchmark module. The benchmark is invoked as:
+
+```bash
+python3 -m maxtext.inference.scripts.mimo_v2_flash_bench ...
+```
+
+The benchmark module always prints `[BENCH]` markers and does not accept a
+`--verbose` flag. Confirm workers are on commit `$BENCH_COMMIT` (section 5)
+before re-running.
+
+### The demo script (`mimo_v2_flash_demo_jax.py`) produces garbled or repetitive output
+
+This is a known generation-quality quirk in the tagged snapshot. It does not
+affect benchmark measurements. For quality-evaluated runs, use the current
+`MiMo-V2-Flash` branch HEAD.
