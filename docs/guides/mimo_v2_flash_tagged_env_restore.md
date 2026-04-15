@@ -26,8 +26,36 @@ The commands below assume you are already logged in to the manager VM
 - network: `default`
 - subnetwork: `default`
 - tag to restore: `mimo-v2-flash-2026-04-08`
-- checkpoint for inference: `gs://jingnw-mimo-v2-flash-us-east5/mimo-v2-flash-fixed-ocdbt/checkpoints/0/items`
+- checkpoint for inference (demo): `gs://jingnw-mimo-v2-flash-us-east5/mimo-v2-flash-fixed-ocdbt/checkpoints/0/items`
+- checkpoint for benchmark (stacked): `gs://jingnw-mimo-v2-flash-us-east5/mimo-v2-flash-4phase-stacked/checkpoints/0/items`
 - tokenizer: `XiaomiMiMo/MiMo-V2-Flash`
+- benchmark commit: `5ad76eac` (branch `MiMo-V2-Flash`)
+
+### Runtime Package Versions (TPU Workers)
+
+Verified on 2026-04-15 from worker 0 after a full install via `uv pip install -e ".[tpu]" --resolution=lowest`:
+
+| Package | Version |
+|---|---|
+| Python | 3.12.13 |
+| jax | 0.8.1 |
+| jaxlib | 0.8.1 |
+| flax | 0.12.1 |
+| libtpu | 0.0.30 |
+| orbax-checkpoint | 0.11.33 |
+| numpy | 2.0.2 |
+| transformers | 4.57.3 |
+| tokenizers | 0.22.1 |
+| sentencepiece | 0.2.1 |
+| optax | 0.2.6 |
+| chex | 0.1.91 |
+| etils | 1.13.0 |
+| grain | 0.2.15 |
+| tensorstore | 0.1.79 |
+| protobuf | 5.29.5 |
+| grpcio | 1.76.0 |
+| google-cloud-storage | 3.6.0 |
+| google-cloud-aiplatform | 1.128.0 |
 
 ## Important Notes
 
@@ -51,6 +79,7 @@ export ZONE=us-east5-b
 export TPU_NAME=jingnw-node
 export TAG=mimo-v2-flash-2026-04-08
 export CKPT=gs://jingnw-mimo-v2-flash-us-east5/mimo-v2-flash-fixed-ocdbt/checkpoints/0/items
+export BENCH_CKPT=gs://jingnw-mimo-v2-flash-us-east5/mimo-v2-flash-4phase-stacked/checkpoints/0/items
 export TOKENIZER=XiaomiMiMo/MiMo-V2-Flash
 
 gcloud config set project tpu-launchpad-playground
@@ -133,117 +162,131 @@ python demos/mimo_v2_flash_demo_jax.py \
 
 Expected result: the model prints a response for the default arithmetic prompt.
 
-## 5. Run The TPU Performance Benchmark
+## 5. Switch Workers to the Benchmark Commit
 
-The tagged demo does not print a direct `tok/s` line unless you preserve the
-underlying decode timings. Use `--verbose` so the worker log contains the
-`[TIME] generate_step_...` lines.
+The dedicated benchmark script is not present in the tagged snapshot. Switch all
+workers to commit `5ad76eac` (branch `MiMo-V2-Flash`) before running the
+benchmark. The Python virtual environment installed in sections 1–3 remains
+fully operational after this checkout.
 
 Run this on `jingnw-tpu-op`:
 
 ```bash
-gcloud compute tpus tpu-vm ssh "$TPU_NAME" --zone "$ZONE" --worker=all --command='set -e
+gcloud compute tpus tpu-vm ssh "$TPU_NAME" --zone "$ZONE" --worker=all \
+  --command='set -e
+cd "$HOME/maxtext"
+git fetch origin
+git checkout 5ad76eac'
+```
+
+## 6. Run The Dedicated TPU Performance Benchmark
+
+The dedicated benchmark script runs 3 warmup steps followed by 50 timed
+`engine.generate()` steps and writes a JSON result file to
+`/tmp/bench_result.json` on each worker.
+
+The stacked checkpoint (`BENCH_CKPT`) is required when using `scan_layers=true`.
+The demo checkpoint used in sections 1–4 will raise a `ValueError` with the
+scan wrapper.
+
+Run this on `jingnw-tpu-op`:
+
+```bash
+gcloud compute tpus tpu-vm ssh "$TPU_NAME" --zone "$ZONE" --worker=all \
+  --command='set -e
 . "$HOME/maxtext/maxtext_tpu_venv/bin/activate"
 cd "$HOME/maxtext"
 export PYTHONUNBUFFERED=1
-LOG="$HOME/mimo_v2_flash_demo_jax_verbose_$(date +%Y%m%d_%H%M%S).log"
-python demos/mimo_v2_flash_demo_jax.py \
-  --checkpoint_path '"$CKPT"' \
-  --tokenizer_path '"$TOKENIZER"' \
-  --ici_tensor_parallelism 4 \
-  --ici_expert_parallelism 8 \
-  --verbose 2>&1 | tee "$LOG"
-echo "LOG_PATH=$LOG"'
+python3 -m maxtext.inference.scripts.mimo_v2_flash_bench \
+  src/maxtext/configs/base.yml \
+  model_name=mimo-v2-flash \
+  run_name=mimo_v2_flash_bench \
+  load_parameters_path='"$BENCH_CKPT"' \
+  tokenizer_path='"$TOKENIZER"' \
+  max_prefill_predict_length=512 \
+  max_target_length=640 \
+  per_device_batch_size=1 \
+  dtype=bfloat16 \
+  weight_dtype=bfloat16 \
+  ici_tensor_parallelism=4 \
+  ici_expert_parallelism=8 \
+  scan_layers=true \
+  attention=dot_product \
+  checkpoint_storage_use_ocdbt=true \
+  checkpoint_storage_use_zarr3=true \
+  inference_microbenchmark_log_file_path=/tmp/bench_result.json'
 ```
 
-This is the exact tagged demo path used for the TPU benchmark.
+Expected progress markers printed to stdout as the job runs:
 
-## 6. Poll The Benchmark
+```
+[BENCH] load_params: <N>s
+[BENCH] decode_state initialised
+[BENCH] warmup (3 steps) ...
+[BENCH] warmup done
+[BENCH] timing 50 steps ...
+```
 
-While the job is running, poll every 20 to 30 seconds from `jingnw-tpu-op`:
+The timed-steps loop takes several minutes. Output from all 8 workers appears
+interleaved.
+
+## 7. Poll The Benchmark
+
+While the job is running, verify processes are alive on all workers every 20 to
+30 seconds from `jingnw-tpu-op`:
 
 ```bash
-gcloud compute tpus tpu-vm ssh "$TPU_NAME" --zone "$ZONE" --worker=0 --command='set -e
-ps -eo pid,etimes,pcpu,pmem,args | grep "python -m maxtext.inference.decode" | grep -v grep || true'
+gcloud compute tpus tpu-vm ssh "$TPU_NAME" --zone "$ZONE" --worker=all \
+  --command='ps -eo pid,etimes,pcpu,args | grep mimo_v2_flash_bench | grep -v grep || true'
 ```
 
-To inspect the tail of the current log on worker 0:
+## 8. Read The Benchmark Results
+
+After the run completes (all workers print `BENCH_EXIT=0`), read the JSON
+result from each worker:
 
 ```bash
-gcloud compute tpus tpu-vm ssh "$TPU_NAME" --zone "$ZONE" --worker=0 --command='set -e
-ls -lt "$HOME"/mimo_v2_flash_demo_jax_verbose_*.log | head -n 1
-tail -n 80 $(ls -t "$HOME"/mimo_v2_flash_demo_jax_verbose_*.log | head -n 1)'
+gcloud compute tpus tpu-vm ssh "$TPU_NAME" --zone "$ZONE" --worker=all \
+  --command='cat /tmp/bench_result.json 2>/dev/null || echo "no result yet"'
 ```
 
-## 7. Extract The Inference Tok/s Result
+Key fields in the JSON output:
 
-After the run finishes, parse the latest verbose log from worker 0:
+| Field | Meaning |
+|---|---|
+| `step_ms_median` | median per-step latency in milliseconds |
+| `step_ms_min` | minimum observed step latency |
+| `step_ms_p90` | 90th-percentile step latency |
+| `throughput_tok_per_s` | decoded tokens per second across all devices |
+| `batch_size` | total batch slots across all 32 devices |
 
-```bash
-gcloud compute tpus tpu-vm ssh "$TPU_NAME" --zone "$ZONE" --worker=0 --command='set -e
-python3 - <<"PY"
-import re
-from pathlib import Path
+## 9. Reference Result For Commit 5ad76eac
 
-logs = sorted(Path.home().glob("mimo_v2_flash_demo_jax_verbose_*.log"), key=lambda p: p.stat().st_mtime)
-log = logs[-1]
-text = log.read_text()
+Measured on 2026-04-15 with `jingnw-node` (v6e-32), stacked checkpoint,
+`scan_layers=true`, `per_device_batch_size=1`, `ici_tensor_parallelism=4`,
+`ici_expert_parallelism=8`:
 
-load = re.search(r"\[TIME\] load_params\s+host=.*? elapsed=([0-9.]+)s", text)
-prefill = re.search(r"\[TIME\] prefill\s+host=.*? elapsed=([0-9.]+)ms", text)
-total = re.search(r"\[TIME\] generate_total\s+host=.*? total=([0-9.]+)s steps=([0-9]+) avg_ms=([0-9.]+)", text)
-steps = [float(x) for x in re.findall(r"\[TIME\] generate_step_\d+\s+host=.*? step_ms=([0-9.]+)", text)]
+- `load_params`: about `27.2 s`
+- HBM after decode-state init: `17.98 GB / 31.25 GB` per device
+- timed steps: `50`
+- step latency (median): about `1757 ms`
+- step latency range: `min ~1757 ms`, `p90 ~1757 ms` (very stable)
+- total throughput: about `18.2 tok/s` (batch=32)
+- per-sequence latency: about `54.9 ms/tok`
 
-if not total or not steps:
-    raise SystemExit(f"Could not parse timing lines from {log}")
+Results from all 8 workers are nearly identical (variance < 1 ms), which is
+expected for a synchronous collective workload.
 
-steady_ms = sum(steps[1:]) / (len(steps) - 1)
-steady_tok_s = (len(steps) - 1) / (sum(steps[1:]) / 1000)
-end_to_end_tok_s = len(steps) / float(total.group(1))
+## 10. Safe Cleanup
 
-print(f"log={log}")
-print(f"load_params_s={float(load.group(1)) if load else 'n/a'}")
-print(f"prefill_ms={float(prefill.group(1)) if prefill else 'n/a'}")
-print(f"generate_steps={len(steps)}")
-print(f"first_generate_step_ms={steps[0]:.3f}")
-print(f"steady_state_mean_ms={steady_ms:.3f}")
-print(f"steady_state_tok_per_s={steady_tok_s:.3f}")
-print(f"end_to_end_generate_tok_per_s={end_to_end_tok_s:.3f}")
-PY'
-```
-
-Interpretation:
-
-- `steady_state_tok_per_s` is the practical TPU inference throughput after the
-  one-time first-token compile cost.
-- `end_to_end_generate_tok_per_s` includes the first-step compile penalty and
-  is always much lower.
-
-## 8. Reference Result For This Exact Setup
-
-For the recreated environment on 2026-04-14, the tagged demo produced:
-
-- `load_params`: about `32.1 s`
-- `prefill` for `512` tokens: about `22.2 s`
-- generated tokens: `128`
-- first generate step: about `35.8 s`
-- steady-state generate step: about `71.6 ms/token`
-- steady-state inference throughput: about `14.0 tok/s`
-- end-to-end generate throughput including the first-step compile: about `2.8 tok/s`
-
-If your rerun is close to those numbers, the environment is behaving as
-expected for this tagged snapshot.
-
-## 9. Safe Cleanup
-
-If you need to stop a running demo, identify the exact PID first, then use
+If you need to stop a running job, identify the exact PID first, then use
 `kill`, not `pkill`.
 
 Inspect PIDs on all workers:
 
 ```bash
 gcloud compute tpus tpu-vm ssh "$TPU_NAME" --zone "$ZONE" --worker=all --command='set -e
-ps -eo pid,etimes,args | grep "mimo_v2_flash_demo_jax.py\|maxtext.inference.decode" | grep -v grep || true'
+ps -eo pid,etimes,args | grep "mimo_v2_flash_demo_jax.py\|mimo_v2_flash_bench\|maxtext.inference" | grep -v grep || true'
 ```
 
 Stop explicit PIDs on all workers safely:
@@ -258,7 +301,7 @@ if [[ -n "$PIDS" ]]; then
 fi'
 ```
 
-## 10. Troubleshooting
+## 11. Troubleshooting
 
 ### Tag checkout fails on recreated hosts
 
