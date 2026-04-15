@@ -405,9 +405,12 @@ class MiMoV2FlashSparseMoeBlock(nnx.Module):
       # Step 6 — slice back to the local (T/EP, H/TP) shard.
       ep_idx = jax.lax.axis_index("expert")
       tp_idx = jax.lax.axis_index("tensor")
-      return jax.lax.dynamic_slice(
+      result = jax.lax.dynamic_slice(
           output, (ep_idx * T_local, tp_idx * H_local), (T_local, H_local)
       )                                                        # (T/EP, H/TP)
+      # Cast to match the input dtype (local_weights in _mimo_permute is float32,
+      # which promotes the psum output to float32; the scan carry expects cfg.dtype).
+      return result.astype(tokens_local.dtype)
 
     tokens_fp = tokens.astype(cfg.dtype)
     wi_0 = self.wi_0[...].astype(cfg.dtype)   # (E, H, I) global; P("expert", None, "tensor")
