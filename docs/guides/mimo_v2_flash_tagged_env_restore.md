@@ -54,6 +54,10 @@ export CKPT=gs://jingnw-mimo-v2-flash-us-east5/mimo-v2-flash-fixed-ocdbt/checkpo
 export TOKENIZER=XiaomiMiMo/MiMo-V2-Flash
 
 gcloud config set project tpu-launchpad-playground
+if [[ ! -f "$HOME/.ssh/google_compute_engine" ]]; then
+  ssh-keygen -t ed25519 -f "$HOME/.ssh/google_compute_engine" -N ""
+fi
+eval "$(ssh-agent -s)"
 ssh-add ~/.ssh/google_compute_engine
 ```
 
@@ -67,6 +71,7 @@ if ! command -v uv >/dev/null 2>&1; then
   curl -LsSf https://astral.sh/uv/install.sh | sh
   export PATH="$HOME/.local/bin:$PATH"
 fi
+cd "$HOME"
 rm -rf "$HOME/maxtext"
 git clone https://github.com/geeningwang/maxtext.git "$HOME/maxtext"
 cd "$HOME/maxtext"
@@ -102,7 +107,7 @@ rm -rf "$HOME/maxtext"
 git clone https://github.com/geeningwang/maxtext.git "$HOME/maxtext"
 cd "$HOME/maxtext"
 git fetch --tags --force
-git checkout "$TAG"
+git checkout '"$TAG"'
 uv venv --python 3.12 --seed "$HOME/maxtext/maxtext_tpu_venv"
 . "$HOME/maxtext/maxtext_tpu_venv/bin/activate"
 uv pip install -e ".[tpu]" --resolution=lowest
@@ -273,6 +278,9 @@ export PATH="$HOME/.local/bin:$PATH"
 Refresh the SSH agent and key on `jingnw-tpu-op`:
 
 ```bash
+if [[ ! -f "$HOME/.ssh/google_compute_engine" ]]; then
+  ssh-keygen -t ed25519 -f "$HOME/.ssh/google_compute_engine" -N ""
+fi
 eval "$(ssh-agent -s)"
 ssh-add ~/.ssh/google_compute_engine
 gcloud compute os-login ssh-keys add --key-file="$HOME/.ssh/google_compute_engine.pub"
