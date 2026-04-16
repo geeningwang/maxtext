@@ -9,15 +9,21 @@ Benchmarks use `src/maxtext/inference/scripts/mimo_v2_flash_bench.py`
 |---|---|---|---|---|---|
 | 2026-04-08 | Baseline (no opt) | 71.7 ms | 446.6 tok/s | 2.2 ms/tok | — |
 | 2026-04-08 | **#1 Remove `jax.debug.print`** | **56.5 ms** | **566.1 tok/s** | **1.8 ms/tok** | ✅ |
-| 2026-04-12 | #2 Sparse MoE dispatch (`mblx.gmm`, `scan_layers=true`, stacked ckpt) | 56.1 ms | 570.4 tok/s | 1.8 ms/tok | ✅ |
+| 2026-04-12 | #2 Sparse MoE dispatch (`mblx.gmm`, `scan_layers=true`, stacked ckpt) | ~~56.1 ms~~ | ~~570.4 tok/s~~ | ~~1.8 ms/tok~~ | ⚠️ Invalid |
 | 2026-04-13 | #3 Int8 KV cache quantisation (`quantize_kvcache=true`) | 60.1 ms | 532.7 tok/s | 1.9 ms/tok | ❌ Rejected |
 | 2026-04-13 | #4 SWA KV cache truncation (`mimo_truncate_swa_kv_cache=true`) | 1797.6 ms† | 17.8 tok/s† | 56.2 ms/tok† | ❌ Rejected |
 | 2026-04-15 | **#5 Fix sparse dispatch for JAX 0.8.1 (EP+TP `shard_map`)** | **160 ms** | **200 tok/s** | **5.0 ms/tok** | ✅ |
 
 † A/B comparison (true vs false) shows **0% Δ** in both median step latency and throughput.
-The absolute numbers are 32× lower than the opt #2 baseline — a separate regression (root
-cause identified and fixed in opt #5, see §5 below) that affects both variants equally and
-is unrelated to this change.
+The absolute numbers are 32× lower than the opt #1 baseline (56.5 ms) — a separate regression
+(root cause identified and fixed in opt #5, see §5 below) that affects both variants equally
+and is unrelated to this change.
+
+⚠️ **Opt #2 measurement invalid**: The 56.1 ms figure was recorded from a stale JIT cache
+still executing the opt #1 (dense) code path. Commit `4cb181c3` crashes with
+`NameError: Found an unbound axis name: expert` on all tested JAX versions (0.4.38 – 0.9.2)
+because `jax.lax.axis_index` is only valid inside `jax.shard_map` or `jax.pmap(axis_name=...)`.
+The sparse gmm path was never actually benchmarked before the regression was introduced.
 
 Removing a single debug line eliminated 47 host–device sync barriers per step
 (one per MoE layer), cutting step latency by **21 %** and boosting throughput
@@ -41,7 +47,7 @@ was 47 host roundtrips *per token*.
 
 ---
 
-### 2. Dense MoE dispatch (all E_local = E/EP = 32 experts computed per token) — ✅ Fixed (commit `4cb181c3`)
+### 2. Dense MoE dispatch (all E_local = E/EP = 32 experts computed per token) — ⚠️ Implementation incomplete (commit `4cb181c3` crashes on all JAX versions)
 
 Each EP shard holds `E_local = 256/8 = 32` experts.  The current dense einsum:
 
@@ -74,10 +80,14 @@ This pattern is already used by MaxText's `MoeBlock` for Llama4, DeepSeek3, Mixt
 For MiMo, the sparse path was integrated directly into `MiMoV2FlashSparseMoeBlock`
 with local permute/unpermute helpers and `jax.lax.psum(..., axis_name="expert")`.
 
-**Measured result (2026-04-12, v6e-32 TP=4 EP=8, batch=32, 3 warmup + 50 timed):**
-- Median: **56.1 ms**
-- Throughput: **570.4 tok/s**
-- Delta vs #1 baseline (56.5 ms): **-0.4 ms** (~0.7% faster)
+**Result (2026-04-12):** ⚠️ **Measurement invalid.**
+The benchmark was run while the JIT cache still held a compiled artifact from opt #1
+(the dense path).  The 56.1 ms figure reflects the opt #1 dense code, not `mblx.gmm`
+sparse dispatch.  Commit `4cb181c3` itself raises `NameError: Found an unbound axis name:
+expert` on every JAX version (0.4.38 – 0.9.2) because `jax.lax.axis_index("expert")`
+was called in a `pjit`+mesh context outside of `jax.shard_map`.  The sparse code path
+was never successfully executed before the regression was introduced.  See §5 for the
+correct fix (`shard_map` wrapper, commit `2ae1dc41`).
 
 ---
 
@@ -112,9 +122,11 @@ A/B benchmark with same hardware and config, only toggling `mimo_truncate_swa_kv
 - **HBM**: Expected savings ~0.36 GB/device; not reflected in `after_setup_decode_state`
   readings (both showed 17.98 GB).  At this sequence length the KV cache is a small
   fraction of total HBM (~0.35 GB vs 17.98 GB params), limiting the impact.
-- **Step latency note**: The absolute 1797 ms is 32× higher than the opt #2 baseline
-  (56.1 ms) — this is a separate infrastructure regression (see investigation note
-  below); it affects both variants equally and does not bias the A/B comparison.
+- **Step latency note**: The absolute 1797 ms is 32× higher than the opt #1 baseline
+  (56.5 ms) — this is a separate software regression (see §5 below); it affects both
+  variants equally and does not bias the A/B comparison.  (Note: the frequently-cited
+  "opt #2 baseline of 56.1 ms" is a stale JIT cache artifact and should not be used
+  as a reference; see ⚠️ note above the benchmark history table.)
 
 **Decision**: ❌ **Rejected**.  Adds code complexity for zero confirmed throughput
 or HBM benefit at the tested configuration.  The `mimo_truncate_swa_kv_cache`
@@ -160,15 +172,17 @@ the row-parallel down-projection, `psum("expert")` to collect EP contributions,
 then `dynamic_slice` back to the local `(T/EP, H/TP)` shard.
 
 **Measured result (2026-04-15, same hardware/config):**
-- Median: **160 ms** (vs 1757 ms regression, vs 56 ms pre-regression target)
+- Median: **160 ms** (vs 1757 ms regression; opt #1 dense baseline was 56.5 ms)
 - Throughput: **200 tok/s** (vs 18.2 tok/s regression)
 - Improvement: **11× vs regression baseline**
 
-The remaining gap to the 56 ms pre-regression target is due to the two
-all-gather collectives added by the shard_map boundary (assembling full `(T,H)`
-tokens on each device). Eliminating these would require restructuring the
-dispatch to avoid the full token all-gathers (e.g. using `ragged_all_to_all`
-as in MaxText's `RoutedMoE` path).
+The gap between 160 ms and the opt #1 dense baseline (56.5 ms) is due to two
+all-gather collectives added by the shard_map boundary (assembling the full `(T,H)`
+token matrix on each device before dispatch).  The sparse gmm code has never
+been benchmarked on JAX 0.8.1 without these all-gathers; the theoretical target
+(avoiding full-token broadcast) has not been measured.  Eliminating the all-gathers
+would require restructuring dispatch to avoid the full token all-gathers (e.g. using
+`ragged_all_to_all` as in MaxText's `RoutedMoE` path).
 
 ---
 
@@ -183,10 +197,15 @@ compute.  Enabling int8 KV quantisation halves KV-read bandwidth.
 KV-int8 was evaluated with:
 `quantize_kvcache=true kv_quant_dtype=int8 kv_quant_axis=heads_and_dkv`.
 
+⚠️ **Note**: The April 13 result was presumably measured against the stale-cache
+"56.1 ms" baseline (opt #2 JIT cache artifact); 56.1 ms is not a valid reference point
+(see ⚠️ note above benchmark table).  The A/B delta (+3.5 ms, ~+6 %) is directionally
+valid.  The quality regression finding is unambiguous.
+
 Observed outcome:
 1. **Performance regression** in benchmark:
-  - `56.1 ms` -> `60.1 ms` median (about `+7.1%` slower)
-  - `570.2 tok/s` -> `532.7 tok/s` throughput (about `-6.6%`)
+  - `56.1 ms` → `60.1 ms` median (about `+7.1%` slower; baseline figure is a stale JIT cache artifact)
+  - `570.2 tok/s` → `532.7 tok/s` throughput (about `−6.6%`)
 2. **Quality regression** on harmonic-mean prompt:
   - KV OFF: `80 km/h`
   - KV ON: `64 km/h`
@@ -229,32 +248,34 @@ token check to avoid the per-step host roundtrip.
 | Rank | Original Opt ID | Method | Config / Code change | Expected impact now | Result |
 |---|---|---|---|---|---|
 | 1 | opt #1 | **Remove `jax.debug.print` from MoE gate** | Delete debug line in `mimo_v2_flash.py` | **Large** — eliminates 47 sync roundtrips/step | ✅ Accepted (56.5 ms) |
-| 2 | opt #2 | **Sparse MoE dispatch (top-8 only)** | Use MaxText MegaBlox path or gather-based sparse dispatch | **Large** — 256 → 8 expert compute (32×) | ✅ Accepted (56.1 ms) |
-| 3 | N/A | **Fix sparse dispatch for JAX 0.8.1** | EP+TP `shard_map` wrapper in `MiMoV2FlashSparseMoeBlock` | **Large** — restores sparse path, 11× vs regression | ✅ Accepted (160 ms, `2ae1dc41`) |
-| 4 | N/A | **Eliminate all-gather in shard_map dispatch** | Use `ragged_all_to_all` instead of full-token gather | **Large** — close remaining gap to 56 ms target | Not run |
-| 5 | N/A | **Truncate SWA KV cache to window size** | Decouple `cache_seq_len` per layer for 39 SWA layers | Medium-High (memory and bandwidth) | ❌ Rejected (0% Δ, ~0.36 GB/dev savings too small) |
-| 4 | N/A | **Remove per-step `effects_barrier` / async EOS** | Move EOS check on-device (`lax.cond`) | Medium (host sync removal in token loop) | Not run |
-| 5 | N/A | **Speculative decoding** | Draft model (smaller MiMo) + verifier | High potential, higher implementation complexity | Not run |
-| 6 | N/A | **Paged attention** | `attention=paged` — enables continuous batching | Medium for single-stream, high for serving throughput | Not run |
-| 7 | N/A | **Reduce `max_target_length`** | Set to `prefill + actual_budget` (e.g. 1024 instead of 2512) | Medium for startup/first-token and memory footprint | Not run |
-| 8 | N/A | **Batch size > 1 (throughput mode)** | `per_device_batch_size=2` or more | High throughput gain; not a per-sequence latency optimization | Not run |
-| 9 | N/A | **Int8 weight quantisation** | `quantization=int8` | Low-Medium for this decode path | Not run |
-| 10 | N/A | **Ring-of-experts for EP all-reduce** | `use_ring_of_experts=true` | Low-Medium, depends on comm/compute balance | Not run |
-| 11 | N/A | **AOT compilation + buffer donation** | `engine._compile_generate_and_get_layouts()` with `donate_argnames` | Low-Medium steady-state, useful startup/allocator wins | Not run |
-| 12 | N/A | **Chunked prefill** | `use_chunked_prefill=True` | Workload-dependent; more relevant for multi-request serving | Not run |
-| 13 | N/A | **Shardy partitioner** | `shardy=True` | Uncertain; can help if current partitioning is suboptimal | Not run |
-| 14 | opt #3 | **Int8 KV cache quantisation** | `quantize_kvcache=true kv_quant_dtype=int8 kv_quant_axis=heads_and_dkv` | Rejected in current setup (slower + quality regression) | ❌ Rejected (60.1 ms, quality regression) |
+| 2 | opt #2 | **Sparse MoE dispatch (top-8 only)** | Use MaxText MegaBlox path (`mblx.gmm`) | **Large** — 256 → 8 expert compute (32×) | ⚠️ Code merged; 56.1 ms figure invalid (stale JIT cache) |
+| 3 | N/A | **Fix sparse dispatch for JAX 0.8.1** | EP+TP `shard_map` wrapper in `MiMoV2FlashSparseMoeBlock` | **Large** — first working sparse execution, 11× vs regression | ✅ Accepted (160 ms, `2ae1dc41`) |
+| 4 | N/A | **Eliminate all-gather in shard_map dispatch** | Use `ragged_all_to_all` instead of full-token broadcast | **Large** — close gap between 160 ms and opt #1 baseline | Not run |
+| 5 | N/A | **Remove per-step `effects_barrier` / async EOS** | Move EOS check on-device (`lax.cond`) | Medium (host sync removal in token loop) | Not run |
+| 6 | N/A | **Truncate SWA KV cache to window size** | Decouple `cache_seq_len` per layer for 39 SWA layers | Medium-High (memory and bandwidth) | ❌ Rejected (0% Δ, ~0.36 GB/dev savings too small) |
+| 7 | N/A | **Speculative decoding** | Draft model (smaller MiMo) + verifier | High potential, higher implementation complexity | Not run |
+| 8 | N/A | **Paged attention** | `attention=paged` — enables continuous batching | Medium for single-stream, high for serving throughput | Not run |
+| 9 | N/A | **Reduce `max_target_length`** | Set to `prefill + actual_budget` (e.g. 1024 instead of 2512) | Medium for startup/first-token and memory footprint | Not run |
+| 10 | N/A | **Batch size > 1 (throughput mode)** | `per_device_batch_size=2` or more | High throughput gain; not a per-sequence latency optimization | Not run |
+| 11 | N/A | **Int8 weight quantisation** | `quantization=int8` | Low-Medium for this decode path | Not run |
+| 12 | N/A | **Ring-of-experts for EP all-reduce** | `use_ring_of_experts=true` | Low-Medium, depends on comm/compute balance | Not run |
+| 13 | N/A | **AOT compilation + buffer donation** | `engine._compile_generate_and_get_layouts()` with `donate_argnames` | Low-Medium steady-state, useful startup/allocator wins | Not run |
+| 14 | N/A | **Chunked prefill** | `use_chunked_prefill=True` | Workload-dependent; more relevant for multi-request serving | Not run |
+| 15 | N/A | **Shardy partitioner** | `shardy=True` | Uncertain; can help if current partitioning is suboptimal | Not run |
+| 16 | opt #3 | **Int8 KV cache quantisation** | `quantize_kvcache=true kv_quant_dtype=int8 kv_quant_axis=heads_and_dkv` | Rejected in current setup (slower + quality regression) | ❌ Rejected (60.1 ms baseline invalid; A/B delta +~6%, quality regression) |
 
 ---
 
 ## Most Impactful Next Fixes
 
-With opt #1, #2, and #5 complete and opt #3 rejected in current form, the highest
+With opt #1 and opt #5 complete, the sparse gmm path in place (opt #2 code merged,
+although never cleanly benchmarked), and opt #3 rejected in current form, the highest
 priority remaining items are:
 1. **Eliminate all-gather overhead in sparse dispatch** — restructure dispatch to
    avoid assembling the full `(T, H)` token matrix on each device (e.g. adopt
-   MaxText's `ragged_all_to_all`-based `RoutedMoE` path). This is the remaining
-   gap between 160 ms (current) and the 56 ms pre-regression target.
+   MaxText's `ragged_all_to_all`-based `RoutedMoE` path in `src/maxtext/layers/moe.py`).
+   This is the remaining gap between 160 ms (current HEAD) and the opt #1 dense baseline
+   (56.5 ms); the theoretical floor for sparse dispatch has not yet been measured.
 2. Removing per-step host sync points in decode (`effects_barrier` / token `.item()`).
 3. SWA KV cache truncation to window-size-driven lengths.
 4. Re-test KV-int8 only after items 1–2 above, using the same prompt gate
