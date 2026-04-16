@@ -58,14 +58,20 @@ Verified on 2026-04-15 from worker 0 after a full install via `uv pip install -e
 
 ## Important Notes
 
-1. Always pass `--worker=all` when running a JAX program on the TPU slice.
+1. Use the `MiMo-V2-Flash` branch in `geeningwang/maxtext`. Do not use the
+   upstream `AI-Hypercomputer/maxtext` repository for MiMo-V2-Flash work.
+2. Always pass `--worker=all` when running a JAX program on the TPU slice.
    Targeting a single worker will cause the collective to hang indefinitely.
-2. Do not use `pkill` in this environment. If you must stop a process, find the
+3. Do not use `pkill` in this environment. If you must stop a process, find the
    exact PID and use `kill <pid>`.
-3. For multi-worker SSH commands, run `ssh-add ~/.ssh/google_compute_engine`
+4. For multi-worker SSH commands, run `ssh-add ~/.ssh/google_compute_engine`
   on `jingnw-tpu-op` first.
-4. When polling a long-running benchmark, check every 20 to 30 seconds. Do not
+5. When polling a long-running benchmark, check every 20 to 30 seconds. Do not
    use long sleeps.
+6. At startup, each worker prints up to 8 lines like
+   `INTERNAL: CUDA error: Failed call to cuInit: UNKNOWN ERROR (303)`. These
+   are harmless — JAX probes for CUDA, finds none on TPU workers, and falls
+   back to TPU automatically. They can be ignored.
 
 ## 1. Set Local Shell Variables
 
