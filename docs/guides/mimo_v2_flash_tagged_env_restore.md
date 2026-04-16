@@ -79,7 +79,7 @@ Run this on `jingnw-tpu-op`:
 ```bash
 export ZONE=us-east5-b
 export TPU_NAME=jingnw-node
-export TAG=mimo-v2-flash-2026-04-08
+export TAG=MiMo-V2-Flash
 export BENCH_COMMIT=origin/MiMo-V2-Flash
 export CKPT=gs://jingnw-mimo-v2-flash-us-east5/mimo-v2-flash-fixed-ocdbt/checkpoints/0/items
 export BENCH_CKPT=gs://jingnw-mimo-v2-flash-us-east5/mimo-v2-flash-4phase-stacked/checkpoints/0/items
