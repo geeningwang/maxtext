@@ -68,7 +68,7 @@ Verified on 2026-04-15 from worker 0 after a full install via `uv pip install -e
   on `jingnw-tpu-op` first.
 5. When polling a long-running benchmark, check every 20 to 30 seconds. Do not
    use long sleeps.
-6. At startup, each worker prints up to 8 lines like
+6. At startup, each worker prints exactly 8 lines (one per device) like
    `INTERNAL: CUDA error: Failed call to cuInit: UNKNOWN ERROR (303)`. These
    are harmless — JAX probes for CUDA, finds none on TPU workers, and falls
    back to TPU automatically. They can be ignored.
@@ -254,11 +254,27 @@ Key fields in the JSON output:
 | `throughput_tok_per_s` | decoded tokens per second across all devices |
 | `batch_size` | total batch slots across all 32 devices |
 
-## 8. Reference Result For Commit 2ae1dc41
+## 8. Reference Results
 
-Measured on 2026-04-15 with `jingnw-node` (v6e-32), stacked checkpoint,
+Configuration for all runs: `jingnw-node` (v6e-32), stacked checkpoint,
 `scan_layers=true`, `per_device_batch_size=1`, `ici_tensor_parallelism=4`,
-`ici_expert_parallelism=8`:
+`ici_expert_parallelism=8`.
+
+> **Note on `load_params` time:** The first run after a full environment restore
+> hits a cold GCS cache and takes noticeably longer (~40 s). Subsequent runs on
+> the same cluster use a warm cache and return to the ~29–30 s baseline.
+
+### 2026-04-16 — Commit f42416a4 (cold GCS cache, post-restore)
+
+- `load_params`: about `40.4 s` (cold GCS cache)
+- timed steps: `50`
+- step latency (mean): about `152.7 ms`
+- step latency (median): about `160.0 ms`
+- step latency (min): about `129.8 ms`
+- step latency (p90): about `164.9 ms`
+- total throughput: about `200 tok/s` (batch=32)
+
+### 2026-04-15 — Commit 2ae1dc41 (warm GCS cache)
 
 - `load_params`: about `29.4 s`
 - timed steps: `50`
@@ -343,5 +359,7 @@ The benchmark module always prints `[BENCH]` markers and does not accept a
 
 ### The demo script (`mimo_v2_flash_demo_jax.py`) produces garbled or repetitive output
 
-This is a known generation-quality quirk of the demo script's greedy decoding
-without EOS handling. It does not affect benchmark measurements.
+This was observed occasionally with earlier commits. As of `f42416a4` the demo
+produces well-formed output. If you see repetitive or garbled text, it is a
+greedy-decoding artifact without EOS handling and does not affect benchmark
+measurements.
