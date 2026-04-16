@@ -37,7 +37,6 @@ References:
 # pylint: disable=no-name-in-module
 
 from typing import Any, Optional
-import functools
 
 import jax
 import jax.numpy as jnp
@@ -46,7 +45,6 @@ from jax import lax
 from flax import linen as nn
 from flax import nnx
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
-from jax.sharding import PartitionSpec as P
 
 from maxtext.common.common_types import (
     Config,
@@ -62,102 +60,7 @@ from maxtext.layers.quantizations import AqtQuantization as Quant
 from maxtext.layers.linears import MlpBlock
 from maxtext.layers.attentions import Attention, AttentionType
 from maxtext.utils import max_utils
-from maxtext.kernels import megablox as mblx
 
-
-# ---------------------------------------------------------------------------
-# Sparse MoE dispatch helpers
-# ---------------------------------------------------------------------------
-
-def _mimo_permute(
-    tokens: Array,
-    top_k_indices: Array,
-    e_local: int,
-    shard_id: Array,
-) -> tuple[Array, Array, Array, Array]:
-  """Sort tokens by local expert assignment within one EP shard.
-
-  Args:
-    tokens:         (T, H) — flat token matrix for this forward pass.
-    top_k_indices:  (T, K) — global expert indices [0, E_total), replicated
-                    across all EP shards (gate forces full replication).
-    e_local:        Number of experts owned by this EP shard (E_total / EP).
-    shard_id:       Scalar integer, index of this EP shard (0 … EP-1).
-
-  Returns:
-    sorted_tokens:  (T*K, H) — tokens sorted by their local expert assignment.
-                    Tokens not routed to this shard appear with a zero local
-                    index and will produce outputs that are masked to zero via
-                    local_weights.
-    sort_order:     (T*K,) — argsort indices used to reconstruct original order.
-    group_sizes:    (e_local,) — number of (token, expert) pairs per local
-                    expert (used by mblx.gmm).
-    local_weights:  (T*K,) — per-sorted-slot weight; 0.0 for slots not routed
-                    to this shard, so their contribution is zeroed during unpermute.
-  """
-  T, K = top_k_indices.shape
-  local_start = shard_id * e_local
-
-  # Boolean mask: which (token, k) slots route to this shard's experts.
-  local_mask = (top_k_indices >= local_start) & (top_k_indices < local_start + e_local)  # (T, K)
-
-  # Re-index global expert IDs to shard-local [0, e_local).
-  # Slots not belonging to this shard are mapped to 0 (will be masked out).
-  local_indices = jnp.where(local_mask, top_k_indices - local_start, 0)  # (T, K)
-
-  # Flatten to (T*K,) for argsort.
-  flat_local   = local_indices.ravel()  # (T*K,)
-  flat_mask    = local_mask.ravel()     # (T*K,)
-
-  # Sort by local expert ID so gmm receives contiguous groups.
-  sort_order   = jnp.argsort(flat_local)  # (T*K,)
-
-  # Replicate each token K times then sort.
-  repeated = jnp.repeat(tokens, K, axis=0)   # (T*K, H)
-  sorted_tokens = repeated[sort_order]         # (T*K, H)
-
-  # group_sizes: bincount over local expert IDs [0, e_local).
-  # Non-local slots are mapped to local index 0 (they'll be zero-weighted
-  # during unpermute but mblx.gmm needs them included in the buffer).
-  group_sizes = jnp.bincount(flat_local, length=e_local)  # (e_local,)
-
-  # Per-slot weight (0 for non-local slots so their output is zeroed).
-  local_weights = jnp.where(flat_mask, jnp.ones(T * K, dtype=jnp.float32), 0.0)  # (T*K,)
-
-  return sorted_tokens, sort_order, group_sizes, local_weights
-
-
-def _mimo_unpermute(
-    sorted_output: Array,
-    sort_order: Array,
-    top_k_weights: Array,
-    local_weights: Array,
-    T: int,
-    K: int,
-) -> Array:
-  """Reverse the permutation, apply routing weights, and sum over K.
-
-  Args:
-    sorted_output:  (T*K, H) — output of the down-projection gmm.
-    sort_order:     (T*K,) — the argsort from _mimo_permute.
-    top_k_weights:  (T, K) — normalised routing weights from the gate.
-    local_weights:  (T*K,) — mask (0 for slots not on this shard).
-    T:              Number of tokens.
-    K:              Top-k experts per token.
-
-  Returns:
-    (T, H) — token outputs for this EP shard (needs psum over expert axis).
-  """
-  H = sorted_output.shape[-1]
-  # Reverse the sort.
-  unsort_order  = jnp.argsort(sort_order)              # (T*K,)
-  unsorte_out   = sorted_output[unsort_order]           # (T*K, H)
-  # Zero out contributions from slots not routed to this shard.
-  unsorte_out   = unsorte_out * local_weights[:, None]  # (T*K, H)
-  # Reshape to (T, K, H) and apply routing weights, then sum over K.
-  reshaped  = unsorte_out.reshape(T, K, H)              # (T, K, H)
-  weights   = top_k_weights.reshape(T, K, 1)            # (T, K, 1)
-  return (reshaped * weights).sum(axis=1)               # (T, H)
 
 
 # ---------------------------------------------------------------------------
@@ -327,7 +230,7 @@ class MiMoV2FlashSparseMoeBlock(nnx.Module):
     )
 
   def __call__(self, hidden_states: Array, deterministic: bool) -> Array:
-    """Apply the MoE block with EP+TP-aware shard_map sparse dispatch.
+    """Apply the MoE block.
 
     Args:
       hidden_states: Shape (batch, seq_len, emb_dim).
@@ -337,101 +240,56 @@ class MiMoV2FlashSparseMoeBlock(nnx.Module):
       Output of shape (batch, seq_len, emb_dim).
     """
     orig_shape = hidden_states.shape
-    tokens = hidden_states.reshape(-1, self.hidden_size)  # (T, H) global
+    tokens = hidden_states.reshape(-1, self.hidden_size)  # (T, H)
 
-    # Route tokens to experts.  The gate forces its logits to P(None, None),
-    # so top_k_indices / top_k_weights hold the full (T, K) routing for ALL
-    # tokens, replicated on every device.
-    top_k_indices, top_k_weights = self.gate(tokens)  # (T, K) replicated
+    # Route tokens to experts.
+    top_k_indices, top_k_weights = self.gate(tokens)  # (T, K), (T, K)
 
-    cfg = self.config
+    # Dispatch tokens to their assigned experts using a scatter/gather approach,
+    # which is fully static-shape-friendly and XLA-compilable.
+    #
+    # Strategy: build an (E, T) weight matrix by scattering top_k_weights into
+    # positions indexed by top_k_indices, then use a single einsum per expert
+    # group. For 256 experts this is the most efficient static approach.
+    #
+    # dispatch_weights: (T, E) — weight for each (token, expert) pair (0 if not selected)
+    T = tokens.shape[0]
+    dispatch_weights = jnp.zeros((T, self.num_experts), dtype=jnp.float32)
+    tok_idx = jnp.broadcast_to(
+        jnp.arange(T)[:, jnp.newaxis], (T, self.num_experts_per_tok)
+    )  # (T, K)
+    dispatch_weights = dispatch_weights.at[tok_idx, top_k_indices].add(
+        top_k_weights.astype(jnp.float32)
+    )  # (T, E)
 
-    def _sparse_dispatch(tokens_local, top_k_indices, top_k_weights, wi_0, wi_1, wo):
-      """Sparse MoE dispatch run inside jax.shard_map.
+    wi_0 = self.wi_0[...].astype(self.config.dtype)  # (E, H, I)
+    wi_1 = self.wi_1[...].astype(self.config.dtype)  # (E, H, I)
+    wo = self.wo[...].astype(self.config.dtype)       # (E, I, H)
 
-      Physical (per-device) input shapes for TP=4, EP=8 on v6e-32:
-        tokens_local  : (T/EP, H/TP)          — EP-batch + TP-embed sharded
-        top_k_indices : (T, K)                 — globally replicated
-        top_k_weights : (T, K)                 — globally replicated
-        wi_0          : (E_local, H, I/TP)     — EP-expert, full-H, TP-intermediate
-        wi_1          : same as wi_0
-        wo            : (E_local, I/TP, H)     — EP-expert, TP-intermediate, full-H
+    # For each expert e compute the contribution to each token:
+    #   g_e   = silu(tokens @ wi_0[e])               (T, I)
+    #   u_e   = tokens @ wi_1[e]                      (T, I)
+    #   out_e = (g_e * u_e) @ wo[e]                  (T, H)
+    #   contribution_e = dispatch_weights[:, e:e+1] * out_e  (T, H)
+    #
+    # We vectorise over E using jnp.einsum with the expert axis:
+    #   tokens_all: (T, H) broadcast over all experts.
+    #   gate:  (E, T, I) = silu(einsum('TH,EHI->ETI', tokens, wi_0))
+    #   up:    (E, T, I) =     einsum('TH,EHI->ETI', tokens, wi_1)
+    #   down:  (E, T, H) =     einsum('ETI,EIH->ETH', gate*up, wo)
+    #   out:   (T, H)    =     einsum('TE,ETH->TH',  dispatch_weights, down)
 
-      The function:
-        1. All-gathers tokens to (T, H) on each device (H then T dim).
-        2. Permutes tokens into expert-contiguous order.
-        3. Runs three grouped matmuls (wi_0, wi_1, wo).
-        4. psum("tensor") reduces the partial row-parallel down-projection.
-        5. psum("expert") collects each token's expert contribution.
-        6. Slices the output back to the local (T/EP, H/TP) shard.
-      """
-      T_local = tokens_local.shape[0]   # T / EP
-      H_local = tokens_local.shape[1]   # H / TP
-      T = top_k_indices.shape[0]        # global token count
-      K = top_k_indices.shape[1]        # top-k experts per token
-      E_local = wi_0.shape[0]           # experts per EP shard
-
-      # Step 1 — assemble the full (T, H) token matrix.
-      # All-gather H first (across TP), then T (across EP).
-      tokens_h    = jax.lax.all_gather(tokens_local, "tensor", axis=1, tiled=True)  # (T_local, H)
-      tokens_full = jax.lax.all_gather(tokens_h,     "expert", axis=0, tiled=True)  # (T,       H)
-
-      # Step 2 — permute tokens into expert-contiguous order.
-      shard_id = jax.lax.axis_index("expert")
-      sorted_tokens, sort_order, group_sizes, local_weights = _mimo_permute(
-          tokens_full, top_k_indices, E_local, shard_id
-      )  # sorted_tokens: (T*K, H), group_sizes: (E_local,)
-
-      # Step 3 — three grouped matmuls.
-      # wi_0, wi_1 have TP-partitioned I dimension → output is (T*K, I/TP).
-      g = mblx.gmm(sorted_tokens, wi_0, group_sizes,
-                   preferred_element_type=cfg.dtype)          # (T*K, I/TP)
-      u = mblx.gmm(sorted_tokens, wi_1, group_sizes,
-                   preferred_element_type=cfg.dtype)          # (T*K, I/TP)
-      h = jax.nn.silu(g) * u                                  # (T*K, I/TP)
-      # wo has TP-partitioned I rows → output is a partial (T*K, H) sum.
-      d = mblx.gmm(h, wo, group_sizes,
-                   preferred_element_type=cfg.dtype)          # (T*K, H) partial
-
-      # Step 4 — sum TP shards to complete the row-parallel down-projection.
-      d = jax.lax.psum(d, "tensor")                           # (T*K, H) full
-
-      # Step 5 — unpermute, apply routing weights, collect EP contributions.
-      local_out = _mimo_unpermute(
-          d, sort_order, top_k_weights, local_weights, T, K
-      )                                                        # (T, H)
-      output = jax.lax.psum(local_out, "expert")              # (T, H) full
-
-      # Step 6 — slice back to the local (T/EP, H/TP) shard.
-      ep_idx = jax.lax.axis_index("expert")
-      tp_idx = jax.lax.axis_index("tensor")
-      result = jax.lax.dynamic_slice(
-          output, (ep_idx * T_local, tp_idx * H_local), (T_local, H_local)
-      )                                                        # (T/EP, H/TP)
-      # Cast to match the input dtype (local_weights in _mimo_permute is float32,
-      # which promotes the psum output to float32; the scan carry expects cfg.dtype).
-      return result.astype(tokens_local.dtype)
-
-    tokens_fp = tokens.astype(cfg.dtype)
-    wi_0 = self.wi_0[...].astype(cfg.dtype)   # (E, H, I) global; P("expert", None, "tensor")
-    wi_1 = self.wi_1[...].astype(cfg.dtype)   # same
-    wo   = self.wo[...].astype(cfg.dtype)     # (E, I, H) global; P("expert", "tensor", None)
-
-    output = jax.shard_map(
-        _sparse_dispatch,
-        mesh=self.mesh,
-        in_specs=(
-            P("expert", "tensor"),        # tokens_fp: (T/EP, H/TP)
-            P(None, None),                # top_k_indices: (T, K) replicated
-            P(None, None),                # top_k_weights: (T, K) replicated
-            P("expert", None, "tensor"),  # wi_0: (E_local, H, I/TP)
-            P("expert", None, "tensor"),  # wi_1: same
-            P("expert", "tensor", None),  # wo:   (E_local, I/TP, H)
-        ),
-        out_specs=P("expert", "tensor"),  # (T/EP, H/TP) — matches input token sharding
-        check_vma=False,
-    )(tokens_fp, top_k_indices, top_k_weights, wi_0, wi_1, wo)
-
+    tokens_fp = tokens.astype(self.config.dtype)  # (T, H)
+    gate = jax.nn.silu(
+        jnp.einsum("th,ehi->eti", tokens_fp, wi_0, precision=lax.Precision.DEFAULT)
+    )                                                                     # (E, T, I)
+    up = jnp.einsum("th,ehi->eti", tokens_fp, wi_1,
+                    precision=lax.Precision.DEFAULT)                      # (E, T, I)
+    down = jnp.einsum("eti,eih->eth", gate * up, wo,
+                      precision=lax.Precision.DEFAULT)                    # (E, T, H)
+    output = jnp.einsum("te,eth->th",
+                        dispatch_weights.astype(self.config.dtype), down,
+                        precision=lax.Precision.DEFAULT)                  # (T, H)
     return output.reshape(orig_shape)
 
 
@@ -650,129 +508,6 @@ class MiMoV2FlashDecoderLayer(nnx.Module):
 
 
 # ---------------------------------------------------------------------------
-# MiMoV2FlashSixLayerCycleBlock
-# ---------------------------------------------------------------------------
-#
-# MiMo-V2-Flash layer structure (48 layers total):
-#
-#   Phase A  layer 0          : unique — global attention + dense MLP
-#   Phase B  layers  1- 4 (4×): SWA-attention + sparse MoE  (homogeneous run)
-#   Phase C  layers  5-46 (7×): repeating 6-layer cycle [G-MoE, SWA-MoE×5]
-#   Phase D  layer 47         : unique — global attention + sparse MoE
-#
-# The 6-layer cycle (Phase C) has identical structure in every repetition:
-#   pos 0 : global attention  + MoE  (KV heads = cfg.num_kv_heads     = 4)
-#   pos 1 : SWA attention     + MoE  (KV heads = cfg.mimo_swa_num_kv_heads = 8)
-#   pos 2 : SWA attention     + MoE
-#   pos 3 : SWA attention     + MoE
-#   pos 4 : SWA attention     + MoE
-#   pos 5 : SWA attention     + MoE
-#
-# Representative global layer indices used for configuration at each position:
-#   pos 0 → layer 5   (hybrid_pattern=0 ⇒ global, moe_freq=1 ⇒ MoE)
-#   pos 1 → layer 6   (hybrid_pattern=1 ⇒ SWA,    moe_freq=1 ⇒ MoE)
-#   ...
-#   pos 5 → layer 10  (hybrid_pattern=1 ⇒ SWA,    moe_freq=1 ⇒ MoE)
-#
-# ROUND 2 CHECKPOINT LAYOUT — produced by tools/mimo_stack_checkpoint.py:
-#   The flat per-layer OCDBT checkpoint (decoder/layers/{i}/*) must be
-#   restacked before using scan_layers=True Round 2.  After conversion the
-#   stacked checkpoint has:
-#     decoder.layers_c.layers_0.*  shape (7, ...)  ← layers  5,11,17,23,29,35,41
-#     decoder.layers_c.layers_1.*  shape (7, ...)  ← layers  6,12,18,24,30,36,42
-#     ...
-#     decoder.layers_c.layers_5.*  shape (7, ...)  ← layers 10,16,22,28,34,40,46
-#   scan_decoder_layers(length=7) in decoders.py then scans over the
-#   leading axis of size 7, calling this 6-layer cycle body 7 times.
-
-# Representative global layer_idx for each in-cycle position (first cycle).
-_CYCLE_REP_LAYER_IDX = (5, 6, 7, 8, 9, 10)
-_CYCLE_LENGTH = 6      # layers per cycle
-_CYCLE_COUNT  = 7      # number of cycle repetitions (layers 5-46)
-_CYCLE_START  = 5      # global index of the first cycle layer
-
-
-class MiMoV2FlashSixLayerCycleBlock(nnx.Module):
-  """One repeating 6-layer cycle of MiMo-V2-Flash (Phase C, layers 5–46).
-
-  Holds 6 ``MiMoV2FlashDecoderLayer`` sublayers named ``layers_0`` …
-  ``layers_5``.  When used as the body of ``scan_decoder_layers(length=7)``,
-  parameters are stacked along the scan axis so XLA compiles the 6-layer body
-  once and loops 7 times, capping peak HLO temp at ~3 GiB instead of ~22 GiB
-  (enabling sparse-gather MoE dispatch without OOM).
-
-  ``__call__`` is a sequential Python loop over the 6 sublayers.  ``nn.scan``
-  wraps this class externally via ``scan_decoder_layers(length=7)`` in
-  ``decoders.py``, so XLA compiles the 6-layer body once and loops 7 times
-  (capping peak HLO temp at ~3 GiB instead of ~22 GiB).
-
-  **Prerequisite:** Run ``tools/mimo_stack_checkpoint.py`` once to convert the
-  flat per-layer checkpoint to the stacked (7, ...) layout expected by
-  ``scan_decoder_layers``; then point ``load_parameters_path`` to the new
-  stacked checkpoint path.
-  """
-
-  def __init__(
-      self,
-      config: Config,
-      mesh: Mesh,
-      model_mode: str,
-      quant: None | Quant = None,
-      *,
-      rngs: nnx.Rngs,
-  ):
-    self.config = config
-    self.mesh = mesh
-    self.model_mode = model_mode
-    self.quant = quant
-
-    for pos, rep_idx in enumerate(_CYCLE_REP_LAYER_IDX):
-      layer = MiMoV2FlashDecoderLayer(
-          config=config,
-          mesh=mesh,
-          model_mode=model_mode,
-          layer_idx=rep_idx,   # sets is_swa / use_moe for this position
-          quant=quant,
-          rngs=rngs,
-      )
-      setattr(self, f"layers_{pos}", layer)
-
-  def __call__(
-      self,
-      inputs: Array,
-      decoder_segment_ids: None | Array,
-      decoder_positions: None | Array,
-      deterministic: bool,
-      model_mode: str,
-      previous_chunk: Any = None,
-      page_state: Any = None,
-      slot: None | int = None,
-      kv_cache: None | dict[str, Array] = None,
-      attention_metadata: None | dict[str, Any] = None,
-  ):
-    """Apply all 6 cycle layers sequentially; return (output, None).
-
-    The ``(output, None)`` tuple is the scan-body convention: the first element
-    is the carry (hidden states), the second is unused scan output (None).
-    """
-    y = inputs
-    for pos in range(_CYCLE_LENGTH):
-      y, _ = getattr(self, f"layers_{pos}")(
-          y,
-          decoder_segment_ids,
-          decoder_positions,
-          deterministic,
-          model_mode,
-          previous_chunk=previous_chunk,
-          page_state=page_state,
-          slot=slot,
-          kv_cache=kv_cache,
-          attention_metadata=attention_metadata,
-      )
-    return y, None
-
-
-# ---------------------------------------------------------------------------
 # Linen wrappers (required by decoders.py registry)
 # ---------------------------------------------------------------------------
 
@@ -781,16 +516,7 @@ MiMoV2FlashDecoderLayerToLinen = nnx_wrappers.to_linen_class(
     base_metadata_fn=variable_to_logically_partitioned,
 )
 
-# Linen wrapper for the 6-layer cycle block.
-# get_decoder_layers() returns this as RemattedBlockLayers[1] when
-# scan_layers=True.  Round 2 will wire it into scan_decoder_layers(length=7).
-MiMoV2FlashSixLayerCycleBlockToLinen = nnx_wrappers.to_linen_class(
-    MiMoV2FlashSixLayerCycleBlock,
+MiMoV2FlashScannableBlockToLinen = nnx_wrappers.to_linen_class(
+    MiMoV2FlashDecoderLayer,
     base_metadata_fn=variable_to_logically_partitioned,
 )
-
-# Alias kept for backward compatibility.  The scan_layers=True path in
-# decoders.py currently uses RemattedBlockLayers[0] (MiMoV2FlashDecoderLayerToLinen)
-# for the sequential fallback, not this alias.  In Round 2 this alias will be
-# retired in favour of direct use of MiMoV2FlashSixLayerCycleBlockToLinen.
-MiMoV2FlashScannableBlockToLinen = MiMoV2FlashSixLayerCycleBlockToLinen

@@ -142,7 +142,7 @@ MIMO_BASE_FLAGS = {
 
 # Default generation settings
 DEFAULT_PREFILL_LENGTH = 512
-DEFAULT_MAX_NEW_TOKENS = 2048
+DEFAULT_MAX_NEW_TOKENS = 128
 
 
 def build_decode_command(
@@ -156,10 +156,6 @@ def build_decode_command(
     dtype: str = "bfloat16",
     ici_tensor_parallelism: int = 4,
     ici_expert_parallelism: int = 8,
-    scan_layers: bool = False,
-    quantize_kvcache: bool = False,
-    kv_quant_dtype: str = "int8",
-    kv_quant_axis: str = "heads_and_dkv",
 ) -> list[str]:
     """Build the shell command for maxtext.inference.decode.
 
@@ -189,13 +185,7 @@ def build_decode_command(
         # must not exceed 4.  Use expert parallelism for the 256 MoE experts instead.
         f"ici_tensor_parallelism={ici_tensor_parallelism}",
         f"ici_expert_parallelism={ici_expert_parallelism}",
-        f"scan_layers={'true' if scan_layers else 'false'}",
-    ]
-    if scan_layers:
-        # The 4phase-stacked checkpoint was produced with jnp.stack(axis=0),
-        # so the scan axis is at dimension 0.  Override MaxText's default of 1.
-        cmd.append("param_scan_axis=0")
-    cmd += [
+        "scan_layers=false",
         # Use dot_product attention to avoid splash attention block-size alignment
         # requirements (splash requires max_target_length % q_block_size == 0).
         "attention=dot_product",
@@ -207,18 +197,7 @@ def build_decode_command(
         # text completion.  decode.py will call apply_chat_template() when this
         # flag is set.  Falls back to raw prompt if the tokenizer has no template.
         "use_chat_template=true",
-        # Nucleus (top-p) sampling with temperature to prevent greedy repetition
-        # loops in complex LaTeX generation (e.g. "= = =" after math expressions).
-        "decode_sampling_strategy=nucleus",
-        "decode_sampling_nucleus_p=0.95",
-        "decode_sampling_temperature=0.6",
     ]
-    if quantize_kvcache:
-        cmd += [
-            "quantize_kvcache=true",
-            f"kv_quant_dtype={kv_quant_dtype}",
-            f"kv_quant_axis={kv_quant_axis}",
-        ]
     return cmd
 
 
@@ -232,10 +211,6 @@ def run_inference(
     verbose: bool = False,
     ici_tensor_parallelism: int = 4,
     ici_expert_parallelism: int = 8,
-    scan_layers: bool = False,
-    quantize_kvcache: bool = False,
-    kv_quant_dtype: str = "int8",
-    kv_quant_axis: str = "heads_and_dkv",
 ) -> str:
     """Execute MaxText inference and return the generated text."""
     cmd = build_decode_command(
@@ -247,10 +222,6 @@ def run_inference(
         dtype=dtype,
         ici_tensor_parallelism=ici_tensor_parallelism,
         ici_expert_parallelism=ici_expert_parallelism,
-        scan_layers=scan_layers,
-        quantize_kvcache=quantize_kvcache,
-        kv_quant_dtype=kv_quant_dtype,
-        kv_quant_axis=kv_quant_axis,
     )
     if verbose:
         print("Running command:")
@@ -448,33 +419,6 @@ def main():
              "Combined with ici_tensor_parallelism=4 gives 4×8=32 chips total on v6e-32.",
     )
     parser.add_argument(
-        "--scan_layers",
-        action="store_true",
-        default=False,
-        help="Use scan_layers=true (requires the 4-phase stacked checkpoint "
-             "produced by mimo_stack_checkpoint.py).",
-    )
-    parser.add_argument(
-        "--quantize_kvcache",
-        action="store_true",
-        default=False,
-        help="Enable KV cache quantization for decode.",
-    )
-    parser.add_argument(
-        "--kv_quant_dtype",
-        type=str,
-        default="int8",
-        choices=["int8"],
-        help="KV cache quantization dtype.",
-    )
-    parser.add_argument(
-        "--kv_quant_axis",
-        type=str,
-        default="heads_and_dkv",
-        choices=["heads_and_dkv", "dkv", "heads_and_kv", ""],
-        help="KV cache quantization axis mode.",
-    )
-    parser.add_argument(
         "--print_arch",
         action="store_true",
         default=False,
@@ -504,10 +448,6 @@ def main():
         verbose=args.verbose,
         ici_tensor_parallelism=args.ici_tensor_parallelism,
         ici_expert_parallelism=args.ici_expert_parallelism,
-        scan_layers=args.scan_layers,
-        quantize_kvcache=args.quantize_kvcache,
-        kv_quant_dtype=args.kv_quant_dtype,
-        kv_quant_axis=args.kv_quant_axis,
     )
     print(f"Output:\n{output}")
 

@@ -157,15 +157,9 @@ def main(argv: Sequence[str]) -> None:
     has_chat_template = False
   if config.use_chat_template and has_chat_template:
     messages = [{"role": "user", "content": text}]
-    # enable_thinking=True produces the bare assistant prefix; we then manually
-    # append <think>\n so the model generates a proper reasoning chain before
-    # answering.  This is required for MiMo-V2-Flash to correctly attend to
-    # (and copy) specific numbers from the prefill (e.g. "120 km/h").
     text = tokenizer_model.tokenizer.apply_chat_template(  # pytype: disable=attribute-error
-        messages, tokenize=False, add_generation_prompt=True, enable_thinking=True
+        messages, tokenize=False, add_generation_prompt=True
     )
-    if not text.endswith("<think>") and not text.endswith("<think>\n"):
-      text = text + "<think>\n"
   tokens, true_length = tokenizer_model.encode(text, is_bos=not has_chat_template, prefill_lengths=[prefill_length])
 
   position_ids = None
@@ -250,9 +244,7 @@ def main(argv: Sequence[str]) -> None:
       decode_state, sampled_tokens = engine.generate(params, decode_state, rng=rng_generate)
       jax.effects_barrier()
       _step_ms = (time.perf_counter() - _t_step) * 1000
-    _tok_id = sampled_tokens.get_result_at_slot(0).tokens.item()
-    _tok_str = tokenizer_model.decode([_tok_id])
-    print(f"[TIME] generate_step_{i:04d}  tok={_tok_id}  str={repr(_tok_str)}  host={socket.gethostname()} step_ms={_step_ms:.1f}", flush=True)
+    print(f"[TIME] generate_step_{i:04d}              host={socket.gethostname()} step_ms={_step_ms:.1f}", flush=True)
     if i == steps[0] or (i - steps[0]) % 50 == 0:
       _probe_hbm(f"generate_step_{i:04d}")
 

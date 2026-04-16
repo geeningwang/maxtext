@@ -95,14 +95,3 @@ tokenizer_type: "huggingface"
 # Training/inference defaults
 enable_dropout: false
 scan_layers: false
-param_scan_axis: 0  # Override base default of 1; axis=0 means scan dim is leading (N_scan, *param_shape).
-                    # Required for efficient orbax loading: axis=0 lets zarr chunk at 1 per scan step
-                    # (e.g. (1,32,512,4096)=250MB) vs axis=1 chunks that span the full scan stack
-                    # (e.g. (32,7,512,4096)=1.75GB) which OOMs during parallel deserialization.
-
-weight_dtype: "bfloat16"  # Keep params in bf16 on device (base.yml defaults to float32).
-                          # Stacked scan params (e.g. layers_c wo: [7,32,512,4096]) may not be
-                          # TP-split within a process shard, so each chip can receive the full
-                          # write_shape.  In float32 that is 1.75 GiB × 18 arrays = 31.5 GiB
-                          # which exceeds the 31.25 GiB v6e HBM budget.  In bfloat16 it is
-                          # 0.875 GiB × 18 = 15.75 GiB, leaving headroom for activations/KV.
