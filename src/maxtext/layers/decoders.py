@@ -968,27 +968,26 @@ class Decoder(nn.Module):
           #   decoder.layers_d.*
           RemattedBlockLayer = RemattedBlockLayers[0]
 
-          # Pre-bind extra __call__ kwargs that nn.scan cannot forward as
-          # keyword arguments.  Mirrors the pattern used by DEEPSEEK scan.
-          layer_call_kwargs = {
-              "previous_chunk": previous_chunk,
-              "page_state": page_state,
-              "slot": slot,
-              "attention_metadata": attention_metadata,
-          }
-          RemattedBlockLayer.__call__ = functools.partial(
-              RemattedBlockLayer.__call__, **layer_call_kwargs
-          )
+          # nn.scan cannot forward keyword arguments; extra per-call kwargs
+          # are appended to broadcast_args as broadcast positional args.
+          # NOTE: functools.partial patching on the class __call__ is NOT used
+          # here because RemattedBlockLayer is a ToLinen(NNX) wrapper whose
+          # @linen.compact decoration metadata would be lost by the partial,
+          # breaking Flax's compact variable-collection tracking.
+          #
+          # Positional order matches MiMoV2FlashDecoderLayer.__call__:
+          #   inputs, seg_ids, positions, det, model_mode,   ← broadcast_args
+          #   previous_chunk, page_state, slot, kv_cache, attention_metadata
+          _mimo_extra = (previous_chunk, page_state, slot, None, attention_metadata)
+          _mimo_bcast = broadcast_args + _mimo_extra
 
           initializing = self.is_mutable_collection("params")
 
           def _mimo_scan(layer_idx_rep, count, name):
-            """Create a scan module for `count` homogeneous MIMO layers.
+            """Create a scan module for ``count`` homogeneous MIMO layers.
 
-            ``layer_idx_rep`` is passed to the layer constructor so that
-            ``is_swa`` and ``use_moe`` are set correctly for the group.
-            All layers in the group must resolve to the same (is_swa, use_moe)
-            pair — caller is responsible for choosing a valid representative.
+            ``layer_idx_rep`` determines ``is_swa`` / ``use_moe`` for the
+            group; all layers in a group are architecturally identical.
             """
             params_spec = cfg.param_scan_axis if initializing else ScanIn(cfg.param_scan_axis)
             scan_fn = nn.scan(
@@ -1001,7 +1000,7 @@ class Decoder(nn.Module):
                     "_overwrite_with_gradient": 0,
                 },
                 split_rngs={"params": True, "dropout": cfg.enable_dropout},
-                in_axes=(nn.broadcast,) * len(broadcast_args),
+                in_axes=(nn.broadcast,) * len(_mimo_bcast),
                 length=count,
                 metadata_params={nn.PARTITION_NAME: name},
             )
@@ -1022,11 +1021,13 @@ class Decoder(nn.Module):
               quant=self.quant,
               model_mode=self.model_mode,
               layer_idx=0,
-          )(y, *broadcast_args)
+          )(y, *broadcast_args,
+            previous_chunk=previous_chunk, page_state=page_state, slot=slot,
+            kv_cache=None, attention_metadata=attention_metadata)
 
           # Phase B: layers 1–4 — SWA + MoE (scan length=4).
           # All four layers share the same structure; use layer_idx=1 as rep.
-          y, _ = _mimo_scan(1, 4, "layers_b")(y, *broadcast_args)
+          y, _ = _mimo_scan(1, 4, "layers_b")(y, *_mimo_bcast)
 
           # Phase C: layers 5–46 — 7 repetitions of a 6-position cycle.
           # Each cycle position is homogeneous across all 7 repetitions:
@@ -1047,7 +1048,7 @@ class Decoder(nn.Module):
                 inp, _ = _mimo_scan(rep_idx, 7, f"layers_{p}")(inp, *bcast_args)
               return inp, None
 
-          y, _ = _MiMoPhaseCScope(name="layers_c")(y, *broadcast_args)
+          y, _ = _MiMoPhaseCScope(name="layers_c")(y, *_mimo_bcast)
 
           # Phase D: layer 47 — global attn + MoE (no scan, single layer)
           y, _ = RemattedBlockLayer(
@@ -1057,7 +1058,9 @@ class Decoder(nn.Module):
               quant=self.quant,
               model_mode=self.model_mode,
               layer_idx=47,
-          )(y, *broadcast_args)
+          )(y, *broadcast_args,
+            previous_chunk=previous_chunk, page_state=page_state, slot=slot,
+            kv_cache=None, attention_metadata=attention_metadata)
         else:
           RemattedBlockLayer = RemattedBlockLayers[0]
           scan_length = int(cfg.num_decoder_layers / cfg.inhomogeneous_layer_cycle_interval)
