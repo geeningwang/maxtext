@@ -266,15 +266,8 @@ def main(argv: Sequence[str]) -> None:
 
     # Early-stop when EOS is generated (slot 0, stream 0).
     if _eos_token_id is not None:
-      _tok_raw = sampled_tokens.get_result_at_slot(0).tokens
-      _tok = _tok_raw.item()
-      _tok_id = int(_tok) if not isinstance(_tok, int) else _tok
-      try:
-        _tok_str = repr(tokenizer_model.decode([_tok_id]))
-      except Exception:  # pylint: disable=broad-except
-        _tok_str = "<decode-error>"
-      print(f"[TOKEN] step={i} id={_tok_id} dtype={_tok_raw.dtype} str={_tok_str}", flush=True)
-      if _tok_id == _eos_token_id:
+      _tok = sampled_tokens.get_result_at_slot(0).tokens.item()
+      if _tok == _eos_token_id:
         print(f"[INFO] EOS token ({_eos_token_id}) generated at step {i}; stopping early.", flush=True)
         break
 

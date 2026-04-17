@@ -601,6 +601,7 @@ class AttentionOp(nnx.Module):
       model_mode: str,
       previous_chunk: Any = None,
       bidirectional_mask: Any = None,
+      swa_next_pos: int | None = None,
   ) -> Array | None:
     """Generates a combined attention mask for Transformer models.
 
@@ -691,16 +692,20 @@ class AttentionOp(nnx.Module):
       if mask is not None:
         mask = mask[:, :, :, next_pos : next_pos + q_seq_len, :]
     elif model_mode == MODEL_MODE_AUTOREGRESSIVE and q_seq_len == 1:
-      if self.attention_type == AttentionType.LOCAL_SLIDING and decoder_segment_ids is not None:
-        # For sliding window attention, use the actual number of filled cache slots
-        # rather than kv_seq_len - 1.  With the split prefill/AR cache architecture,
-        # kv_seq_len is always max_prefill or max_decode (fully padded sizes), so
-        # kv_seq_len - 1 points to the last cache *slot* rather than the last *token*.
-        # For the AR cache:   segment count - 1  ==  decode_step  (correct local pos)
-        # For the prefill cache: segment count - 1 == true_length - 1  (≈ correct)
-        next_pos = (
-            jnp.sum(decoder_segment_ids[0] == DECODING_ACTIVE_SEQUENCE_INDICATOR).astype(jnp.int32) - 1
-        )
+      if self.attention_type == AttentionType.LOCAL_SLIDING:
+        if swa_next_pos is not None:
+          # Exact query position provided by __call__ (computed from AR step count + true_length).
+          # For the prefill cache: swa_next_pos = true_length + ar_step  (absolute ROPE position)
+          # For the AR cache:      swa_next_pos = ar_step                 (local slot index)
+          next_pos = swa_next_pos
+        elif decoder_segment_ids is not None:
+          # Fallback: derive from segment count.  Exact for the AR cache; approximate
+          # for the prefill cache (uses true_length-1 instead of true_length+ar_step).
+          next_pos = (
+              jnp.sum(decoder_segment_ids[0] == DECODING_ACTIVE_SEQUENCE_INDICATOR).astype(jnp.int32) - 1
+          )
+        else:
+          next_pos = kv_seq_len - 1
       else:
         # In autoregression, the query position is the last position in the KV sequence.
         next_pos = kv_seq_len - 1
@@ -897,6 +902,7 @@ class AttentionOp(nnx.Module):
       sinks: Array | None = None,
       index_mask: Array | None = None,
       record_max_logits: bool = False,
+      swa_next_pos: int | None = None,
       *,
       qk_product_einsum: Callable[..., Array],
       wv_product_einsum: Callable[..., Array],
@@ -942,6 +948,7 @@ class AttentionOp(nnx.Module):
           sinks=sinks,
           index_mask=index_mask,
           record_max_logits=record_max_logits,
+          swa_next_pos=swa_next_pos,
           qk_product_einsum=qk_product_einsum,
           wv_product_einsum=wv_product_einsum,
       )
@@ -982,6 +989,7 @@ class AttentionOp(nnx.Module):
               model_mode,
               bidirectional_mask=bidirectional_mask,
               record_max_logits=record_max_logits,
+              swa_next_pos=swa_next_pos,
               qk_product_einsum=qk_product_einsum,
               wv_product_einsum=wv_product_einsum,
           )
@@ -1779,6 +1787,7 @@ class AttentionOp(nnx.Module):
       sinks: Array | None = None,
       index_mask: Array | None = None,
       record_max_logits: bool = False,
+      swa_next_pos: int | None = None,
       *,
       qk_product_einsum: Callable[..., Array],
       wv_product_einsum: Callable[..., Array],
@@ -1836,6 +1845,7 @@ class AttentionOp(nnx.Module):
         model_mode,
         previous_chunk,
         bidirectional_mask,
+        swa_next_pos=swa_next_pos,
     )
 
     if self.config.moba:
@@ -2059,6 +2069,26 @@ class AttentionOp(nnx.Module):
       assert prefill_kv_cache
       key, value, decoder_segment_ids = prefill_kv_cache
 
+    # For LOCAL_SLIDING (SWA) in AR decode, compute the exact query ROPE position
+    # so the sliding window is anchored correctly in both prefill and AR caches.
+    # With the split-cache architecture kv_seq_len == max_prefill or max_decode_len,
+    # so using kv_seq_len-1 would anchor the window far past all valid tokens.
+    prefill_swa_next_pos = None
+    ar_swa_next_pos = None
+    if (
+        model_mode == MODEL_MODE_AUTOREGRESSIVE
+        and ar_kv_cache is not None
+        and self.attention_type == AttentionType.LOCAL_SLIDING
+    ):
+      prefill_seg = prefill_kv_cache[2]  # shape [batch, max_prefill_len]
+      ar_lengths = ar_kv_cache[3]        # shape [batch] — count of written AR tokens
+      true_length = jnp.sum(prefill_seg[0] == DECODING_ACTIVE_SEQUENCE_INDICATOR).astype(jnp.int32)
+      ar_step = ar_lengths[0].astype(jnp.int32) - 1  # 0-indexed current AR step
+      # Absolute ROPE position of the current query token in the full sequence.
+      prefill_swa_next_pos = true_length + ar_step
+      # Local slot index of the current AR token within the AR circular buffer.
+      ar_swa_next_pos = ar_step
+
     prefill_unnormalized_output, prefill_exponentials_max, prefill_exponentials_sum = self.apply_attention(
         query=query,
         key=key,
@@ -2072,6 +2102,7 @@ class AttentionOp(nnx.Module):
         sinks=sinks,
         index_mask=index_mask,
         record_max_logits=record_max_logits,
+        swa_next_pos=prefill_swa_next_pos,
         qk_product_einsum=self.AqtEinsum_0,
         wv_product_einsum=self.AqtEinsum_1,
     )
@@ -2093,6 +2124,7 @@ class AttentionOp(nnx.Module):
         model_mode=model_mode,
         use_ragged_attention=self.use_ragged_attention,
         bidirectional_mask=bidirectional_mask,
+        swa_next_pos=ar_swa_next_pos,
         qk_product_einsum=self.AqtEinsum_2,
         wv_product_einsum=self.AqtEinsum_3,
     )
