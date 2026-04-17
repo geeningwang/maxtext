@@ -14,7 +14,7 @@ Benchmarks use `src/maxtext/inference/scripts/mimo_v2_flash_bench.py`
 | 2026-04-13 | #4 SWA KV cache truncation (`mimo_truncate_swa_kv_cache=true`) | 1797.6 ms† | 17.8 tok/s† | 56.2 ms/tok† | ❌ Rejected |
 | 2026-04-15 | #5 `shard_map` EP+TP sparse dispatch (commits `01527b9c`–`2ae1dc41`) | 160 ms | 200 tok/s | 5.0 ms/tok | ❌ Reverted |
 | 2026-04-16 | **#6 Revert sparse code; run dense dispatch from opt #1 baseline** (commit `30fd5e55`) | **55.7 ms** | **575 tok/s** | **1.7 ms/tok** | ✅ Current best |
-| 2026-04-17 | #7 `scan_layers=true` — 4-phase stacked ckpt (commits `0a084626`–`539cc043`) | 71.1 ms | 450 tok/s | 2.2 ms/tok | ⚠️ +28% vs #6 |
+| 2026-04-17 | #7 `scan_layers=true` — 4-phase stacked ckpt (commits `0a084626`–`539cc043`) | 68.5 ms | 467 tok/s | 2.1 ms/tok | ⚠️ +23% vs #6 |
 
 † A/B comparison (true vs false) shows **0% Δ** in both median step latency and throughput.
 The absolute numbers are 32× lower than the opt #1 baseline (56.5 ms) — a separate regression
@@ -38,7 +38,7 @@ on the first few steps; benchmark numbers above exclude warmup.
 
 ## `scan_layers=true` Analysis (2026-04-17)
 
-`scan_layers=true` with the 4-phase stacked checkpoint runs at **71.1 ms / 450 tok/s** — **28 % slower** than the dense unscanned baseline (55.7 ms / 575 tok/s). HBM footprint is identical (17.98 GB / 31.25 GB).
+`scan_layers=true` with the 4-phase stacked checkpoint runs at **68.5 ms / 467 tok/s** — **23 % slower** than the dense unscanned baseline (55.7 ms / 575 tok/s). HBM footprint is identical (17.98 GB / 31.25 GB).
 
 ### Why scan is slower
 
@@ -47,7 +47,7 @@ For AR generate (memory-bandwidth–bound, tiny activations), the bottleneck is 
 - **Unrolled (`scan=false`)**: XLA has full visibility of all 48 layers as a single HLO graph. It overlaps HBM reads for layer N+1 with execution of layer N — effectively hiding HBM latency behind compute.
 - **Scanned (`scan=true`)**: each phase compiles to a `lax.while_loop`. XLA has per-iteration visibility only. It cannot prefetch weights from the next scan iteration because the carry (hidden state) and the loop counter are symbolic at compile time, blocking cross-iteration scheduling.
 
-The 15.4 ms gap (71.1 − 55.7) over 48 layers = **~0.32 ms per layer** of lost prefetch pipelining. This is the expected cost of a `while_loop` on weight-read–bound workloads.
+The 12.8 ms gap (68.5 − 55.7) over 48 layers = **~0.27 ms per layer** of lost prefetch pipelining. This is the expected cost of a `while_loop` on weight-read–bound workloads.
 
 A secondary factor: the 4-phase structure introduces three additional control-flow transitions (A→B, B→C, C→D) and a nested `_MiMoPhaseCScope` module, each adding loop-counter and carry-copy overhead. This accounts for a small fraction of the gap.
 
@@ -55,16 +55,16 @@ A secondary factor: the 4-phase structure introduces three additional control-fl
 
 The original motivation for `scan_layers=true` was to bound peak HLO temporary memory to ~3 GB/layer (vs 22 GB unrolled) so that sparse MoE dispatch intermediates fit in HBM. That goal is unchanged and valid.
 
-However, the scan overhead sets a new break-even bar: **sparse dispatch with scan must bring the step time below 55.7 ms** (the current unscanned dense best) to show any net improvement. With scan already at 71.1 ms, sparse dispatch needs to recover the 15.4 ms scan penalty *plus* deliver additional speedup.
+However, the scan overhead sets a new break-even bar: **sparse dispatch with scan must bring the step time below 55.7 ms** (the current unscanned dense best) to show any net improvement. With scan already at 68.5 ms, sparse dispatch needs to recover the 12.8 ms scan penalty *plus* deliver additional speedup.
 
 Rough estimate of potential savings from `ragged_all_to_all` sparse dispatch:
 
 - E_local = 32 experts/device; K=8 of E=256 → expected ~4 active experts/device/step at batch=32
 - Sparse weight loads: 4/32 ≈ 12 % of current; ~8× HBM bandwidth reduction for MoE weights
 - MoE layers are ~47/48 of the stack; if MoE weight-read is ~60 % of per-layer time → sparse saves ~52 % of layer time
-- Expected sparse+scan: ~71.1 × (1 − 0.52) ≈ **34 ms** — well below 55.7 ms if the estimate holds
+- Expected sparse+scan: ~68.5 × (1 − 0.52) ≈ **33 ms** — well below 55.7 ms if the estimate holds
 
-The estimate is optimistic (ignores routing overhead, `all_to_all` latency, and sparse kernel efficiency). Even at half the expected savings (~26 %), sparse+scan would reach ~52 ms, still below 55.7 ms.
+The estimate is optimistic (ignores routing overhead, `all_to_all` latency, and sparse kernel efficiency). Even at half the expected savings (~26 %), sparse+scan would reach ~51 ms, still below 55.7 ms.
 
 **Conclusion**: pursue `ragged_all_to_all` sparse dispatch on top of `scan_layers=true`; scan is necessary for memory headroom and is not a dead end.
 
@@ -294,7 +294,7 @@ token check to avoid the per-step host roundtrip.
 |---|---|---|---|---|---|
 | 1 | opt #1 | **Remove `jax.debug.print` from MoE gate** | Delete debug line in `mimo_v2_flash.py` | **Large** — eliminates 47 sync roundtrips/step | ✅ Accepted (56.5 ms) |
 | 2 | N/A | **`ragged_all_to_all` sparse MoE dispatch** | Adopt `RoutedMoE` pattern from `src/maxtext/layers/moe.py`; requires `scan_layers=true` | **Large** — ~8× less MoE weight bandwidth; est. ~34 ms if fully effective | Not run |
-| 3 | N/A | **`scan_layers=true` (prerequisite for sparse dispatch)** | 4-phase stacked ckpt + `decoders.py` MIMO_V2_FLASH scan branch | −28 % latency penalty (71.1 ms) — needed as memory primitive for sparse | ✅ Done (`539cc043`); 71.1 ms / 450 tok/s |
+| 3 | N/A | **`scan_layers=true` (prerequisite for sparse dispatch)** | 4-phase stacked ckpt + `decoders.py` MIMO_V2_FLASH scan branch | −23 % latency penalty (68.5 ms) — needed as memory primitive for sparse | ✅ Done (`539cc043`); 68.5 ms / 467 tok/s |
 | 4 | opt #2 | **Sparse MoE dispatch (top-8 only, `mblx.gmm`)** | Use MaxText MegaBlox path (`mblx.gmm`) | **Large** — 256 → 8 expert compute (32×) | ⚠️ Code merged; 56.1 ms figure invalid (stale JIT cache) |
 | 5 | N/A | **`shard_map` EP+TP sparse dispatch** | EP+TP `shard_map` wrapper in `MiMoV2FlashSparseMoeBlock` | Regressed to 160 ms — all-gather overhead dominated | ❌ Reverted (`30fd5e55`) |
 | 6 | N/A | **Remove per-step `effects_barrier` / async EOS** | Move EOS check on-device (`lax.cond`) | Medium (host sync removal in token loop) | Not run |
@@ -317,17 +317,17 @@ token check to avoid the per-step host roundtrip.
 Current HEAD (`539cc043`) uses the **opt #1 dense dispatch** (`scan_layers=false`,
 ocdbt checkpoint, `ici_expert_parallelism=8`, `ici_tensor_parallelism=4`, batch=32)
 → **575 tok/s / 55.7 ms**. `scan_layers=true` (4-phase stacked ckpt) is now working
-but runs at 71.1 ms / 450 tok/s — 28 % slower due to lost XLA inter-layer
+but runs at 68.5 ms / 467 tok/s — 23 % slower due to lost XLA inter-layer
 weight-prefetch pipelining (see scan analysis above). Highest-priority remaining items:
 
 1. ~~**Fix `scan_layers=true`**~~ ✅ Done (commits `0a084626`–`539cc043`, 2026-04-17).
-   Result: 71.1 ms / 450 tok/s; 28 % slower than dense unscanned. Scan is required
+   Result: 68.5 ms / 467 tok/s; 23 % slower than dense unscanned. Scan is required
    as a memory-management primitive for sparse dispatch (bounds HLO temp to ~3 GB/layer).
 2. **`ragged_all_to_all` sparse MoE dispatch on top of `scan_layers=true`** — adopt
    MaxText's `RoutedMoE` path (`src/maxtext/layers/moe.py`) to route tokens directly
    to target expert shards. This avoids the two all-gather collectives that caused the
-   160 ms regression in opt #5. Target: sparse+scan < 55.7 ms (need >22 % improvement
-   from sparsity to beat the current unscanned dense best). Rough estimate: ~34 ms
+   160 ms regression in opt #5. Target: sparse+scan < 55.7 ms (need >19 % improvement
+   from sparsity to beat the current unscanned dense best). Rough estimate: ~33 ms
    (see scan analysis section). This is the highest-value remaining item.
 3. **Remove per-step `effects_barrier` / async EOS** in `decode.py` (lines 245, 260).
    Independent of scan/sparse; straightforward host-sync removal.

@@ -26,7 +26,8 @@ The commands below assume you are already logged in to the manager VM
 - network: `default`
 - subnetwork: `default`
 - checkpoint for inference (demo): `gs://jingnw-mimo-v2-flash-us-east5/mimo-v2-flash-fixed-ocdbt/checkpoints/0/items`
-- checkpoint for benchmark: `gs://jingnw-mimo-v2-flash-us-east5/mimo-v2-flash-fixed-ocdbt/checkpoints/0/items` (same as demo; `scan_layers=false`)
+- checkpoint for benchmark (`scan_layers=false`): `gs://jingnw-mimo-v2-flash-us-east5/mimo-v2-flash-fixed-ocdbt/checkpoints/0/items`
+- checkpoint for benchmark (`scan_layers=true`): `gs://jingnw-mimo-v2-flash-us-east5/mimo-v2-flash-4phase-stacked/checkpoints/0/items`
 - tokenizer: `XiaomiMiMo/MiMo-V2-Flash`
 - benchmark commit: latest `MiMo-V2-Flash` branch HEAD
 
@@ -84,6 +85,7 @@ export TAG=MiMo-V2-Flash
 export BENCH_COMMIT=origin/MiMo-V2-Flash
 export CKPT=gs://jingnw-mimo-v2-flash-us-east5/mimo-v2-flash-fixed-ocdbt/checkpoints/0/items
 export BENCH_CKPT=gs://jingnw-mimo-v2-flash-us-east5/mimo-v2-flash-fixed-ocdbt/checkpoints/0/items
+export SCAN_CKPT=gs://jingnw-mimo-v2-flash-us-east5/mimo-v2-flash-4phase-stacked/checkpoints/0/items
 export TOKENIZER=XiaomiMiMo/MiMo-V2-Flash
 
 gcloud config set project tpu-launchpad-playground
@@ -179,9 +181,7 @@ The dedicated benchmark script runs 3 warmup steps followed by 50 timed
 `engine.generate()` steps and writes a JSON result file to
 `/tmp/bench_result.json` on each worker.
 
-> **Note:** `scan_layers=true` is not yet supported for `MIMO_V2_FLASH` (crashes
-> with `TypeError: MiMoV2FlashDecoderLayer.__init__() missing 1 required positional
-> argument: 'layer_idx'`). Use `scan_layers=false` with the ocdbt checkpoint.
+### 5a. `scan_layers=false` benchmark (dense dispatch baseline)
 
 Run this on `jingnw-tpu-op`:
 
@@ -208,6 +208,37 @@ python3 -m maxtext.inference.scripts.mimo_v2_flash_bench \
   attention=dot_product \
   checkpoint_storage_use_ocdbt=true \
   checkpoint_storage_use_zarr3=true \
+  inference_microbenchmark_log_file_path=/tmp/bench_result.json'
+```
+
+### 5b. `scan_layers=true` benchmark (4-phase stacked checkpoint)
+
+Run this on `jingnw-tpu-op`:
+
+```bash
+gcloud compute tpus tpu-vm ssh "$TPU_NAME" --zone "$ZONE" --worker=all \
+  --command='set -e
+. "$HOME/maxtext/maxtext_tpu_venv/bin/activate"
+cd "$HOME/maxtext"
+export PYTHONUNBUFFERED=1
+python3 -m maxtext.inference.scripts.mimo_v2_flash_bench \
+  src/maxtext/configs/base.yml \
+  model_name=mimo-v2-flash \
+  run_name=mimo_v2_flash_scan_bench \
+  load_parameters_path='"$SCAN_CKPT"' \
+  tokenizer_path='"$TOKENIZER"' \
+  max_prefill_predict_length=512 \
+  max_target_length=640 \
+  per_device_batch_size=1 \
+  dtype=bfloat16 \
+  weight_dtype=bfloat16 \
+  ici_tensor_parallelism=4 \
+  ici_expert_parallelism=8 \
+  scan_layers=true \
+  attention=dot_product \
+  checkpoint_storage_use_ocdbt=true \
+  checkpoint_storage_use_zarr3=true \
+  async_checkpointing=false \
   inference_microbenchmark_log_file_path=/tmp/bench_result.json'
 ```
 
@@ -256,9 +287,8 @@ Key fields in the JSON output:
 
 ## 8. Reference Results
 
-Configuration for all runs: `jingnw-node` (v6e-32), checkpoint
-`mimo-v2-flash-fixed-ocdbt`, `scan_layers=false`, `per_device_batch_size=1`,
-`ici_tensor_parallelism=4`, `ici_expert_parallelism=8`.
+All runs: `jingnw-node` (v6e-32), `per_device_batch_size=1`,
+`ici_tensor_parallelism=4`, `ici_expert_parallelism=8`, `max_target_length=640`.
 
 > **Note on `load_params` time:** The first run after a full environment restore
 > hits a cold GCS cache and takes noticeably longer (~40 s). Subsequent runs on
@@ -275,16 +305,19 @@ Configuration for all runs: `jingnw-node` (v6e-32), checkpoint
 - step latency (p90): about `55.8 ms`
 - total throughput: about `575 tok/s` (batch=32)
 
-### Prior results — Commits f42416a4 / 2ae1dc41 (scan_layers=true, stacked checkpoint)
+### 2026-04-17 — Commit 539cc043 (`scan_layers=true`, stacked checkpoint)
 
-> **Note:** These runs used `scan_layers=true` with the stacked checkpoint. That
-> combination is currently broken (see Step 5 note). Results are kept for
-> historical comparison only.
+checkpoint: `mimo-v2-flash-4phase-stacked`
 
-- `load_params`: about `29–40 s`
+- `load_params`: about `34.4–34.5 s` (warm GCS cache)
+- HBM after decode-state init: `17.98 GB / 31.25 GB` per device
 - timed steps: `50`
-- step latency (median): about `160 ms`
-- total throughput: about `200 tok/s` (batch=32)
+- step latency (mean): about `68.5 ms`
+- step latency (median): about `68.5 ms`
+- step latency (min): about `68.3 ms`
+- step latency (p90): about `68.5–68.6 ms`
+- total throughput: about `467 tok/s` (batch=32)
+- per-sequence latency: about `2.1 ms/tok/seq`
 
 Results from all 8 workers are nearly identical, which is expected for a
 synchronous collective workload.
