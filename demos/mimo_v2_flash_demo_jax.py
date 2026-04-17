@@ -200,6 +200,13 @@ def build_decode_command(
         # text completion.  decode.py will call apply_chat_template() when this
         # flag is set.  Falls back to raw prompt if the tokenizer has no template.
         "use_chat_template=true",
+        # Nucleus (top-p) sampling with temperature to prevent greedy repetition
+        # loops.  Greedy decoding causes the model to repeat tokens like
+        # '= = =' or '/h/h/h' once it enters a locally-highest-probability cycle,
+        # exhausting max_new_tokens without ever generating EOS.
+        "decode_sampling_strategy=nucleus",
+        "decode_sampling_nucleus_p=0.95",
+        "decode_sampling_temperature=0.6",
     ]
     # scan_layers=true requires the stacked checkpoint and cannot use async
     # checkpointing (shape mismatch with the default param_scan_axis=1).
