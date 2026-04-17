@@ -524,8 +524,13 @@ python3 -m pytest tests/unit/mimo_v2_flash_architecture_test.py \
   up incremental KV-cache for autoregressive decoding.  SWA layers need
   sliding-window cache management.  Full paged-attention support is tracked
   as a follow-up.
-- **Scan layers:** `scan_layers=true` is not yet validated for MiMo.  Use
-  `scan_layers=false` (the default in `mimo-v2-flash.yml`).
+- **Scan layers:** `scan_layers=true` benchmark is valid (68.3 ms / 468 tok/s,
+  2026-04-17) but the **demo/inference path is currently broken** — the 4-phase
+  decoder classes (`MiMoV2FlashSixLayerCycleBlockToLinen`,
+  `MiMoV2FlashDecoderLayerToLinen`) were lost in revert `30fd5e55`.  Use
+  `scan_layers=false` (the default in `mimo-v2-flash.yml`) for any run that
+  requires correct generated output.  Scan support will be re-enabled once the
+  4-phase code is restored from pre-revert `a28b6718`.
 - **FP8 weights:** The original model is stored in FP8 with per-block
   `weight_scale_inv` scale tensors.  The conversion script explicitly reads
   these scale tensors and applies block-wise dequantisation

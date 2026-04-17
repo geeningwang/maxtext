@@ -37,6 +37,110 @@ on the first few steps; benchmark numbers above exclude warmup.
 
 ---
 
+## Reproducing the Results (2026-04-17, v6e-32)
+
+All four cells of the inference-demo × scan matrix. Run from the manager VM against `jingnw-node` (v6e-32, `us-east5-b`). All commands use `--worker=all` to launch all 8 workers simultaneously.
+
+### Inference demo — `scan_layers=false` (dense, OCDBT checkpoint)
+
+```bash
+gcloud compute tpus tpu-vm ssh jingnw-node --zone=us-east5-b --worker=all \
+  --command='set -e
+. "$HOME/maxtext/maxtext_tpu_venv/bin/activate"
+cd "$HOME/maxtext"
+python demos/mimo_v2_flash_demo_jax.py \
+  --checkpoint_path gs://jingnw-mimo-v2-flash-us-east5/mimo-v2-flash-fixed-ocdbt/checkpoints/0/items \
+  --tokenizer_path XiaomiMiMo/MiMo-V2-Flash \
+  --ici_tensor_parallelism 4 \
+  --ici_expert_parallelism 8 \
+  --max_new_tokens 512 2>&1 | tail -25'
+```
+
+**Result (2026-04-17):** EOS fired; output = *"420 km"* (train distance problem); 2.3 tok/s.
+
+### Inference demo — `scan_layers=true` (4-phase stacked checkpoint)
+
+> ⚠️ Currently garbled — 4-phase decoder code was lost in revert `30fd5e55`. Recorded for completeness; do not use for quality validation until the code is restored.
+
+```bash
+gcloud compute tpus tpu-vm ssh jingnw-node --zone=us-east5-b --worker=all \
+  --command='set -e
+. "$HOME/maxtext/maxtext_tpu_venv/bin/activate"
+cd "$HOME/maxtext"
+python demos/mimo_v2_flash_demo_jax.py \
+  --checkpoint_path gs://jingnw-mimo-v2-flash-us-east5/mimo-v2-flash-4phase-stacked/checkpoints/0/items \
+  --tokenizer_path XiaomiMiMo/MiMo-V2-Flash \
+  --ici_tensor_parallelism 4 \
+  --ici_expert_parallelism 8 \
+  --max_new_tokens 512 \
+  --scan_layers 2>&1 | tail -25'
+```
+
+**Result (2026-04-17):** Garbled output — EOS never fired; hit `max_new_tokens=512`. Root cause: `MiMoV2FlashSixLayerCycleBlockToLinen` / `MiMoV2FlashDecoderLayerToLinen` 4-phase classes missing from current HEAD.
+
+### Benchmark — `scan_layers=false` (dense, OCDBT checkpoint)
+
+```bash
+gcloud compute tpus tpu-vm ssh jingnw-node --zone=us-east5-b --worker=all \
+  --command='set -e
+. "$HOME/maxtext/maxtext_tpu_venv/bin/activate"
+cd "$HOME/maxtext"
+export PYTHONUNBUFFERED=1
+python3 -m maxtext.inference.scripts.mimo_v2_flash_bench \
+  src/maxtext/configs/base.yml \
+  model_name=mimo-v2-flash \
+  run_name=mimo_v2_flash_bench \
+  load_parameters_path=gs://jingnw-mimo-v2-flash-us-east5/mimo-v2-flash-fixed-ocdbt/checkpoints/0/items \
+  tokenizer_path=XiaomiMiMo/MiMo-V2-Flash \
+  max_prefill_predict_length=512 \
+  max_target_length=640 \
+  per_device_batch_size=1 \
+  dtype=bfloat16 \
+  weight_dtype=bfloat16 \
+  ici_tensor_parallelism=4 \
+  ici_expert_parallelism=8 \
+  scan_layers=false \
+  attention=dot_product \
+  checkpoint_storage_use_ocdbt=true \
+  checkpoint_storage_use_zarr3=true \
+  inference_microbenchmark_log_file_path=/tmp/bench_result.json 2>&1 | grep -E "^\[BENCH\]" | tail -10'
+```
+
+**Result (2026-04-17):** Median 55.5 ms · 576 tok/s (all 8 workers consistent). Read result: `python3 -c "import json; r=json.load(open('/tmp/bench_result.json')); print(r['step_ms_median'], r['throughput_tok_per_s'])"`
+
+### Benchmark — `scan_layers=true` (4-phase stacked checkpoint)
+
+```bash
+gcloud compute tpus tpu-vm ssh jingnw-node --zone=us-east5-b --worker=all \
+  --command='set -e
+. "$HOME/maxtext/maxtext_tpu_venv/bin/activate"
+cd "$HOME/maxtext"
+export PYTHONUNBUFFERED=1
+python3 -m maxtext.inference.scripts.mimo_v2_flash_bench \
+  src/maxtext/configs/base.yml \
+  model_name=mimo-v2-flash \
+  run_name=mimo_v2_flash_scan_bench \
+  load_parameters_path=gs://jingnw-mimo-v2-flash-us-east5/mimo-v2-flash-4phase-stacked/checkpoints/0/items \
+  tokenizer_path=XiaomiMiMo/MiMo-V2-Flash \
+  max_prefill_predict_length=512 \
+  max_target_length=640 \
+  per_device_batch_size=1 \
+  dtype=bfloat16 \
+  weight_dtype=bfloat16 \
+  ici_tensor_parallelism=4 \
+  ici_expert_parallelism=8 \
+  scan_layers=true \
+  attention=dot_product \
+  checkpoint_storage_use_ocdbt=true \
+  checkpoint_storage_use_zarr3=true \
+  async_checkpointing=false \
+  inference_microbenchmark_log_file_path=/tmp/bench_scan_result.json 2>&1 | grep -E "^\[BENCH\]" | tail -5'
+```
+
+**Result (2026-04-17):** Median 68.3 ms · 468 tok/s (all 8 workers consistent). Read result: `python3 -c "import json; r=json.load(open('/tmp/bench_scan_result.json')); print(r['step_ms_median'], r['throughput_tok_per_s'])"`
+
+---
+
 ## `scan_layers=true` Analysis (2026-04-17)
 
 > **Note:** The 4-phase scan decoder code (`decoders.py` + `mimo_v2_flash.py`) was lost when sparse dispatch code was reverted in commit `30fd5e55`. The scan benchmark (below) loads the 4-phase stacked checkpoint and measures step latency, but the generated output is garbled. The scan demo path needs the 4-phase `MiMoV2FlashSixLayerCycleBlockToLinen` / `MiMoV2FlashDecoderLayerToLinen` classes restored before it can produce correct text.
