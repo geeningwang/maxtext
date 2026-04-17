@@ -219,12 +219,16 @@ def run_inference(
     ici_tensor_parallelism: int = 4,
     ici_expert_parallelism: int = 8,
     scan_layers: bool = False,
-) -> tuple[str, float | None]:
-    """Execute MaxText inference and return (generated_text, tok_per_s).
+) -> tuple[str, float | None, bool]:
+    """Execute MaxText inference and return (generated_text, tok_per_s, eos_fired).
 
     tok_per_s is the AR-generate throughput measured from the generate-loop
     timing lines printed by decode.py.  Returns None if the timing lines are
     not found in stdout (e.g. early crash).
+
+    eos_fired is True if decode.py printed an EOS-stop message, meaning the
+    model produced a clean response.  False means all max_new_tokens steps ran
+    without hitting EOS — output is likely garbled / truncated.
     """
     cmd = build_decode_command(
         checkpoint_path=checkpoint_path,
@@ -294,7 +298,11 @@ def run_inference(
         total_s = float(total_match.group(1))
         tok_per_s = actual_steps / total_s if total_s > 0 else None
 
-    return text, tok_per_s
+    # EOS detection: decode.py prints "[INFO] EOS token ... generated at step N"
+    # when the model stops early.  If absent the model exhausted max_new_tokens.
+    eos_fired = bool(re.search(r"\[INFO\] EOS token", stdout))
+
+    return text, tok_per_s, eos_fired
 
 
 def dry_run(checkpoint_path: str, tokenizer_path: str):
@@ -478,7 +486,7 @@ def main():
     print(f"Mode: {scan_label}")
     print("-" * 60)
 
-    output, tok_per_s = run_inference(
+    output, tok_per_s, eos_fired = run_inference(
         checkpoint_path=args.checkpoint_path,
         tokenizer_path=args.tokenizer_path,
         prompt=args.prompt,
@@ -493,6 +501,8 @@ def main():
     print("-" * 60)
     if tok_per_s is not None:
         print(f"Throughput: {tok_per_s:.1f} tok/s  [{scan_label}]")
+    eos_status = "EOS fired (clean stop)" if eos_fired else "WARNING: EOS never fired — output likely garbled (model hit max_new_tokens limit)"
+    print(f"Status:     {eos_status}")
     print(f"\nOutput:\n{output}")
 
 
