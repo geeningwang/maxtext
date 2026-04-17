@@ -395,7 +395,12 @@ The benchmark module always prints `[BENCH]` markers and does not accept a
 
 ### The demo script (`mimo_v2_flash_demo_jax.py`) produces garbled or repetitive output
 
-This was observed occasionally with earlier commits. As of `f42416a4` the demo
-produces well-formed output. If you see repetitive or garbled text, it is a
-greedy-decoding artifact without EOS handling and does not affect benchmark
-measurements.
+This is a known limitation on current HEAD. The demo uses greedy decoding with
+no EOS stopping condition, so the model degenerates into repetitive tokens once
+it passes the natural end of its answer. Example: the response starts correctly
+then repeats phrases like `train train first covering traveling...` indefinitely.
+
+This does **not** affect benchmark measurements — the benchmark script
+(`mimo_v2_flash_bench`) measures `engine.generate()` step latency, not output
+quality. The demo is only useful for verifying that the model loads and produces
+non-crash output; treat the generated text as a sanity-check only.
