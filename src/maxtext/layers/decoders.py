@@ -983,13 +983,18 @@ class Decoder(nn.Module):
 
           initializing = self.is_mutable_collection("params")
 
+          # mimo_stack_checkpoint.py stacks params with jnp.stack(..., axis=0),
+          # so the stacked checkpoint always has the scan dim at axis 0 regardless
+          # of the global cfg.param_scan_axis (which defaults to 1).
+          _MIMO_SCAN_AXIS = 0
+
           def _mimo_scan(layer_idx_rep, count, name):
             """Create a scan module for ``count`` homogeneous MIMO layers.
 
             ``layer_idx_rep`` determines ``is_swa`` / ``use_moe`` for the
             group; all layers in a group are architecturally identical.
             """
-            params_spec = cfg.param_scan_axis if initializing else ScanIn(cfg.param_scan_axis)
+            params_spec = _MIMO_SCAN_AXIS if initializing else ScanIn(_MIMO_SCAN_AXIS)
             scan_fn = nn.scan(
                 RemattedBlockLayer,
                 variable_axes={
