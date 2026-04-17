@@ -949,6 +949,115 @@ class Decoder(nn.Module):
               page_state,
               slot,
           )
+        elif cfg.decoder_block == DecoderBlockType.MIMO_V2_FLASH:
+          # MiMo-V2-Flash uses a 4-phase stacked checkpoint layout where each
+          # phase groups layers that share identical architecture so that
+          # nn.scan can be applied within each phase.
+          #
+          #   Phase A: layer 0          (global attn + dense MLP, unique)
+          #   Phase B: layers 1–4       (SWA + MoE, all identical) → scan=4
+          #   Phase C: layers 5–46      (7 repetitions × 6-position cycle)
+          #                             → 6 independent scans of 7 each,
+          #                               nested under "layers_c"
+          #   Phase D: layer 47         (global attn + MoE, unique)
+          #
+          # Checkpoint key layout (must match mimo_stack_checkpoint.py):
+          #   decoder.layers_a.*
+          #   decoder.layers_b.*           (stacked dim=4)
+          #   decoder.layers_c.layers_p.*  (stacked dim=7, p in 0..5)
+          #   decoder.layers_d.*
+          RemattedBlockLayer = RemattedBlockLayers[0]
+
+          # Pre-bind extra __call__ kwargs that nn.scan cannot forward as
+          # keyword arguments.  Mirrors the pattern used by DEEPSEEK scan.
+          layer_call_kwargs = {
+              "previous_chunk": previous_chunk,
+              "page_state": page_state,
+              "slot": slot,
+              "attention_metadata": attention_metadata,
+          }
+          RemattedBlockLayer.__call__ = functools.partial(
+              RemattedBlockLayer.__call__, **layer_call_kwargs
+          )
+
+          initializing = self.is_mutable_collection("params")
+
+          def _mimo_scan(layer_idx_rep, count, name):
+            """Create a scan module for `count` homogeneous MIMO layers.
+
+            ``layer_idx_rep`` is passed to the layer constructor so that
+            ``is_swa`` and ``use_moe`` are set correctly for the group.
+            All layers in the group must resolve to the same (is_swa, use_moe)
+            pair — caller is responsible for choosing a valid representative.
+            """
+            params_spec = cfg.param_scan_axis if initializing else ScanIn(cfg.param_scan_axis)
+            scan_fn = nn.scan(
+                RemattedBlockLayer,
+                variable_axes={
+                    "params": params_spec,
+                    "cache": 0,
+                    "intermediates": 0,
+                    "aqt": 0,
+                    "_overwrite_with_gradient": 0,
+                },
+                split_rngs={"params": True, "dropout": cfg.enable_dropout},
+                in_axes=(nn.broadcast,) * len(broadcast_args),
+                length=count,
+                metadata_params={nn.PARTITION_NAME: name},
+            )
+            return scan_fn(
+                config=cfg,
+                mesh=mesh,
+                name=name,
+                quant=self.quant,
+                model_mode=model_mode,
+                layer_idx=layer_idx_rep,
+            )
+
+          # Phase A: layer 0 — global attn + dense MLP (no scan, single layer)
+          y, _ = RemattedBlockLayer(
+              config=cfg,
+              mesh=mesh,
+              name="layers_a",
+              quant=self.quant,
+              model_mode=self.model_mode,
+              layer_idx=0,
+          )(y, *broadcast_args)
+
+          # Phase B: layers 1–4 — SWA + MoE (scan length=4).
+          # All four layers share the same structure; use layer_idx=1 as rep.
+          y, _ = _mimo_scan(1, 4, "layers_b")(y, *broadcast_args)
+
+          # Phase C: layers 5–46 — 7 repetitions of a 6-position cycle.
+          # Each cycle position is homogeneous across all 7 repetitions:
+          #   pos 0: global-attn MoE  (representative: layer 5)
+          #   pos 1: SWA-MoE          (representative: layer 6)
+          #   pos 2: SWA-MoE          (representative: layer 7)
+          #   pos 3: SWA-MoE          (representative: layer 8)
+          #   pos 4: SWA-MoE          (representative: layer 9)
+          #   pos 5: SWA-MoE          (representative: layer 10)
+          _PHASE_C_REP_IDXS = [5, 6, 7, 8, 9, 10]
+
+          class _MiMoPhaseCScope(nn.Module):  # pylint: disable=invalid-name
+            """Wraps the 6 phase-C scan groups under the 'layers_c' key."""
+
+            @nn.compact
+            def __call__(self_inner, inp, *bcast_args):  # pylint: disable=no-self-argument
+              for p, rep_idx in enumerate(_PHASE_C_REP_IDXS):
+                inp, _ = _mimo_scan(rep_idx, 7, f"layers_{p}")(inp, *bcast_args)
+              return inp, None
+
+          y, _ = _MiMoPhaseCScope(name="layers_c")(y, *broadcast_args)
+
+          # Phase D: layer 47 — global attn + MoE (no scan, single layer)
+          y, _ = RemattedBlockLayer(
+              config=cfg,
+              mesh=mesh,
+              name="layers_d",
+              quant=self.quant,
+              model_mode=self.model_mode,
+              layer_idx=47,
+          )(y, *broadcast_args)
         else:
           RemattedBlockLayer = RemattedBlockLayers[0]
           scan_length = int(cfg.num_decoder_layers / cfg.inhomogeneous_layer_cycle_interval)
