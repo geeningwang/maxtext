@@ -94,9 +94,11 @@ Measured performance (v6e-32, 8 workers, TP=4 × EP=8, 2026-04-08)
 """
 
 import argparse
+import re
 import subprocess
 import sys
 import textwrap
+import time
 
 
 # ---------------------------------------------------------------------------
@@ -142,7 +144,7 @@ MIMO_BASE_FLAGS = {
 
 # Default generation settings
 DEFAULT_PREFILL_LENGTH = 512
-DEFAULT_MAX_NEW_TOKENS = 128
+DEFAULT_MAX_NEW_TOKENS = 512
 
 
 def build_decode_command(
@@ -156,6 +158,7 @@ def build_decode_command(
     dtype: str = "bfloat16",
     ici_tensor_parallelism: int = 4,
     ici_expert_parallelism: int = 8,
+    scan_layers: bool = False,
 ) -> list[str]:
     """Build the shell command for maxtext.inference.decode.
 
@@ -185,7 +188,7 @@ def build_decode_command(
         # must not exceed 4.  Use expert parallelism for the 256 MoE experts instead.
         f"ici_tensor_parallelism={ici_tensor_parallelism}",
         f"ici_expert_parallelism={ici_expert_parallelism}",
-        "scan_layers=false",
+        f"scan_layers={'true' if scan_layers else 'false'}",
         # Use dot_product attention to avoid splash attention block-size alignment
         # requirements (splash requires max_target_length % q_block_size == 0).
         "attention=dot_product",
@@ -198,6 +201,10 @@ def build_decode_command(
         # flag is set.  Falls back to raw prompt if the tokenizer has no template.
         "use_chat_template=true",
     ]
+    # scan_layers=true requires the stacked checkpoint and cannot use async
+    # checkpointing (shape mismatch with the default param_scan_axis=1).
+    if scan_layers:
+        cmd.append("async_checkpointing=false")
     return cmd
 
 
@@ -211,8 +218,14 @@ def run_inference(
     verbose: bool = False,
     ici_tensor_parallelism: int = 4,
     ici_expert_parallelism: int = 8,
-) -> str:
-    """Execute MaxText inference and return the generated text."""
+    scan_layers: bool = False,
+) -> tuple[str, float | None]:
+    """Execute MaxText inference and return (generated_text, tok_per_s).
+
+    tok_per_s is the AR-generate throughput measured from the generate-loop
+    timing lines printed by decode.py.  Returns None if the timing lines are
+    not found in stdout (e.g. early crash).
+    """
     cmd = build_decode_command(
         checkpoint_path=checkpoint_path,
         tokenizer_path=tokenizer_path,
@@ -222,12 +235,14 @@ def run_inference(
         dtype=dtype,
         ici_tensor_parallelism=ici_tensor_parallelism,
         ici_expert_parallelism=ici_expert_parallelism,
+        scan_layers=scan_layers,
     )
     if verbose:
         print("Running command:")
         print("  " + " \\\n    ".join(cmd))
         print()
 
+    _t_wall_start = time.perf_counter()
     result = subprocess.run(
         cmd,
         stdout=subprocess.PIPE,
@@ -235,6 +250,7 @@ def run_inference(
         text=True,
         check=False,
     )
+    _t_wall_total = time.perf_counter() - _t_wall_start
     if verbose:
         # stderr was streamed live to terminal; echo the stdout (Input -> line) too.
         print(result.stdout or "", end="", flush=True)
@@ -250,21 +266,35 @@ def run_inference(
     eos = "<|im_end|>"
     arrow = " -> `"
     arrow_idx = stdout.find(arrow)
+    text = None
     if arrow_idx != -1:
         text_start = arrow_idx + len(arrow)
         eos_idx = stdout.find(eos, text_start)
         if eos_idx != -1:
-            # Return clean text truncated at EOS.
-            return stdout[text_start:eos_idx].rstrip("`")
-        # No EOS in output; close at the trailing backtick of the arrow segment.
-        close = stdout.find("`", text_start)
-        if close != -1:
-            return stdout[text_start:close]
-    # Fallback: return the Input -> line verbatim (no stats).
-    for line in stdout.splitlines():
-        if arrow in line:
-            return line
-    return stdout
+            text = stdout[text_start:eos_idx].rstrip("`")
+        else:
+            close = stdout.find("`", text_start)
+            if close != -1:
+                text = stdout[text_start:close]
+    if text is None:
+        for line in stdout.splitlines():
+            if arrow in line:
+                text = line
+                break
+    if text is None:
+        text = stdout
+
+    # Compute tok/s from decode.py timing lines:
+    #   [TIME] generate_total ... total=Xs steps=N avg_ms=M
+    # Actual steps taken = number of "[TIME] generate_step_" lines printed.
+    tok_per_s = None
+    total_match = re.search(r"\[TIME\] generate_total\s+\S+\s+total=(\S+)s", stdout)
+    actual_steps = len(re.findall(r"\[TIME\] generate_step_", stdout))
+    if total_match and actual_steps > 0:
+        total_s = float(total_match.group(1))
+        tok_per_s = actual_steps / total_s if total_s > 0 else None
+
+    return text, tok_per_s
 
 
 def dry_run(checkpoint_path: str, tokenizer_path: str):
@@ -424,6 +454,14 @@ def main():
         default=False,
         help="Print architecture summary and exit.",
     )
+    parser.add_argument(
+        "--scan_layers",
+        action="store_true",
+        default=False,
+        help="Use scan_layers=true (lax.while_loop per phase). Requires the 4-phase "
+             "stacked checkpoint (mimo-v2-flash-4phase-stacked). "
+             "Sets async_checkpointing=false automatically.",
+    )
     args = parser.parse_args()
 
     if args.print_arch:
@@ -436,9 +474,11 @@ def main():
 
     print_architecture_summary()
     print(f"\nPrompt:\n{args.prompt}\n")
+    scan_label = "scan_layers=true (stacked ckpt)" if args.scan_layers else "scan_layers=false (dense)"
+    print(f"Mode: {scan_label}")
     print("-" * 60)
 
-    output = run_inference(
+    output, tok_per_s = run_inference(
         checkpoint_path=args.checkpoint_path,
         tokenizer_path=args.tokenizer_path,
         prompt=args.prompt,
@@ -448,8 +488,12 @@ def main():
         verbose=args.verbose,
         ici_tensor_parallelism=args.ici_tensor_parallelism,
         ici_expert_parallelism=args.ici_expert_parallelism,
+        scan_layers=args.scan_layers,
     )
-    print(f"Output:\n{output}")
+    print("-" * 60)
+    if tok_per_s is not None:
+        print(f"Throughput: {tok_per_s:.1f} tok/s  [{scan_label}]")
+    print(f"\nOutput:\n{output}")
 
 
 if __name__ == "__main__":
