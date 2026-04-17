@@ -10,7 +10,7 @@ This document summarises all four validated inference configurations for
 
 | # | Stack | Hardware | Weight format | Status | Output quality |
 |---|---|---|---|---|---|
-| 1 | **MaxText + TPU** | TPU v6e / Ironwood v7 | BF16 (OCDBT checkpoint, FP8 dequantized via `weight_scale_inv`) | ✅ End-to-end generation validated | Coherent (`"2. But what if we are in binary?…"`) |
+| 1 | **MaxText + TPU** | TPU v6e / Ironwood v7 | BF16 (OCDBT checkpoint, FP8 dequantized via `weight_scale_inv`) | ✅ End-to-end generation validated; 55.5 ms/step · 576 tok/s (v6e-32, 2026-04-17) | Coherent (“420 km” train distance problem; EOS stop) |
 | 2 | **HuggingFace Transformers (CPU)** | AMD EPYC 9B14, 180 vCPUs, 708 GB | BF16 (shard-by-shard FP8→BF16 dequant with `weight_scale_inv`) | ✅ Runs end-to-end | Coherent (`"2. But what if we consider it in a"`) |
 | 3 | **SGLang CPU engine** | AMD EPYC 9B14, 180 vCPUs, 708 GB | FP8→BF16 cast at load (quantization_config=null) | ✅ Runs, 5 patches needed | Garbled (`葭葭葭…`) — FP8 scale tensors stripped |
 | 4 | **llama.cpp (GGUF Q8_0)** | AMD EPYC 9B14, 180 vCPUs, 708 GB | Q8_0 on disk, int8+f32 accumulation in compute | ✅ Runs, no patches needed | Coherent (`"2. But what is 0+0?"`) |
@@ -51,12 +51,12 @@ re-encodes FP8 to Q8_0 at conversion time.
 - noaux-TC sigmoid MoE routing (sigmoid scores, not softmax; L1-normalised final weights)
 
 ### Status
-End-to-end autoregressive generation is **validated** (as of 2026-04-08).  The
+End-to-end autoregressive generation is **validated** (as of 2026-04-17).  The
 demo script `demos/mimo_v2_flash_demo_jax.py` runs on v6e-32 (8 workers,
 `ici_tensor_parallelism=4 ici_expert_parallelism=8`) and produces coherent
 output.  Proper benchmark (3-step warmup + 50 timed steps at batch=32):
-**56.5 ms/step median**, **566.1 tok/s**, **1.8 ms/tok/seq** (2026-04-08,
-after opt #1: removed `jax.debug.print` from MoE gate).
+**55.5 ms/step median**, **576 tok/s**, **1.7 ms/tok/seq** (2026-04-17,
+commit `72f75972`; opt #1 `jax.debug.print` removal + SWA fix).
 The model is prompted via
 `tokenizer.apply_chat_template()` (`use_chat_template=true`) and stops cleanly
 at EOS (`<|im_end|>`, token id 151645) without running to `max_new_tokens`.
@@ -79,17 +79,28 @@ it, attention logits were `sqrt(192) ≈ 13.9×` too large, driving softmax to
 near-argmax and producing completely garbled token predictions.  Fix: added
 `query_pre_attn_scalar=cfg.head_dim**-0.5` (commit `6051205a`).
 
-### Performance (measured 2026-04-08, v6e-32)
+### Performance (measured 2026-04-17, v6e-32)
 | Metric | Value |
-|---|---|
+|---|—|
 | Checkpoint load (OCDBT, 8-process) | ~36 s |
 | Prefill (512 tokens) | ~22 s |
 | Generate (~600 tokens, EOS stop) | ~43 s (cold, includes JIT compile) |
-| Generation speed (steady-state, batch=32) | **56.5 ms/step · 566.1 tok/s · 1.8 ms/tok/seq** |
+| Generation speed (steady-state, batch=32) | **55.5 ms/step · 576 tok/s · 1.7 ms/tok/seq** |
 | HBM per chip after load | ~18.0 GB / 31.25 GB (57.5%) |
 | Parallelism | TP=4 × EP=8 |
 
-### Output (validated 2026-04-08)
+### Output (validated 2026-04-17)
+```
+Step 1: 120 km/h × 2.5 h = 300 km
+Step 2: 80 km/h × 1.5 h = 120 km
+Step 3: Total = 300 + 120 = 420 km
+```
+Model stopped cleanly at EOS after ~512 generate steps.
+Chat template applied; prompt: `"Solve step by step: A train travels at 120 km/h for 2.5 hours, then at 80 km/h for 1.5 hours. What is the total distance traveled?"`.
+
+<details>
+<summary>Earlier validated output (2026-04-08, prompt: "What is 1+1?")</summary>
+
 ```
 The answer is **2**.
 
@@ -100,7 +111,7 @@ However, depending on the context, it could also be:
 *   **1** (in modular arithmetic modulo 2)
 ```
 Model stopped cleanly at EOS after 597 generate steps (~600 tokens).
-Chat template applied; prompt: `"What is 1+1?"`.
+</details>
 
 ### Key command
 ```bash

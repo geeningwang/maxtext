@@ -305,18 +305,33 @@ All runs: `jingnw-node` (v6e-32), `per_device_batch_size=1`,
 - step latency (p90): about `55.8 ms`
 - total throughput: about `575 tok/s` (batch=32)
 
-### 2026-04-17 — Commit 539cc043 (`scan_layers=true`, stacked checkpoint)
+### 2026-04-17 — Commit 72f75972 (SWA fix + debug cleanup, dense baseline re-confirmed)
+
+checkpoint: `mimo-v2-flash-fixed-ocdbt`
+
+- `load_params`: about `29–30 s` (warm GCS cache)
+- HBM after decode-state init: `17.98 GB / 31.25 GB` per device
+- timed steps: `50`
+- step latency (median): about `55.5 ms`
+- step latency (min): about `55.2 ms`
+- total throughput: about `576 tok/s` (batch=32)
+- per-sequence latency: about `1.7 ms/tok/seq`
+
+### 2026-04-17 — Commit 539cc043 (`scan_layers=true`, stacked checkpoint, bench-only)
+
+> **Note:** The 4-phase decoder code was lost in revert `30fd5e55`.  This
+> benchmark timing is valid but the demo path produces garbled output.
 
 checkpoint: `mimo-v2-flash-4phase-stacked`
 
 - `load_params`: about `34.4–34.5 s` (warm GCS cache)
 - HBM after decode-state init: `17.98 GB / 31.25 GB` per device
 - timed steps: `50`
-- step latency (mean): about `68.5 ms`
-- step latency (median): about `68.5 ms`
-- step latency (min): about `68.3 ms`
-- step latency (p90): about `68.5–68.6 ms`
-- total throughput: about `467 tok/s` (batch=32)
+- step latency (mean): about `68.3 ms`
+- step latency (median): about `68.3 ms`
+- step latency (min): about `68.0 ms`
+- step latency (p90): about `68.4 ms`
+- total throughput: about `468 tok/s` (batch=32)
 - per-sequence latency: about `2.1 ms/tok/seq`
 
 Results from all 8 workers are nearly identical, which is expected for a
