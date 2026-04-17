@@ -12,8 +12,8 @@ Benchmarks use `src/maxtext/inference/scripts/mimo_v2_flash_bench.py`
 | 2026-04-12 | #2 Sparse MoE dispatch (`mblx.gmm`, `scan_layers=true`, stacked ckpt) | ~~56.1 ms~~ | ~~570.4 tok/s~~ | ~~1.8 ms/tok~~ | ⚠️ Invalid |
 | 2026-04-13 | #3 Int8 KV cache quantisation (`quantize_kvcache=true`) | 60.1 ms | 532.7 tok/s | 1.9 ms/tok | ❌ Rejected |
 | 2026-04-13 | #4 SWA KV cache truncation (`mimo_truncate_swa_kv_cache=true`) | 1797.6 ms† | 17.8 tok/s† | 56.2 ms/tok† | ❌ Rejected |
-| 2026-04-15 | **#5 Fix sparse dispatch for JAX 0.8.1 (EP+TP `shard_map`)** | **160 ms** | **200 tok/s** | **5.0 ms/tok** | ✅ |
-| 2026-04-17 | **#6 Switch to ocdbt checkpoint, `scan_layers=false`** (commit `1a6b9579`) | **55.7 ms** | **575 tok/s** | **1.7 ms/tok** | ✅ |
+| 2026-04-15 | #5 `shard_map` EP+TP sparse dispatch (commits `01527b9c`–`2ae1dc41`) | 160 ms | 200 tok/s | 5.0 ms/tok | ❌ Reverted |
+| 2026-04-16 | **#6 Revert sparse code; run dense dispatch from opt #1 baseline** (commit `30fd5e55`) | **55.7 ms** | **575 tok/s** | **1.7 ms/tok** | ✅ |
 
 † A/B comparison (true vs false) shows **0% Δ** in both median step latency and throughput.
 The absolute numbers are 32× lower than the opt #1 baseline (56.5 ms) — a separate regression
@@ -175,15 +175,21 @@ then `dynamic_slice` back to the local `(T/EP, H/TP)` shard.
 **Measured result (2026-04-15, same hardware/config):**
 - Median: **160 ms** (vs 1757 ms regression; opt #1 dense baseline was 56.5 ms)
 - Throughput: **200 tok/s** (vs 18.2 tok/s regression)
-- Improvement: **11× vs regression baseline**
+- Improvement vs regression: 11×, but still **3× slower than the opt #1 dense baseline**
 
 The gap between 160 ms and the opt #1 dense baseline (56.5 ms) is due to two
 all-gather collectives added by the shard_map boundary (assembling the full `(T,H)`
-token matrix on each device before dispatch).  The sparse gmm code has never
-been benchmarked on JAX 0.8.1 without these all-gathers; the theoretical target
-(avoiding full-token broadcast) has not been measured.  Eliminating the all-gathers
-would require restructuring dispatch to avoid the full token all-gathers (e.g. using
-`ragged_all_to_all` as in MaxText's `RoutedMoE` path).
+token matrix on each device before dispatch).
+
+**❌ Subsequently reverted (commit `30fd5e55`, April 16):** The shard_map approach
+was rejected because 160 ms is slower than the dense dispatch (55.7 ms). All sparse
+dispatch code (`4cb181c3`–`2ae1dc41`) was reverted back to the opt #1 dense einsum
+baseline. Current HEAD (`1a6b9579`/`5781158c`) uses the dense `MiMoV2FlashSparseMoeBlock`
+from opt #1 with no shard_map, no mblx.gmm, and no axis_index.
+
+Eliminating the all-gathers would require restructuring dispatch to avoid the full
+token broadcast (e.g. using `ragged_all_to_all` as in MaxText's `RoutedMoE` path).
+This has not yet been measured.
 
 ---
 
@@ -234,11 +240,14 @@ _tok = sampled_tokens.get_result_at_slot(0).tokens.item()  # device→host copy
 ```
 
 Both are synchronisation points that prevent any pipeline overlap between CPU
-work and TPU execution.  Bug #1 above (debug.print) already causes forced
-syncs, so fixing that also mitigates this path; however the explicit
-`effects_barrier` / `.item()` calls add host overhead independently.
+work and TPU execution. With opt #1's debug.print removed, these are now the
+**dominant per-step host sync costs** in `decode.py` (confirmed present in current
+code at lines 245 and 260). Note: `mimo_v2_flash_bench.py` avoids both — it uses
+`jax.block_until_ready(sampled_tokens)` inside the timing loop and does not call
+`effects_barrier` or `.item()`, so benchmark numbers are unaffected. The sync
+cost only matters for `decode.py` (the demo / production inference path).
 
-**Fix**: Remove the unconditional `effects_barrier` from the timing loop.  For
+**Fix**: Remove the unconditional `effects_barrier` from the timing loop. For
 the EOS check, implement on-device via `jax.lax.cond` or a deferred async
 token check to avoid the per-step host roundtrip.
 
@@ -250,7 +259,7 @@ token check to avoid the per-step host roundtrip.
 |---|---|---|---|---|---|
 | 1 | opt #1 | **Remove `jax.debug.print` from MoE gate** | Delete debug line in `mimo_v2_flash.py` | **Large** — eliminates 47 sync roundtrips/step | ✅ Accepted (56.5 ms) |
 | 2 | opt #2 | **Sparse MoE dispatch (top-8 only)** | Use MaxText MegaBlox path (`mblx.gmm`) | **Large** — 256 → 8 expert compute (32×) | ⚠️ Code merged; 56.1 ms figure invalid (stale JIT cache) |
-| 3 | N/A | **Fix sparse dispatch for JAX 0.8.1** | EP+TP `shard_map` wrapper in `MiMoV2FlashSparseMoeBlock` | **Large** — first working sparse execution, 11× vs regression | ✅ Accepted (160 ms, `2ae1dc41`) |
+| 3 | N/A | **`shard_map` EP+TP sparse dispatch** | EP+TP `shard_map` wrapper in `MiMoV2FlashSparseMoeBlock` | Regressed to 160 ms — all-gather overhead dominated | ❌ Reverted (`30fd5e55`) |
 | 4 | N/A | **Eliminate all-gather in shard_map dispatch** | Use `ragged_all_to_all` instead of full-token broadcast | **Large** — close gap between 160 ms and opt #1 baseline | Not run |
 | 5 | N/A | **Remove per-step `effects_barrier` / async EOS** | Move EOS check on-device (`lax.cond`) | Medium (host sync removal in token loop) | Not run |
 | 6 | N/A | **Truncate SWA KV cache to window size** | Decouple `cache_seq_len` per layer for 39 SWA layers | Medium-High (memory and bandwidth) | ❌ Rejected (0% Δ, ~0.36 GB/dev savings too small) |
@@ -269,9 +278,12 @@ token check to avoid the per-step host roundtrip.
 
 ## Most Impactful Next Fixes
 
-With opt #1, #5, and #6 complete (current HEAD `1a6b9579` achieves **575 tok/s /
-55.7 ms** with `scan_layers=false`, ocdbt checkpoint), and opt #3 rejected, the
-highest-priority remaining items are:
+Current HEAD (`5781158c`) uses the **opt #1 dense dispatch** (all 32 local experts
+computed per device per step via static einsum). `scan_layers=false`, ocdbt
+checkpoint, `ici_expert_parallelism=8`, `ici_tensor_parallelism=4`, batch=32 →
+**575 tok/s / 55.7 ms**. Sparse dispatch (opt #2/#5) was tried and reverted;
+it regressed to 160 ms due to shard_map all-gather overhead. Highest-priority
+remaining items:
 
 1. **Fix `scan_layers=true` for `MIMO_V2_FLASH`** — `decoders.py` has no
    `MIMO_V2_FLASH` case in the `if cfg.scan_layers:` branch; the generic scan
