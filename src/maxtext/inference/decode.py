@@ -160,6 +160,13 @@ def main(argv: Sequence[str]) -> None:
     text = tokenizer_model.tokenizer.apply_chat_template(  # pytype: disable=attribute-error
         messages, tokenize=False, add_generation_prompt=True
     )
+    # MiMo-V2-Flash is a reasoning model: it does not reliably self-start
+    # <think> from the bare <|im_start|>assistant\n prefix.  Force the model
+    # into its thinking chain by appending <think>\n so that the first tokens
+    # it generates are the reasoning chain rather than a direct (degenerate)
+    # answer.  Without this the model never produces <|im_end|> (EOS).
+    if not text.endswith("<think>") and not text.endswith("<think>\n"):
+      text = text + "<think>\n"
   tokens, true_length = tokenizer_model.encode(text, is_bos=not has_chat_template, prefill_lengths=[prefill_length])
 
   position_ids = None
