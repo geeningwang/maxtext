@@ -26,7 +26,7 @@ The commands below assume you are already logged in to the manager VM
 - network: `default`
 - subnetwork: `default`
 - checkpoint for inference (demo): `gs://jingnw-mimo-v2-flash-us-east5/mimo-v2-flash-fixed-ocdbt/checkpoints/0/items`
-- checkpoint for benchmark (stacked): `gs://jingnw-mimo-v2-flash-us-east5/mimo-v2-flash-4phase-stacked/checkpoints/0/items`
+- checkpoint for benchmark: `gs://jingnw-mimo-v2-flash-us-east5/mimo-v2-flash-fixed-ocdbt/checkpoints/0/items` (same as demo; `scan_layers=false`)
 - tokenizer: `XiaomiMiMo/MiMo-V2-Flash`
 - benchmark commit: latest `MiMo-V2-Flash` branch HEAD
 
@@ -83,7 +83,7 @@ export TPU_NAME=jingnw-node
 export TAG=MiMo-V2-Flash
 export BENCH_COMMIT=origin/MiMo-V2-Flash
 export CKPT=gs://jingnw-mimo-v2-flash-us-east5/mimo-v2-flash-fixed-ocdbt/checkpoints/0/items
-export BENCH_CKPT=gs://jingnw-mimo-v2-flash-us-east5/mimo-v2-flash-4phase-stacked/checkpoints/0/items
+export BENCH_CKPT=gs://jingnw-mimo-v2-flash-us-east5/mimo-v2-flash-fixed-ocdbt/checkpoints/0/items
 export TOKENIZER=XiaomiMiMo/MiMo-V2-Flash
 
 gcloud config set project tpu-launchpad-playground
@@ -179,9 +179,9 @@ The dedicated benchmark script runs 3 warmup steps followed by 50 timed
 `engine.generate()` steps and writes a JSON result file to
 `/tmp/bench_result.json` on each worker.
 
-The stacked checkpoint (`BENCH_CKPT`) is required when using `scan_layers=true`.
-The demo checkpoint used in section 4 will raise a `ValueError` with the
-scan wrapper.
+> **Note:** `scan_layers=true` is not yet supported for `MIMO_V2_FLASH` (crashes
+> with `TypeError: MiMoV2FlashDecoderLayer.__init__() missing 1 required positional
+> argument: 'layer_idx'`). Use `scan_layers=false` with the ocdbt checkpoint.
 
 Run this on `jingnw-tpu-op`:
 
@@ -204,7 +204,7 @@ python3 -m maxtext.inference.scripts.mimo_v2_flash_bench \
   weight_dtype=bfloat16 \
   ici_tensor_parallelism=4 \
   ici_expert_parallelism=8 \
-  scan_layers=true \
+  scan_layers=false \
   attention=dot_product \
   checkpoint_storage_use_ocdbt=true \
   checkpoint_storage_use_zarr3=true \
@@ -256,31 +256,34 @@ Key fields in the JSON output:
 
 ## 8. Reference Results
 
-Configuration for all runs: `jingnw-node` (v6e-32), stacked checkpoint,
-`scan_layers=true`, `per_device_batch_size=1`, `ici_tensor_parallelism=4`,
-`ici_expert_parallelism=8`.
+Configuration for all runs: `jingnw-node` (v6e-32), checkpoint
+`mimo-v2-flash-fixed-ocdbt`, `scan_layers=false`, `per_device_batch_size=1`,
+`ici_tensor_parallelism=4`, `ici_expert_parallelism=8`.
 
 > **Note on `load_params` time:** The first run after a full environment restore
 > hits a cold GCS cache and takes noticeably longer (~40 s). Subsequent runs on
 > the same cluster use a warm cache and return to the ~29–30 s baseline.
 
-### 2026-04-16 — Commit f42416a4 (cold GCS cache, post-restore)
+### 2026-04-17 — Commit 1a6b9579 (cold GCS cache, post-restore)
 
-- `load_params`: about `40.4 s` (cold GCS cache)
+- `load_params`: about `40.0–40.6 s` (cold GCS cache)
+- HBM after decode-state init: `17.98 GB / 31.25 GB` per device
 - timed steps: `50`
-- step latency (mean): about `152.7 ms`
-- step latency (median): about `160.0 ms`
-- step latency (min): about `129.8 ms`
-- step latency (p90): about `164.9 ms`
-- total throughput: about `200 tok/s` (batch=32)
+- step latency (mean): about `55.7 ms`
+- step latency (median): about `55.7 ms`
+- step latency (min): about `55.3 ms`
+- step latency (p90): about `55.8 ms`
+- total throughput: about `575 tok/s` (batch=32)
 
-### 2026-04-15 — Commit 2ae1dc41 (warm GCS cache)
+### Prior results — Commits f42416a4 / 2ae1dc41 (scan_layers=true, stacked checkpoint)
 
-- `load_params`: about `29.4 s`
+> **Note:** These runs used `scan_layers=true` with the stacked checkpoint. That
+> combination is currently broken (see Step 5 note). Results are kept for
+> historical comparison only.
+
+- `load_params`: about `29–40 s`
 - timed steps: `50`
 - step latency (median): about `160 ms`
-- step latency (min): about `130 ms`
-- step latency (p90): about `165 ms`
 - total throughput: about `200 tok/s` (batch=32)
 
 Results from all 8 workers are nearly identical, which is expected for a

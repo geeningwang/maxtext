@@ -13,6 +13,7 @@ Benchmarks use `src/maxtext/inference/scripts/mimo_v2_flash_bench.py`
 | 2026-04-13 | #3 Int8 KV cache quantisation (`quantize_kvcache=true`) | 60.1 ms | 532.7 tok/s | 1.9 ms/tok | ❌ Rejected |
 | 2026-04-13 | #4 SWA KV cache truncation (`mimo_truncate_swa_kv_cache=true`) | 1797.6 ms† | 17.8 tok/s† | 56.2 ms/tok† | ❌ Rejected |
 | 2026-04-15 | **#5 Fix sparse dispatch for JAX 0.8.1 (EP+TP `shard_map`)** | **160 ms** | **200 tok/s** | **5.0 ms/tok** | ✅ |
+| 2026-04-17 | **#6 Switch to ocdbt checkpoint, `scan_layers=false`** (commit `1a6b9579`) | **55.7 ms** | **575 tok/s** | **1.7 ms/tok** | ✅ |
 
 † A/B comparison (true vs false) shows **0% Δ** in both median step latency and throughput.
 The absolute numbers are 32× lower than the opt #1 baseline (56.5 ms) — a separate regression
@@ -268,15 +269,21 @@ token check to avoid the per-step host roundtrip.
 
 ## Most Impactful Next Fixes
 
-With opt #1 and opt #5 complete, the sparse gmm path in place (opt #2 code merged,
-although never cleanly benchmarked), and opt #3 rejected in current form, the highest
-priority remaining items are:
-1. **Eliminate all-gather overhead in sparse dispatch** — restructure dispatch to
+With opt #1, #5, and #6 complete (current HEAD `1a6b9579` achieves **575 tok/s /
+55.7 ms** with `scan_layers=false`, ocdbt checkpoint), and opt #3 rejected, the
+highest-priority remaining items are:
+
+1. **Fix `scan_layers=true` for `MIMO_V2_FLASH`** — `decoders.py` has no
+   `MIMO_V2_FLASH` case in the `if cfg.scan_layers:` branch; the generic scan
+   omits the required `layer_idx` constructor argument, crashing all workers.
+   Add an `elif cfg.decoder_block == DecoderBlockType.MIMO_V2_FLASH` branch
+   that broadcasts `layer_idx` correctly (e.g. via a scanned `_MiMoLayersScope`
+   analogous to the unscanned path at line 1011). Once fixed, benchmark with
+   the stacked checkpoint to compare scan vs. non-scan throughput.
+2. **Eliminate all-gather overhead in sparse dispatch** — restructure dispatch to
    avoid assembling the full `(T, H)` token matrix on each device (e.g. adopt
    MaxText's `ragged_all_to_all`-based `RoutedMoE` path in `src/maxtext/layers/moe.py`).
-   This is the remaining gap between 160 ms (current HEAD) and the opt #1 dense baseline
-   (56.5 ms); the theoretical floor for sparse dispatch has not yet been measured.
-2. Removing per-step host sync points in decode (`effects_barrier` / token `.item()`).
-3. SWA KV cache truncation to window-size-driven lengths.
-4. Re-test KV-int8 only after items 1–2 above, using the same prompt gate
+3. Removing per-step host sync points in decode (`effects_barrier` / token `.item()`).
+4. SWA KV cache truncation to window-size-driven lengths.
+5. Re-test KV-int8 only after items 1–3 above, using the same prompt gate
    and benchmark protocol.
