@@ -395,46 +395,53 @@ token check to avoid the per-step host roundtrip.
 
 ---
 
-## Optimisation Methods (re-ranked after measured Opt #3 outcome)
+## Optimisation Methods (re-ranked by expected gain, 2026-04-20)
 
-| Rank | Original Opt ID | Method | Config / Code change | Expected impact now | Result |
+> Active items (ranked by expected performance gain) are listed first. Completed ✅, measurement-invalid ⚠️, and rejected/reverted ❌ items are at the bottom for reference.
+
+| Rank | Original Opt ID | Method | Config / Code change | Expected impact | Result |
 |---|---|---|---|---|---|
-| 1 | opt #1 | **Remove `jax.debug.print` from MoE gate** | Delete debug line in `mimo_v2_flash.py` | **Large** — eliminates 47 sync roundtrips/step | ✅ Accepted (56.5 ms) |
-| 2 | N/A | **`ragged_all_to_all` sparse MoE dispatch** | Adopt `RoutedMoE` pattern from `src/maxtext/layers/moe.py`; requires `scan_layers=true` | **Large** — ~8× less MoE weight bandwidth; est. ~34 ms if fully effective | Not run |
-| 3 | N/A | **`scan_layers=true` (prerequisite for sparse dispatch)** | 4-phase stacked ckpt + `decoders.py` MIMO_V2_FLASH scan branch | −23 % latency penalty (68.3 ms) — needed as memory primitive for sparse | ⚠️ Bench valid (`72f75972`); 68.3 ms / 468 tok/s; **demo broken** (4-phase decoder code needs re-apply from pre-revert `a28b6718`) |
-| 4 | opt #2 | **Sparse MoE dispatch (top-8 only, `mblx.gmm`)** | Use MaxText MegaBlox path (`mblx.gmm`) | **Large** — 256 → 8 expert compute (32×) | ⚠️ Code merged; 56.1 ms figure invalid (stale JIT cache) |
-| 5 | N/A | **`shard_map` EP+TP sparse dispatch** | EP+TP `shard_map` wrapper in `MiMoV2FlashSparseMoeBlock` | Regressed to 160 ms — all-gather overhead dominated | ❌ Reverted (`30fd5e55`) |
-| 6 | N/A | **Remove per-step `effects_barrier` / async EOS** | Move EOS check on-device (`lax.cond`) | Medium (host sync removal in token loop) | Not run |
-| 6 | N/A | **Truncate SWA KV cache to window size** | Decouple `cache_seq_len` per layer for 39 SWA layers | Medium-High (memory and bandwidth) | ❌ Rejected (0% Δ, ~0.36 GB/dev savings too small) |
-| 7 | N/A | **Speculative decoding** | Draft model (smaller MiMo) + verifier | High potential, higher implementation complexity | Not run |
-| 8 | N/A | **Paged attention** | `attention=paged` — enables continuous batching | Medium for single-stream, high for serving throughput | Not run |
-| 9 | N/A | **Reduce `max_target_length`** | Set to `prefill + actual_budget` (e.g. 1024 instead of 2512) | Medium for startup/first-token and memory footprint | Not run |
-| 10 | N/A | **Batch size > 1 (throughput mode)** | `per_device_batch_size=2` or more | High throughput gain; not a per-sequence latency optimization | Not run |
-| 11 | N/A | **Int8 weight quantisation** | `quantization=int8` | Low-Medium for this decode path | Not run |
-| 12 | N/A | **Ring-of-experts for EP all-reduce** | `use_ring_of_experts=true` | Low-Medium, depends on comm/compute balance | Not run |
-| 13 | N/A | **AOT compilation + buffer donation** | `engine._compile_generate_and_get_layouts()` with `donate_argnames` | Low-Medium steady-state, useful startup/allocator wins | Not run |
-| 14 | N/A | **Chunked prefill** | `use_chunked_prefill=True` | Workload-dependent; more relevant for multi-request serving | Not run |
-| 15 | N/A | **Shardy partitioner** | `shardy=True` | Uncertain; can help if current partitioning is suboptimal | Not run |
-| 16 | opt #3 | **Int8 KV cache quantisation** | `quantize_kvcache=true kv_quant_dtype=int8 kv_quant_axis=heads_and_dkv` | Rejected in current setup (slower + quality regression) | ❌ Rejected (60.1 ms baseline invalid; A/B delta +~6%, quality regression) |
+| 1 | N/A | **`ragged_all_to_all` sparse MoE dispatch** | Adopt `RoutedMoE` pattern from `src/maxtext/layers/moe.py`; requires `scan_layers=true` for HBM headroom | **Largest** — ~8× less MoE weight bandwidth; est. ~32.8 ms (−41 %) if fully effective; beats current best even at half efficiency (~51 ms) | Not run |
+| 2 | N/A | **`scan_layers=true` + restore 4-phase decoder (prerequisite for rank 1)** | Cherry-pick `MiMoV2FlashDecoderLayerToLinen` + `MiMoV2FlashSixLayerCycleBlockToLinen` from pre-revert `a28b6718`; 4-phase stacked ckpt | −23 % latency alone (68.3 ms vs 55.5 ms dense) — scan is the only path that gives HBM headroom for sparse dispatch intermediates | ⚠️ Bench valid (`72f75972`); 68.3 ms / 468 tok/s; **demo broken** (4-phase decoder code needs re-apply from pre-revert `a28b6718`) |
+| 3 | N/A | **Batch size > 1 (throughput mode)** | `per_device_batch_size=2` or more — independent of scan/sparse chain | **High** — independent throughput multiplier; test on current dense HEAD first to establish scaling baseline | Not run |
+| 4 | N/A | **Speculative decoding** | Draft model (smaller MiMo) + verifier | **High** potential per-sequence latency reduction; higher implementation complexity | Not run |
+| 5 | N/A | **Remove per-step `effects_barrier` / async EOS** | Move EOS check on-device (`lax.cond`); remove sync at `decode.py` lines 245, 260 | Medium — host-sync removal in demo/production path; independent of scan/sparse | Not run |
+| 6 | N/A | **Paged attention** | `attention=paged` — enables continuous batching | Medium for single-stream, high for serving throughput | Not run |
+| 7 | N/A | **Reduce `max_target_length`** | Set to `prefill + actual_budget` (e.g. 1024 instead of 2512) | Medium for startup/first-token latency and memory footprint | Not run |
+| 8 | N/A | **Int8 weight quantisation** | `quantization=int8` | Low-Medium for this decode path | Not run |
+| 9 | N/A | **Ring-of-experts for EP all-reduce** | `use_ring_of_experts=true` | Low-Medium, depends on comm/compute balance | Not run |
+| 10 | N/A | **AOT compilation + buffer donation** | `engine._compile_generate_and_get_layouts()` with `donate_argnames` | Low-Medium steady-state, useful startup/allocator wins | Not run |
+| 11 | N/A | **Chunked prefill** | `use_chunked_prefill=True` | Workload-dependent; more relevant for multi-request serving | Not run |
+| 12 | N/A | **Shardy partitioner** | `shardy=True` | Uncertain; can help if current partitioning is suboptimal | Not run |
+| — | opt #1 | **Remove `jax.debug.print` from MoE gate** | Delete debug line in `mimo_v2_flash.py` | **Large** — eliminates 47 sync roundtrips/step | ✅ Accepted (56.5 ms) |
+| — | opt #2 | **Sparse MoE dispatch (top-8 only, `mblx.gmm`)** | Use MaxText MegaBlox path (`mblx.gmm`) | Superseded by rank-1 `ragged_all_to_all` approach | ⚠️ Code merged; 56.1 ms figure invalid (stale JIT cache) |
+| — | N/A | **`shard_map` EP+TP sparse dispatch** | EP+TP `shard_map` wrapper in `MiMoV2FlashSparseMoeBlock` | Superseded by rank-1 `ragged_all_to_all` approach — regressed to 160 ms due to all-gather overhead | ❌ Reverted (`30fd5e55`) |
+| — | N/A | **Truncate SWA KV cache to window size** | Decouple `cache_seq_len` per layer for 39 SWA layers | 0% Δ at tested config; ~0.36 GB/dev savings too small to surface | ❌ Rejected |
+| — | opt #3 | **Int8 KV cache quantisation** | `quantize_kvcache=true kv_quant_dtype=int8 kv_quant_axis=heads_and_dkv` | +~6 % slower + quality regression in current setup | ❌ Rejected |
 
 ---
 
 ## Most Impactful Next Fixes
 
-Current HEAD (`72f75972`) uses the **opt #1 dense dispatch** (`scan_layers=false`,
-ocdbt checkpoint, `ici_expert_parallelism=8`, `ici_tensor_parallelism=4`, batch=32)
-→ **576 tok/s / 55.5 ms** (confirmed after SWA fix). `scan_layers=true` benchmark
-runs at 68.3 ms / 468 tok/s — 23 % slower due to lost XLA inter-layer
-weight-prefetch pipelining (see scan analysis above); **scan demo is broken** (4-phase decoder
-code needs to be re-applied — see scan analysis note). Highest-priority remaining items:
+Current HEAD (`72f75972`) → **576 tok/s / 55.5 ms** (`scan_layers=false`, dense dispatch,
+`ici_expert_parallelism=8`, `ici_tensor_parallelism=4`, batch=32). Highest-priority items
+ranked by expected performance gain:
 
-1. **Restore 4-phase scan decoder code** (`decoders.py` + `mimo_v2_flash.py` — lost in revert `30fd5e55`). Benchmark is valid (68.3 ms / 468 tok/s) but demo is broken. Classes needed: `MiMoV2FlashDecoderLayerToLinen` + `MiMoV2FlashSixLayerCycleBlockToLinen` with phases A/B/C/D. Cherry-pick from pre-revert `a28b6718`.
-2. **`ragged_all_to_all` sparse MoE dispatch on top of `scan_layers=true`** — adopt
-   MaxText's `RoutedMoE` path (`src/maxtext/layers/moe.py`) to route tokens directly
-   to target expert shards. This avoids the two all-gather collectives that caused the
-   160 ms regression in opt #5. Target: sparse+scan < 55.5 ms (need >19 % improvement
-   from sparsity to beat the current unscanned dense best). Rough estimate: ~32.8 ms
-   (see scan analysis section). This is the highest-value remaining item after scan demo is fixed.
-3. **Remove per-step `effects_barrier` / async EOS** in `decode.py` (lines 245, 260).
-   Independent of scan/sparse; straightforward host-sync removal.
-4. Re-test KV-int8 only after items 2–3 above, using the corrected benchmark baseline.
+1. **`ragged_all_to_all` sparse MoE dispatch — the single most gainful item (rank 1).**
+   Estimated ~32.8 ms (−41 % from 55.5 ms) if fully effective; still beats current best at
+   half efficiency (~51 ms). Adopt MaxText's `RoutedMoE` path (`src/maxtext/layers/moe.py`)
+   to route tokens directly to target expert shards — avoids the two all-gather collectives
+   that caused the 160 ms regression in the earlier `shard_map` attempt. Requires
+   `scan_layers=true` for HBM headroom (see item 2). Target: sparse+scan < 55.5 ms
+   (need >19 % sparsity gain over the 68.3 ms scan baseline to beat the unscanned dense best).
+2. **Restore 4-phase scan decoder + `scan_layers=true` (prerequisite for item 1).**
+   Cherry-pick `MiMoV2FlashDecoderLayerToLinen` + `MiMoV2FlashSixLayerCycleBlockToLinen`
+   (phases A/B/C/D) from pre-revert `a28b6718`. Scan bench is already valid at 68.3 ms /
+   468 tok/s; only the demo path is broken. `scan_layers=true` is slower alone (−23 %)
+   but is the only way to bound HBM temporaries to ~3 GB/layer so sparse dispatch
+   intermediates fit within the 31.25 GB limit.
+3. **Batch size > 1 (independent throughput multiplier).** Try `per_device_batch_size=2`
+   on current dense HEAD first to measure scaling behaviour before the scan/sparse chain
+   is ready. Orthogonal to items 1–2 and can proceed in parallel.
+4. **Remove per-step `effects_barrier` / async EOS** in `decode.py` (lines 245, 260).
+   Independent of scan/sparse; straightforward host-sync removal for the demo/production path.

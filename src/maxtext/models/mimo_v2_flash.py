@@ -245,51 +245,34 @@ class MiMoV2FlashSparseMoeBlock(nnx.Module):
     # Route tokens to experts.
     top_k_indices, top_k_weights = self.gate(tokens)  # (T, K), (T, K)
 
-    # Dispatch tokens to their assigned experts using a scatter/gather approach,
-    # which is fully static-shape-friendly and XLA-compilable.
-    #
-    # Strategy: build an (E, T) weight matrix by scattering top_k_weights into
-    # positions indexed by top_k_indices, then use a single einsum per expert
-    # group. For 256 experts this is the most efficient static approach.
-    #
-    # dispatch_weights: (T, E) — weight for each (token, expert) pair (0 if not selected)
+    cfg = self.config
+    K: int = self.num_experts_per_tok    # 8
+    E_total: int = self.num_experts      # 256
     T = tokens.shape[0]
-    dispatch_weights = jnp.zeros((T, self.num_experts), dtype=jnp.float32)
+
+    # Dense dispatch: build a (T, E) weight matrix and compute expert outputs
+    # via batched einsums.  All local experts are evaluated; the dispatch matrix
+    # zeros out non-selected expert contributions.
+    dispatch_weights = jnp.zeros((T, E_total), dtype=jnp.float32)
     tok_idx = jnp.broadcast_to(
-        jnp.arange(T)[:, jnp.newaxis], (T, self.num_experts_per_tok)
-    )  # (T, K)
+        jnp.arange(T)[:, jnp.newaxis], (T, K)
+    )
     dispatch_weights = dispatch_weights.at[tok_idx, top_k_indices].add(
         top_k_weights.astype(jnp.float32)
-    )  # (T, E)
-
-    wi_0 = self.wi_0[...].astype(self.config.dtype)  # (E, H, I)
-    wi_1 = self.wi_1[...].astype(self.config.dtype)  # (E, H, I)
-    wo = self.wo[...].astype(self.config.dtype)       # (E, I, H)
-
-    # For each expert e compute the contribution to each token:
-    #   g_e   = silu(tokens @ wi_0[e])               (T, I)
-    #   u_e   = tokens @ wi_1[e]                      (T, I)
-    #   out_e = (g_e * u_e) @ wo[e]                  (T, H)
-    #   contribution_e = dispatch_weights[:, e:e+1] * out_e  (T, H)
-    #
-    # We vectorise over E using jnp.einsum with the expert axis:
-    #   tokens_all: (T, H) broadcast over all experts.
-    #   gate:  (E, T, I) = silu(einsum('TH,EHI->ETI', tokens, wi_0))
-    #   up:    (E, T, I) =     einsum('TH,EHI->ETI', tokens, wi_1)
-    #   down:  (E, T, H) =     einsum('ETI,EIH->ETH', gate*up, wo)
-    #   out:   (T, H)    =     einsum('TE,ETH->TH',  dispatch_weights, down)
-
-    tokens_fp = tokens.astype(self.config.dtype)  # (T, H)
-    gate = jax.nn.silu(
+    )
+    wi_0 = self.wi_0[...].astype(cfg.dtype)
+    wi_1 = self.wi_1[...].astype(cfg.dtype)
+    wo  = self.wo[...].astype(cfg.dtype)
+    tokens_fp = tokens.astype(cfg.dtype)
+    gate_act = jax.nn.silu(
         jnp.einsum("th,ehi->eti", tokens_fp, wi_0, precision=lax.Precision.DEFAULT)
-    )                                                                     # (E, T, I)
-    up = jnp.einsum("th,ehi->eti", tokens_fp, wi_1,
-                    precision=lax.Precision.DEFAULT)                      # (E, T, I)
-    down = jnp.einsum("eti,eih->eth", gate * up, wo,
-                      precision=lax.Precision.DEFAULT)                    # (E, T, H)
-    output = jnp.einsum("te,eth->th",
-                        dispatch_weights.astype(self.config.dtype), down,
-                        precision=lax.Precision.DEFAULT)                  # (T, H)
+    )
+    up = jnp.einsum("th,ehi->eti", tokens_fp, wi_1, precision=lax.Precision.DEFAULT)
+    down = jnp.einsum("eti,eih->eth", gate_act * up, wo, precision=lax.Precision.DEFAULT)
+    output = jnp.einsum(
+        "te,eth->th", dispatch_weights.astype(cfg.dtype), down,
+        precision=lax.Precision.DEFAULT,
+    )
     return output.reshape(orig_shape)
 
 

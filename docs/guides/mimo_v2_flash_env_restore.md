@@ -337,6 +337,31 @@ checkpoint: `mimo-v2-flash-4phase-stacked`
 Results from all 8 workers are nearly identical, which is expected for a
 synchronous collective workload.
 
+### 2026-04-20 — Post-opt4 revert (dense dispatch, `scan_layers=true`, decode + prefill)
+
+checkpoint: `mimo-v2-flash-4phase-stacked`
+
+After reverting the ragged-A2A sparse MoE dispatch (opt4, see plan post-mortem),
+the benchmark now measures both AR decode and prefill in a single run.
+
+**AR Decode:**
+- `load_params`: about `34.7 s`
+- timed steps: `50`
+- step latency (median): about `68.4 ms`
+- step latency (min): about `68.3 ms`
+- total throughput: about `468 tok/s` (batch=32)
+
+**Prefill (seq_len=512):**
+- timed calls: `20`
+- step latency (median): about `121.9 ms`
+- step latency (min): about `121.8 ms`
+- total throughput: about `4,200 tok/s`
+
+The decode result matches the prior `scan_layers=true` baseline (68.3 ms),
+confirming the revert is clean.  The opt4 ragged-A2A implementation measured
+101.5 ms — an 83% regression caused by ICI collective overhead with small
+T=32 during AR decode (see opt4 plan doc for full post-mortem).
+
 ### Prior Reference Result For Commit 5ad76eac (regression baseline)
 
 Measured on 2026-04-15 with the same configuration. This commit contained the

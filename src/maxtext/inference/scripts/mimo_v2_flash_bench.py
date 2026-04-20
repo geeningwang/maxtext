@@ -13,11 +13,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Minimal AR generate benchmark for MiMo-V2-Flash on TPU.
+"""Minimal AR generate + prefill benchmark for MiMo-V2-Flash on TPU.
 
-Uses the same engine.generate() path as decode.py (no AOT compilation),
-adds a proper warmup pass, then times TIMED_STEPS steady-state generate steps.
-Reports min/median/p90/mean and total throughput.
+Uses the same engine.generate() and engine.prefill() paths as decode.py
+(no AOT compilation), adds a proper warmup pass, then times TIMED_STEPS
+steady-state steps for each phase.
+
+Decode benchmark: times engine.generate() — one AR step generating a single
+  new token for each request in the batch (T = batch × 1 per step).
+
+Prefill benchmark: times engine.prefill() — processes one full prompt of
+  max_prefill_predict_length tokens (T = 1 × max_prefill_predict_length per
+  call).  This is the phase where sparse MoE routing provides the most
+  benefit, since T is large and MoE intermediates dominate HBM bandwidth.
+
+Key distinction that drove opt4 reversal (see opt4 plan post-mortem):
+  - Decode T = batch × 1 = 32 tokens per step → EP routing overhead dominates.
+  - Prefill T = 1 × max_prefill_predict_length = 512 tokens per call
+    → EP routing can reduce MoE HBM temporaries by up to 32×.
 
 Run on all TPU workers simultaneously:
     gcloud compute tpus tpu-vm ssh <tpu> --zone=<zone> --worker=all \\
@@ -33,6 +46,7 @@ import time
 from typing import Sequence
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 from absl import app
 
@@ -42,6 +56,34 @@ from maxtext.utils import max_utils
 
 _WARMUP_STEPS = 3
 _TIMED_STEPS = 50
+_PREFILL_WARMUP = 3
+_PREFILL_TIMED = 20
+
+
+def _report(label: str, times_ms: list[float], batch_tokens: int, host: str, num_devices: int) -> dict:
+    arr = np.array(times_ms)
+    results = {
+        "label": label,
+        "host": host,
+        "num_devices": num_devices,
+        "batch_tokens": batch_tokens,
+        "step_ms_mean": float(np.mean(arr)),
+        "step_ms_median": float(np.median(arr)),
+        "step_ms_min": float(np.min(arr)),
+        "step_ms_p90": float(np.percentile(arr, 90)),
+        "step_ms_max": float(np.max(arr)),
+        "throughput_tok_per_s": float(batch_tokens / (np.median(arr) / 1000)),
+    }
+    print("\n" + "=" * 60, flush=True)
+    print(f"[BENCH] === {label} Results ===", flush=True)
+    print(f"  Host:           {host}", flush=True)
+    print(f"  Devices:        {num_devices}  (batch_tokens={batch_tokens})", flush=True)
+    print(f"  Timed steps:    {len(times_ms)}", flush=True)
+    print(f"  Step latency:   mean={results['step_ms_mean']:.1f}ms  median={results['step_ms_median']:.1f}ms", flush=True)
+    print(f"                  min={results['step_ms_min']:.1f}ms   p90={results['step_ms_p90']:.1f}ms  max={results['step_ms_max']:.1f}ms", flush=True)
+    print(f"  Throughput:     {results['throughput_tok_per_s']:.1f} tok/s", flush=True)
+    print("=" * 60, flush=True)
+    return results
 
 
 def main(argv: Sequence[str]) -> None:
@@ -50,6 +92,10 @@ def main(argv: Sequence[str]) -> None:
     config = pyconfig.initialize(argv)
     jax.config.update("jax_use_shardy_partitioner", config.shardy)
     max_utils.print_system_information()
+
+    host = socket.gethostname()
+    num_devices = jax.device_count()
+    all_results = {}
 
     # ---- Build engine + load params ----------------------------------------
     engine = maxengine.MaxEngine(config)
@@ -61,64 +107,89 @@ def main(argv: Sequence[str]) -> None:
     load_s = time.perf_counter() - t0
     print(f"[BENCH] load_params: {load_s:.1f}s", flush=True)
 
-    # ---- Init decode state (empty KV cache) --------------------------------
+    # ====================================================================
+    # Phase 1: AR Decode benchmark
+    # ====================================================================
     rng, rng_init = jax.random.split(rng)
     decode_state = engine.init_decode_state(rng_init)
     jax.block_until_ready(decode_state)
     print("[BENCH] decode_state initialised", flush=True)
 
-    # ---- Warmup (2+ full generate passes, JIT compiles on first) -----------
-    print(f"[BENCH] warmup ({_WARMUP_STEPS} steps) ...", flush=True)
+    # Warmup
+    print(f"[BENCH] decode warmup ({_WARMUP_STEPS} steps) ...", flush=True)
     for _ in range(_WARMUP_STEPS):
         rng, rng_gen = jax.random.split(rng)
         decode_state, _ = engine.generate(params, decode_state, rng=rng_gen)
     jax.block_until_ready(decode_state)
-    print("[BENCH] warmup done", flush=True)
+    print("[BENCH] decode warmup done", flush=True)
 
-    # ---- Timed benchmark ---------------------------------------------------
+    # Timed
     step_times_ms = []
-    print(f"[BENCH] timing {_TIMED_STEPS} steps ...", flush=True)
-    for i in range(_TIMED_STEPS):
+    print(f"[BENCH] timing {_TIMED_STEPS} decode steps ...", flush=True)
+    for _ in range(_TIMED_STEPS):
         rng, rng_gen = jax.random.split(rng)
         t_step = time.perf_counter()
         decode_state, sampled_tokens = engine.generate(params, decode_state, rng=rng_gen)
         jax.block_until_ready(sampled_tokens)
-        step_ms = (time.perf_counter() - t_step) * 1000
-        step_times_ms.append(step_ms)
+        step_times_ms.append((time.perf_counter() - t_step) * 1000)
 
-    # ---- Report ------------------------------------------------------------
-    arr = np.array(step_times_ms)
-    batch_size = int(config.per_device_batch_size * jax.device_count())
-    host = socket.gethostname()
+    batch_size = int(config.per_device_batch_size * num_devices)
+    all_results["decode"] = _report(
+        "AR Decode", step_times_ms, batch_tokens=batch_size,
+        host=host, num_devices=num_devices,
+    )
 
-    results = {
-        "host": host,
-        "num_devices": jax.device_count(),
-        "batch_size": batch_size,
-        "timed_steps": _TIMED_STEPS,
-        "step_ms_mean": float(np.mean(arr)),
-        "step_ms_median": float(np.median(arr)),
-        "step_ms_min": float(np.min(arr)),
-        "step_ms_p90": float(np.percentile(arr, 90)),
-        "step_ms_max": float(np.max(arr)),
-        "throughput_tok_per_s": float(batch_size / (np.median(arr) / 1000)),
-    }
+    # ====================================================================
+    # Phase 2: Prefill benchmark
+    # ====================================================================
+    prefill_len = int(config.max_prefill_predict_length)
+    if prefill_len > 0:
+        print(f"\n[BENCH] prefill benchmark (seq_len={prefill_len}) ...", flush=True)
+        # Synthetic prompt: fill with token ID 1 (typically <s> or pad)
+        padded_tokens = jnp.ones((prefill_len,), dtype=jnp.int32)
 
-    print("\n" + "=" * 60, flush=True)
-    print("[BENCH] === AR Generate Benchmark Results ===", flush=True)
-    print(f"  Host:           {host}", flush=True)
-    print(f"  Devices:        {results['num_devices']}  (batch={batch_size})", flush=True)
-    print(f"  Timed steps:    {_TIMED_STEPS}", flush=True)
-    print(f"  Step latency:   mean={results['step_ms_mean']:.1f}ms  median={results['step_ms_median']:.1f}ms", flush=True)
-    print(f"                  min={results['step_ms_min']:.1f}ms   p90={results['step_ms_p90']:.1f}ms  max={results['step_ms_max']:.1f}ms", flush=True)
-    print(f"  Throughput:     {results['throughput_tok_per_s']:.1f} tok/s  (batch={batch_size})", flush=True)
-    print(f"  Per-seq:        {results['step_ms_median'] / batch_size:.1f} ms/tok/seq", flush=True)
-    print("=" * 60, flush=True)
+        # Warmup — each prefill call processes one sequence
+        print(f"[BENCH] prefill warmup ({_PREFILL_WARMUP} calls) ...", flush=True)
+        for _ in range(_PREFILL_WARMUP):
+            rng, rng_pf = jax.random.split(rng)
+            result = engine.prefill(
+                params=params,
+                padded_tokens=padded_tokens,
+                true_length=prefill_len,
+                rng=rng_pf,
+                slot=0,
+            )
+            jax.block_until_ready(result)
+        print("[BENCH] prefill warmup done", flush=True)
 
+        # Timed
+        prefill_times_ms = []
+        print(f"[BENCH] timing {_PREFILL_TIMED} prefill calls ...", flush=True)
+        for _ in range(_PREFILL_TIMED):
+            rng, rng_pf = jax.random.split(rng)
+            t_pf = time.perf_counter()
+            result = engine.prefill(
+                params=params,
+                padded_tokens=padded_tokens,
+                true_length=prefill_len,
+                rng=rng_pf,
+                slot=0,
+            )
+            jax.block_until_ready(result)
+            prefill_times_ms.append((time.perf_counter() - t_pf) * 1000)
+
+        all_results["prefill"] = _report(
+            f"Prefill (seq_len={prefill_len})", prefill_times_ms,
+            batch_tokens=prefill_len, host=host, num_devices=num_devices,
+        )
+    else:
+        print("[BENCH] skipping prefill benchmark (max_prefill_predict_length=0)", flush=True)
+
+    # ---- Persist results ---------------------------------------------------
     log_path = getattr(config, "inference_microbenchmark_log_file_path", "")
     if log_path:
         with open(log_path, "w", encoding="utf-8") as f:
-            json.dump(results, f, indent=2)
+            json.dump(all_results, f, indent=2)
         print(f"[BENCH] results written to {log_path}", flush=True)
 
 
