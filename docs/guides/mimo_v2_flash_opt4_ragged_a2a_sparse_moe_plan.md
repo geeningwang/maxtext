@@ -641,6 +641,7 @@ For **prefill** throughput (where T is large and sparse routing helps):
 | Local gmm only (opt2, scan=true) | 56.1 ms | 570 tok/s | — | — |
 | **Ragged-A2A shard_map (opt4)** | **101.5 ms** | **315.5 tok/s** | — | — |
 | **Dense scan=true (opt4 reverted)** | **68.4 ms** | **468 tok/s** | **121.9 ms** | **4,200 tok/s** |
+| **Dense no-scan (opt4 reverted)** | **55.4 ms** | **577.5 tok/s** | **123.6 ms** | **4,144 tok/s** |
 
 ### Lessons learned
 

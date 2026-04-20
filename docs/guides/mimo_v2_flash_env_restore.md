@@ -362,6 +362,33 @@ confirming the revert is clean.  The opt4 ragged-A2A implementation measured
 101.5 ms — an 83% regression caused by ICI collective overhead with small
 T=32 during AR decode (see opt4 plan doc for full post-mortem).
 
+### 2026-04-20 — Post-opt4 revert (dense dispatch, `scan_layers=false`, decode + prefill)
+
+checkpoint: `mimo-v2-flash-fixed-ocdbt`
+
+Re-confirmed dense no-scan baseline on commit `055a4c2d` after full environment
+restore.  Both `scan_layers` modes verified working on the same commit.
+
+**AR Decode:**
+- `load_params`: about `40.0 s` (cold GCS cache after restore)
+- timed steps: `50`
+- step latency (median): about `55.4 ms`
+- step latency (min): about `55.3 ms`
+- total throughput: about `577.5 tok/s` (batch=32)
+
+**Prefill (seq_len=512):**
+- timed calls: `20`
+- step latency (median): about `123.6 ms`
+- step latency (min): about `123.4 ms`
+- total throughput: about `4,144 tok/s`
+
+### Summary of current baselines (2026-04-20, commit `055a4c2d`)
+
+| Config | Decode Median | Decode Throughput | Prefill Median (512 tok) | Prefill Throughput |
+|---|---|---|---|---|
+| `scan_layers=false` (OCDBT ckpt) | 55.4 ms | 577.5 tok/s | 123.6 ms | 4,144 tok/s |
+| `scan_layers=true` (stacked ckpt) | 68.4 ms | 468 tok/s | 121.9 ms | 4,200 tok/s |
+
 ### Prior Reference Result For Commit 5ad76eac (regression baseline)
 
 Measured on 2026-04-15 with the same configuration. This commit contained the

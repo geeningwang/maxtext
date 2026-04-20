@@ -15,7 +15,9 @@ Benchmarks use `src/maxtext/inference/scripts/mimo_v2_flash_bench.py`
 | 2026-04-15 | #5 `shard_map` EP+TP sparse dispatch (commits `01527b9c`–`2ae1dc41`) | 160 ms | 200 tok/s | 5.0 ms/tok | ❌ Reverted |
 | 2026-04-16 | **#6 Revert sparse code; run dense dispatch from opt #1 baseline** (commit `30fd5e55`) | **55.7 ms** | **575 tok/s** | **1.7 ms/tok** | ✅ |
 | 2026-04-17 | #7 `scan_layers=true` — 4-phase stacked ckpt bench-only (commits `0a084626`–`539cc043`; demo broken — 4-phase decoder code lost in `30fd5e55`, see note) | 68.3 ms | 468 tok/s | 2.1 ms/tok | ⚠️ Bench-only; +23% vs best dense |
-| 2026-04-17 | **#8 SWA fix + debug logging cleanup** (commit `72f75972`) — dense baseline re-confirmed | **55.5 ms** | **576 tok/s** | **1.7 ms/tok** | ✅ Current best |
+| 2026-04-17 | **#8 SWA fix + debug logging cleanup** (commit `72f75972`) — dense baseline re-confirmed | **55.5 ms** | **576 tok/s** | **1.7 ms/tok** | ✅ |
+| 2026-04-20 | #9 Ragged-A2A sparse EP routing (opt4) — reverted, 83% regression | 101.5 ms | 315.5 tok/s | 3.2 ms/tok | ❌ Reverted |
+| 2026-04-20 | **#10 Revert opt4; add prefill benchmark** (commit `055a4c2d`) — both scan modes verified | **55.4 ms** | **577.5 tok/s** | **1.7 ms/tok** | ✅ Current best |
 
 † A/B comparison (true vs false) shows **0% Δ** in both median step latency and throughput.
 The absolute numbers are 32× lower than the opt #1 baseline (56.5 ms) — a separate regression
@@ -108,6 +110,8 @@ python3 -m maxtext.inference.scripts.mimo_v2_flash_bench \
 
 **Result (2026-04-17):** Median 55.5 ms · 576 tok/s (all 8 workers consistent). Read result: `python3 -c "import json; r=json.load(open('/tmp/bench_result.json')); print(r['step_ms_median'], r['throughput_tok_per_s'])"`
 
+**Result (2026-04-20, commit `055a4c2d`):** Median 55.4 ms decode · 577.5 tok/s; Median 123.6 ms prefill (512 tok) · 4,144 tok/s. Bench script now runs both decode and prefill phases.
+
 ### Benchmark — `scan_layers=true` (4-phase stacked checkpoint)
 
 ```bash
@@ -138,6 +142,8 @@ python3 -m maxtext.inference.scripts.mimo_v2_flash_bench \
 ```
 
 **Result (2026-04-17):** Median 68.3 ms · 468 tok/s (all 8 workers consistent). Read result: `python3 -c "import json; r=json.load(open('/tmp/bench_scan_result.json')); print(r['step_ms_median'], r['throughput_tok_per_s'])"`
+
+**Result (2026-04-20, commit `055a4c2d`):** Median 68.4 ms decode · 468 tok/s; Median 121.9 ms prefill (512 tok) · 4,200 tok/s. Both scan modes verified working on the same commit.
 
 ---
 
