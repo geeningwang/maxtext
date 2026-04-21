@@ -17,7 +17,8 @@ Benchmarks use `src/maxtext/inference/scripts/mimo_v2_flash_bench.py`
 | 2026-04-17 | #7 `scan_layers=true` — 4-phase stacked ckpt bench-only (commits `0a084626`–`539cc043`; demo broken — 4-phase decoder code lost in `30fd5e55`, see note) | 68.3 ms | 468 tok/s | 2.1 ms/tok | ⚠️ Bench-only; +23% vs best dense |
 | 2026-04-17 | **#8 SWA fix + debug logging cleanup** (commit `72f75972`) — dense baseline re-confirmed | **55.5 ms** | **576 tok/s** | **1.7 ms/tok** | ✅ |
 | 2026-04-20 | #9 Ragged-A2A sparse EP routing (opt4) — reverted, 83% regression | 101.5 ms | 315.5 tok/s | 3.2 ms/tok | ❌ Reverted |
-| 2026-04-20 | **#10 Revert opt4; add prefill benchmark** (commit `055a4c2d`) — both scan modes verified | **55.4 ms** | **577.5 tok/s** | **1.7 ms/tok** | ✅ Current best |
+| 2026-04-20 | **#10 Revert opt4; add prefill benchmark** (commit `055a4c2d`) — both scan modes verified | **55.4 ms** | **577.5 tok/s** | **1.7 ms/tok** | ✅ |
+| 2026-04-21 | **#11 Batch size scaling (opt5)** — sweep per_device_batch_size=1→11, OOM at 12 (commits `6d067cdf`–`711f591f`) | **129.2 ms** | **2,724 tok/s** | **0.37 ms/tok** | ✅ Current best |
 
 † A/B comparison (true vs false) shows **0% Δ** in both median step latency and throughput.
 The absolute numbers are 32× lower than the opt #1 baseline (56.5 ms) — a separate regression
@@ -420,7 +421,7 @@ token check to avoid the per-step host roundtrip.
 
 | Rank | Method | Config / Code change | Expected impact | Result |
 |---|---|---|---|---|
-| 1 | **Batch size > 1 (throughput mode)** | `per_device_batch_size=2` or more — see [opt5 plan](mimo_v2_flash_opt5_batch_size_scaling.md) | **Highest confidence** — at batch=32 the step is weight-bandwidth-bound; doubling batch doubles tokens/step with nearly the same weight reads → near-linear throughput scaling. Simple config change, orthogonal to all other opts. | Not run |
+| 1 | **Batch size > 1 (throughput mode)** | `per_device_batch_size=11` — see [opt5 results](mimo_v2_flash_opt5_batch_size_scaling.md) | **Highest confidence — confirmed.** Sweep: batch=2 (1,032 tok/s, 1.79×), 4 (1,652, 2.86×), 8 (2,428, 4.21×), 10 (2,715, 4.70×), **11 (2,724, 4.72×)**. OOM at batch=12. Prefill unchanged (123.6 ms, compute-bound). | ✅ **Done** — 2,724 tok/s at `per_device_batch_size=11` (total batch 352) |
 | 2 | **Int8/FP8 weight quantisation** | `quantization=int8` (or FP8 via `quantization=fp8`) | **High** — directly halves the dominant cost (expert weight reads from HBM). The opt4 post-mortem identified weight reads as THE bottleneck for decode. Not the same as KV-int8 (rejected, opt #3); weight quant targets a different data path. Must test quality impact. | Not run |
 | 3 | **Speculative decoding** | Draft model (smaller MiMo or shared-expert-only subset) + verifier | **High** per-sequence latency reduction; higher implementation complexity. Orthogonal to batch-size scaling. | Not run |
 | 4 | **Remove per-step `effects_barrier` / async EOS** | Move EOS check on-device (`lax.cond`); remove sync at `decode.py` lines 245, 260 | **Medium** — host-sync removal in demo/production path. Simple, independent of all other opts. Does not affect benchmark numbers (bench already avoids sync). | Not run |
@@ -443,9 +444,9 @@ token check to avoid the per-step host roundtrip.
 
 ## Most Impactful Next Fixes (2026-04-20 post-opt4 post-mortem)
 
-Current HEAD (`055a4c2d`) → **577.5 tok/s / 55.4 ms decode** (`scan_layers=false`, dense dispatch,
-`ici_expert_parallelism=8`, `ici_tensor_parallelism=4`, batch=32).
-Prefill: **123.6 ms / 4,144 tok/s** (512 tokens).
+Current HEAD (`711f591f`) → **2,724 tok/s / 129.2 ms decode** (`scan_layers=false`, dense dispatch,
+`ici_expert_parallelism=8`, `ici_tensor_parallelism=4`, `per_device_batch_size=11`, total batch=352).
+Prefill: **123.6 ms / 4,144 tok/s** (512 tokens, compute-bound, unchanged by batch scaling).
 
 **Key insight from opt4 failure:** AR decode at batch=32 / T=32 is **weight-bandwidth-bound**.
 The bottleneck is reading ~1.5 GB of expert weights per step (47 MoE layers × 3 projections ×
@@ -456,20 +457,19 @@ must target **weight bandwidth** directly.
 
 Highest-priority items ranked by expected decode throughput gain:
 
-1. **Batch size > 1 — highest-confidence throughput gain (rank 1).**
-   At batch=32, each decode step reads the same ~1.5 GB of weights regardless of batch size.
-   Doubling batch (`per_device_batch_size=2`) doubles tokens per step with minimal extra HBM
-   read, giving near-linear throughput scaling. Simple `per_device_batch_size` config change.
-   Test on current dense HEAD first to measure scaling curve. If HBM allows, try batch=4 or 8.
-2. **Int8/FP8 weight quantisation — directly targets the identified bottleneck (rank 2).**
+1. **Batch size > 1 — ✅ Done (opt5, 2026-04-21).**
+   Full sweep: batch=2 (1,032 tok/s), 4 (1,652), 8 (2,428), 10 (2,715), **11 (2,724, optimal)**.
+   OOM at batch=12 (XLA HLO temp allocation). New baseline: `per_device_batch_size=11`, 2,724 tok/s.
+2. **Int8/FP8 weight quantisation — directly targets the identified bottleneck (rank 1, next up).**
    `quantization=int8` halves expert weight reads from HBM — the dominant cost identified
    by the opt4 post-mortem. Unlike KV-int8 (rejected, +6 % latency + quality regression),
    weight quantisation targets a completely different data path (model weights, not KV cache).
    Must measure both latency improvement and quality impact on reference prompts.
-3. **Speculative decoding (rank 3).** Draft model (smaller MiMo variant or shared-expert-only
+   **Run at the new baseline (`per_device_batch_size=11`) to measure stacked gain.**
+3. **Speculative decoding (rank 2).** Draft model (smaller MiMo variant or shared-expert-only
    subset) produces K candidate tokens per step, verified in one pass by the full model.
    High per-sequence latency reduction; orthogonal to batch scaling. Higher implementation
    complexity.
-4. **Remove per-step `effects_barrier` / async EOS (rank 4).** Simple host-sync removal in
+4. **Remove per-step `effects_barrier` / async EOS (rank 3).** Simple host-sync removal in
    `decode.py` (lines 245, 260). Does not affect benchmark numbers (bench avoids sync), but
    improves demo/production inference path latency. Independent of all other items.

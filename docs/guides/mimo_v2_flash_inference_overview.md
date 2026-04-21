@@ -10,7 +10,7 @@ This document summarises all four validated inference configurations for
 
 | # | Stack | Hardware | Weight format | Status | Output quality |
 |---|---|---|---|---|---|
-| 1 | **MaxText + TPU** | TPU v6e / Ironwood v7 | BF16 (OCDBT checkpoint, FP8 dequantized via `weight_scale_inv`) | ✅ End-to-end generation validated; 55.5 ms/step · 576 tok/s (v6e-32, 2026-04-17) | Coherent (“420 km” train distance problem; EOS stop) |
+| 1 | **MaxText + TPU** | TPU v6e / Ironwood v7 | BF16 (OCDBT checkpoint, FP8 dequantized via `weight_scale_inv`) | ✅ End-to-end generation validated; 129.2 ms/step · 2,724 tok/s at batch=352 (v6e-32, 2026-04-21, `per_device_batch_size=11`); 55.4 ms/step · 577.5 tok/s at batch=32 | Coherent ("420 km" train distance problem; EOS stop) |
 | 2 | **HuggingFace Transformers (CPU)** | AMD EPYC 9B14, 180 vCPUs, 708 GB | BF16 (shard-by-shard FP8→BF16 dequant with `weight_scale_inv`) | ✅ Runs end-to-end | Coherent (`"2. But what if we consider it in a"`) |
 | 3 | **SGLang CPU engine** | AMD EPYC 9B14, 180 vCPUs, 708 GB | FP8→BF16 cast at load (quantization_config=null) | ✅ Runs, 5 patches needed | Garbled (`葭葭葭…`) — FP8 scale tensors stripped |
 | 4 | **llama.cpp (GGUF Q8_0)** | AMD EPYC 9B14, 180 vCPUs, 708 GB | Q8_0 on disk, int8+f32 accumulation in compute | ✅ Runs, no patches needed | Coherent (`"2. But what is 0+0?"`) |
@@ -57,6 +57,8 @@ demo script `demos/mimo_v2_flash_demo_jax.py` runs on v6e-32 (8 workers,
 output.  Proper benchmark (3-step warmup + 50 timed steps at batch=32):
 **55.5 ms/step median**, **576 tok/s**, **1.7 ms/tok/seq** (2026-04-17,
 commit `72f75972`; opt #1 `jax.debug.print` removal + SWA fix).
+Opt5 batch scaling (2026-04-21, commit `711f591f`): **129.2 ms/step**, **2,724 tok/s**,
+**0.37 ms/tok/seq** at `per_device_batch_size=11` (total batch=352, v6e-32).
 The model is prompted via
 `tokenizer.apply_chat_template()` (`use_chat_template=true`) and stops cleanly
 at EOS (`<|im_end|>`, token id 151645) without running to `max_new_tokens`.
@@ -85,7 +87,8 @@ near-argmax and producing completely garbled token predictions.  Fix: added
 | Checkpoint load (OCDBT, 8-process) | ~36 s |
 | Prefill (512 tokens) | ~22 s |
 | Generate (~600 tokens, EOS stop) | ~43 s (cold, includes JIT compile) |
-| Generation speed (steady-state, batch=32) | **55.5 ms/step · 576 tok/s · 1.7 ms/tok/seq** |
+| Generation speed (steady-state, batch=32) | 55.5 ms/step · 576 tok/s · 1.7 ms/tok/seq |
+| Generation speed (steady-state, batch=352, `per_device_batch_size=11`) | **129.2 ms/step · 2,724 tok/s · 0.37 ms/tok/seq** (2026-04-21, current best) |
 | HBM per chip after load | ~18.0 GB / 31.25 GB (57.5%) |
 | Parallelism | TP=4 × EP=8 |
 
