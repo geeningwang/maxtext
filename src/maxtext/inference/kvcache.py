@@ -326,15 +326,6 @@ class KVCache(BaseCache):
     self._prefill_cache_len = min(max_prefill_length, swa_window_size) if swa_window_size > 0 else max_prefill_length
     self._ar_cache_len = swa_window_size if swa_window_size > 0 else (max_target_length - max_prefill_length)
 
-    import jax
-    if jax.process_index() == 0:
-      print(
-          f"[KVCache DEBUG] swa={swa_window_size} mode={model_mode} "
-          f"prefill_len={self._prefill_cache_len} ar_len={self._ar_cache_len} "
-          f"batch={batch} heads(k/v)={key_heads}/{value_heads}",
-          flush=True,
-      )
-
     if model_mode in (MODEL_MODE_PREFILL, MODEL_MODE_AUTOREGRESSIVE):
       self._initialize_prefill_caches(model_mode)
       self._initialize_ar_cache_vars(model_mode)
