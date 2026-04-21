@@ -24,6 +24,55 @@ re-encodes FP8 to Q8_0 at conversion time.
 
 ---
 
+## Competitive Benchmark Comparison
+
+Numbers from an external reference implementation (hardware and framework unspecified by source).
+Our MaxText + TPU v6e-32 measurements are the closest available counterpart.
+
+### External reference
+
+| Scene | E2E Peak Throughput | Peak BS | TTFT / ITL (ms) |
+| :--- | :--- | :--- | :--- |
+| 4K Prefill | 8,163 input tok/s | — | 513 ms avg TTFT |
+| 4K / 1K Decode | 417 output tok/s | 32 | 22,602 / 31.20 |
+| 16K Prefill | 4,861 input tok/s | — | 3,406 ms avg TTFT |
+| 16K / 1K Decode | 94 output tok/s | 8 | 37,979 / 14.71 |
+
+### MaxText + TPU v6e-32 (measured, 2026-04-21)
+
+| Scene | E2E Peak Throughput | Peak BS | TTFT / ITL (ms) |
+| :--- | :--- | :--- | :--- |
+| **512-token Prefill** | **4,144 input tok/s** | 1 (single seq) | **123.6 ms avg TTFT** |
+| 4K Prefill | *Not measured* | — | — |
+| **Decode, BS=352** (`per_device_batch_size=11`) | **2,724 output tok/s** | **352** | — / **129.2 ms** |
+| **Decode, BS=32** (`per_device_batch_size=1`) | **577.5 output tok/s** | **32** | — / **55.4 ms** |
+| 16K Prefill | *Not measured* | — | — |
+| 16K / 1K Decode | *Not measured* | — | — |
+
+**Comparability notes:**
+- **Context length differs.** Our bench uses a fixed 512-token input context (`max_prefill_predict_length=512`,
+  `max_target_length=640`).  The external reference uses 4K / 16K inputs, which
+  raises prefill cost as O(n²) for attention and expands the KV cache, reducing
+  usable batch size and decode throughput.  Our 512-token prefill throughput
+  (4,144 tok/s) and decode numbers are therefore *not directly comparable* to the
+  4K / 16K rows above.
+- **Hardware differs.** Our results are on TPU v6e-32 (8 workers × 4 chips,
+  1,024 GB HBM total, 918 GB/s HBM bandwidth).  The external reference hardware
+  is unspecified.
+- **Decode throughput at BS=32:** MaxText/TPU achieves **577.5 tok/s** vs the
+  external reference **417 tok/s** — a **1.38× advantage** at matched batch size,
+  though our shorter context (512 vs 4,096 tokens) likely helps.
+- **Decode throughput at optimal batch:** MaxText/TPU achieves **2,724 tok/s** at
+  BS=352 — **6.5× the external reference at BS=32**.  The external reference has
+  not published results at higher batch sizes.
+- **ITL at BS=32:** MaxText/TPU **55.4 ms** vs external reference **31.20 ms**.
+  Our higher per-sequence latency reflects weight-bandwidth-bound decode on TPU;
+  the external reference likely runs on GPU with higher memory bandwidth per chip.
+- **Prefill gaps:** 4K and 16K prefill measurements are not yet run on MaxText/TPU.
+  These are the highest-priority missing data points for a complete comparison.
+
+---
+
 ## Setting 1 — MaxText on TPU
 
 **Guide:** [mimo_v2_flash_inference.md](mimo_v2_flash_inference.md)
