@@ -43,7 +43,7 @@ Our MaxText + TPU v6e-32 measurements are the closest available counterpart.
 | Scene | E2E Peak Throughput | Peak BS | TTFT / ITL (ms) |
 | :--- | :--- | :--- | :--- |
 | 4K Prefill | **2,847 input tok/s** | 1 | **1,439 ms avg TTFT** |
-| 4K / 1K Decode | **535 output tok/s** | 32 | — / **59.8** |
+| 4K / 1K Decode | **535 output tok/s** | 32 (max, BS=64 OOM) | — / **59.8** |
 | 16K Prefill | OOM (v6e-32, 31.25 GB/chip) | — | — |
 | 16K / 1K Decode | OOM (v6e-32, 31.25 GB/chip) | — | — |
 
@@ -53,19 +53,17 @@ Our MaxText + TPU v6e-32 measurements are the closest available counterpart.
   4K prefills concurrently, multiplying throughput linearly. The TTFT is higher (1,439 ms vs 513 ms)
   for the same reason — at BS=1 the compute is underutilised.
 - **4K / 1K Decode at BS=32:** MaxText/TPU achieves **535 tok/s** vs external **417 tok/s** —
-  a **1.28× advantage** at matched batch size. Note our ITL is higher (59.8 ms vs 31.20 ms):
-  we produce more total tokens per second despite higher per-step latency because our smaller
-  KV cache (4K + 1K vs the external 4K window) keeps attention compute lower.
+  a **1.28× advantage**. BS=32 (`per_device_batch_size=1`) is the **maximum possible batch** at
+  4K context on v6e-32: `per_device_batch_size=2` (BS=64) OOMs immediately because the 4K KV
+  cache leaves only ~54 MB free HBM per chip after weights (17.98 GB). Our higher ITL (59.8 ms
+  vs 31.20 ms) reflects weight-bandwidth-bound decode on TPU vs likely GPU in the external reference.
 - **16K context OOM:** Both `scan_layers=false` (XLA compilation OOM, `bf16[16384,2,1,192]`
   intermediates) and `scan_layers=true` (runtime OOM) fail on v6e-32 (17.98 GB weights +
   16K KV cache exceeds 31.25 GB/chip HBM). A hardware upgrade to Ironwood v7 (192 GB/chip)
   or weight quantisation (halving model footprint to ~9 GB/chip) would unlock 16K.
-- **Optimal batch:** MaxText/TPU achieves **2,724 tok/s** at BS=352 (`per_device_batch_size=11`)
-  with the 512-token context — see [opt5 results](mimo_v2_flash_opt5_batch_size_scaling.md).
-  The decode throughput for 4K context at higher batch has not been measured; OOM at BS>1 is
-  expected because the larger KV cache leaves less room for batch scaling.
-- **Hardware:** Our results are on TPU v6e-32 (8 workers × 4 chips, 31.25 GB/chip HBM).
-  The external reference hardware is unspecified.
+- **Optimal batch at 512-token context:** MaxText/TPU achieves **2,724 tok/s** at BS=352
+  (`per_device_batch_size=11`) — see [opt5 results](mimo_v2_flash_opt5_batch_size_scaling.md).
+  The shorter context leaves far more HBM for KV cache, enabling 11× more sequences in parallel.
 
 ---
 
