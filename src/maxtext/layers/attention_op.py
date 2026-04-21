@@ -960,9 +960,20 @@ class AttentionOp(nnx.Module):
           value = value.dequant()
 
         if model_mode == MODEL_MODE_AUTOREGRESSIVE:
-          raise ValueError(
-              """Decode not supported with flash attention.
-                              Use `dot_product` instead."""
+          # fallback to dot_product for decode: flash/splash attention only handles prefill
+          # on TPU (no KV-cache insertion path in the splash kernel). dot_product at decode
+          # time is fine because the sequence dimension is 1 (single new token).
+          return self.apply_attention_dot(
+              query,
+              key,
+              value,
+              decoder_segment_ids,
+              model_mode,
+              bidirectional_mask=bidirectional_mask,
+              record_max_logits=record_max_logits,
+              swa_next_pos=swa_next_pos,
+              qk_product_einsum=qk_product_einsum,
+              wv_product_einsum=wv_product_einsum,
           )
 
         out, max_logits = self.tpu_flash_attention(
