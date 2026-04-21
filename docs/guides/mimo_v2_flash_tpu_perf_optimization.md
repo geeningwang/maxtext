@@ -420,7 +420,7 @@ token check to avoid the per-step host roundtrip.
 
 | Rank | Method | Config / Code change | Expected impact | Result |
 |---|---|---|---|---|
-| 1 | **Batch size > 1 (throughput mode)** | `per_device_batch_size=2` or more | **Highest confidence** — at batch=32 the step is weight-bandwidth-bound; doubling batch doubles tokens/step with nearly the same weight reads → near-linear throughput scaling. Simple config change, orthogonal to all other opts. | Not run |
+| 1 | **Batch size > 1 (throughput mode)** | `per_device_batch_size=2` or more — see [opt5 plan](mimo_v2_flash_opt5_batch_size_scaling.md) | **Highest confidence** — at batch=32 the step is weight-bandwidth-bound; doubling batch doubles tokens/step with nearly the same weight reads → near-linear throughput scaling. Simple config change, orthogonal to all other opts. | Not run |
 | 2 | **Int8/FP8 weight quantisation** | `quantization=int8` (or FP8 via `quantization=fp8`) | **High** — directly halves the dominant cost (expert weight reads from HBM). The opt4 post-mortem identified weight reads as THE bottleneck for decode. Not the same as KV-int8 (rejected, opt #3); weight quant targets a different data path. Must test quality impact. | Not run |
 | 3 | **Speculative decoding** | Draft model (smaller MiMo or shared-expert-only subset) + verifier | **High** per-sequence latency reduction; higher implementation complexity. Orthogonal to batch-size scaling. | Not run |
 | 4 | **Remove per-step `effects_barrier` / async EOS** | Move EOS check on-device (`lax.cond`); remove sync at `decode.py` lines 245, 260 | **Medium** — host-sync removal in demo/production path. Simple, independent of all other opts. Does not affect benchmark numbers (bench already avoids sync). | Not run |
