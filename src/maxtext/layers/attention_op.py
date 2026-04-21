@@ -959,10 +959,14 @@ class AttentionOp(nnx.Module):
         if isinstance(value, KVTensor):
           value = value.dequant()
 
-        if model_mode == MODEL_MODE_AUTOREGRESSIVE:
-          # fallback to dot_product for decode: flash/splash attention only handles prefill
-          # on TPU (no KV-cache insertion path in the splash kernel). dot_product at decode
-          # time is fine because the sequence dimension is 1 (single new token).
+        if model_mode in (MODEL_MODE_AUTOREGRESSIVE, MODEL_MODE_TRAIN):
+          # fallback to dot_product for:
+          #   - decode (MODEL_MODE_AUTOREGRESSIVE): splash has no KV-cache insertion path;
+          #     dot_product is optimal because the sequence dimension is 1 (single new token).
+          #   - train (MODEL_MODE_TRAIN): splash kernel is not needed for training in inference
+          #     code, and the training-mode init call (get_abstract_state) uses the full
+          #     max_target_length sequence which can produce degenerate mask shapes with
+          #     EP_AS_CONTEXT (causing assert current_block_mask.size > 0 to fail).
           return self.apply_attention_dot(
               query,
               key,
