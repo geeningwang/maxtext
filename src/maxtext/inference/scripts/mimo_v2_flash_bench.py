@@ -41,6 +41,7 @@ Run on all TPU workers simultaneously:
 """
 
 import json
+import os
 import socket
 import time
 from typing import Sequence
@@ -107,37 +108,44 @@ def main(argv: Sequence[str]) -> None:
     load_s = time.perf_counter() - t0
     print(f"[BENCH] load_params: {load_s:.1f}s", flush=True)
 
+    # Set BENCH_PREFILL_ONLY=1 to skip decode state init (needed when the KV
+    # cache for a long context would OOM, but prefill throughput is still wanted).
+    prefill_only = os.environ.get("BENCH_PREFILL_ONLY", "0") == "1"
+
     # ====================================================================
     # Phase 1: AR Decode benchmark
     # ====================================================================
-    rng, rng_init = jax.random.split(rng)
-    decode_state = engine.init_decode_state(rng_init)
-    jax.block_until_ready(decode_state)
-    print("[BENCH] decode_state initialised", flush=True)
+    if not prefill_only:
+        rng, rng_init = jax.random.split(rng)
+        decode_state = engine.init_decode_state(rng_init)
+        jax.block_until_ready(decode_state)
+        print("[BENCH] decode_state initialised", flush=True)
 
-    # Warmup
-    print(f"[BENCH] decode warmup ({_WARMUP_STEPS} steps) ...", flush=True)
-    for _ in range(_WARMUP_STEPS):
-        rng, rng_gen = jax.random.split(rng)
-        decode_state, _ = engine.generate(params, decode_state, rng=rng_gen)
-    jax.block_until_ready(decode_state)
-    print("[BENCH] decode warmup done", flush=True)
+        # Warmup
+        print(f"[BENCH] decode warmup ({_WARMUP_STEPS} steps) ...", flush=True)
+        for _ in range(_WARMUP_STEPS):
+            rng, rng_gen = jax.random.split(rng)
+            decode_state, _ = engine.generate(params, decode_state, rng=rng_gen)
+        jax.block_until_ready(decode_state)
+        print("[BENCH] decode warmup done", flush=True)
 
-    # Timed
-    step_times_ms = []
-    print(f"[BENCH] timing {_TIMED_STEPS} decode steps ...", flush=True)
-    for _ in range(_TIMED_STEPS):
-        rng, rng_gen = jax.random.split(rng)
-        t_step = time.perf_counter()
-        decode_state, sampled_tokens = engine.generate(params, decode_state, rng=rng_gen)
-        jax.block_until_ready(sampled_tokens)
-        step_times_ms.append((time.perf_counter() - t_step) * 1000)
+        # Timed
+        step_times_ms = []
+        print(f"[BENCH] timing {_TIMED_STEPS} decode steps ...", flush=True)
+        for _ in range(_TIMED_STEPS):
+            rng, rng_gen = jax.random.split(rng)
+            t_step = time.perf_counter()
+            decode_state, sampled_tokens = engine.generate(params, decode_state, rng=rng_gen)
+            jax.block_until_ready(sampled_tokens)
+            step_times_ms.append((time.perf_counter() - t_step) * 1000)
 
-    batch_size = int(config.per_device_batch_size * num_devices)
-    all_results["decode"] = _report(
-        "AR Decode", step_times_ms, batch_tokens=batch_size,
-        host=host, num_devices=num_devices,
-    )
+        batch_size = int(config.per_device_batch_size * num_devices)
+        all_results["decode"] = _report(
+            "AR Decode", step_times_ms, batch_tokens=batch_size,
+            host=host, num_devices=num_devices,
+        )
+    else:
+        print("[BENCH] skipping decode benchmark (BENCH_PREFILL_ONLY=1)", flush=True)
 
     # ====================================================================
     # Phase 2: Prefill benchmark
