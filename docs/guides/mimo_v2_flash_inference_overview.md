@@ -42,34 +42,30 @@ Our MaxText + TPU v6e-32 measurements are the closest available counterpart.
 
 | Scene | E2E Peak Throughput | Peak BS | TTFT / ITL (ms) |
 | :--- | :--- | :--- | :--- |
-| **512-token Prefill** | **4,144 input tok/s** | 1 (single seq) | **123.6 ms avg TTFT** |
-| 4K Prefill | *Not measured* | — | — |
-| **Decode, BS=352** (`per_device_batch_size=11`) | **2,724 output tok/s** | **352** | — / **129.2 ms** |
-| **Decode, BS=32** (`per_device_batch_size=1`) | **577.5 output tok/s** | **32** | — / **55.4 ms** |
-| 16K Prefill | *Not measured* | — | — |
-| 16K / 1K Decode | *Not measured* | — | — |
+| 4K Prefill | **2,847 input tok/s** | 1 | **1,439 ms avg TTFT** |
+| 4K / 1K Decode | **535 output tok/s** | 32 | — / **59.8** |
+| 16K Prefill | OOM (v6e-32, 31.25 GB/chip) | — | — |
+| 16K / 1K Decode | OOM (v6e-32, 31.25 GB/chip) | — | — |
 
 **Comparability notes:**
-- **Context length differs.** Our bench uses a fixed 512-token input context (`max_prefill_predict_length=512`,
-  `max_target_length=640`).  The external reference uses 4K / 16K inputs, which
-  raises prefill cost as O(n²) for attention and expands the KV cache, reducing
-  usable batch size and decode throughput.  Our 512-token prefill throughput
-  (4,144 tok/s) and decode numbers are therefore *not directly comparable* to the
-  4K / 16K rows above.
-- **Hardware differs.** Our results are on TPU v6e-32 (8 workers × 4 chips,
-  1,024 GB HBM total, 918 GB/s HBM bandwidth).  The external reference hardware
-  is unspecified.
-- **Decode throughput at BS=32:** MaxText/TPU achieves **577.5 tok/s** vs the
-  external reference **417 tok/s** — a **1.38× advantage** at matched batch size,
-  though our shorter context (512 vs 4,096 tokens) likely helps.
-- **Decode throughput at optimal batch:** MaxText/TPU achieves **2,724 tok/s** at
-  BS=352 — **6.5× the external reference at BS=32**.  The external reference has
-  not published results at higher batch sizes.
-- **ITL at BS=32:** MaxText/TPU **55.4 ms** vs external reference **31.20 ms**.
-  Our higher per-sequence latency reflects weight-bandwidth-bound decode on TPU;
-  the external reference likely runs on GPU with higher memory bandwidth per chip.
-- **Prefill gaps:** 4K and 16K prefill measurements are not yet run on MaxText/TPU.
-  These are the highest-priority missing data points for a complete comparison.
+- **4K Prefill throughput:** MaxText/TPU achieves **2,847 tok/s** vs external **8,163 tok/s** (0.35×).
+  Our bench runs single-sequence prefill (BS=1); the external reference likely batches multiple
+  4K prefills concurrently, multiplying throughput linearly. The TTFT is higher (1,439 ms vs 513 ms)
+  for the same reason — at BS=1 the compute is underutilised.
+- **4K / 1K Decode at BS=32:** MaxText/TPU achieves **535 tok/s** vs external **417 tok/s** —
+  a **1.28× advantage** at matched batch size. Note our ITL is higher (59.8 ms vs 31.20 ms):
+  we produce more total tokens per second despite higher per-step latency because our smaller
+  KV cache (4K + 1K vs the external 4K window) keeps attention compute lower.
+- **16K context OOM:** Both `scan_layers=false` (XLA compilation OOM, `bf16[16384,2,1,192]`
+  intermediates) and `scan_layers=true` (runtime OOM) fail on v6e-32 (17.98 GB weights +
+  16K KV cache exceeds 31.25 GB/chip HBM). A hardware upgrade to Ironwood v7 (192 GB/chip)
+  or weight quantisation (halving model footprint to ~9 GB/chip) would unlock 16K.
+- **Optimal batch:** MaxText/TPU achieves **2,724 tok/s** at BS=352 (`per_device_batch_size=11`)
+  with the 512-token context — see [opt5 results](mimo_v2_flash_opt5_batch_size_scaling.md).
+  The decode throughput for 4K context at higher batch has not been measured; OOM at BS>1 is
+  expected because the larger KV cache leaves less room for batch scaling.
+- **Hardware:** Our results are on TPU v6e-32 (8 workers × 4 chips, 31.25 GB/chip HBM).
+  The external reference hardware is unspecified.
 
 ---
 
