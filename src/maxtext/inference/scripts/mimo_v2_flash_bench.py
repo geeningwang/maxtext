@@ -110,7 +110,11 @@ def main(argv: Sequence[str]) -> None:
 
     # Set BENCH_PREFILL_ONLY=1 to skip decode state init (needed when the KV
     # cache for a long context would OOM, but prefill throughput is still wanted).
+    # Set BENCH_DECODE_ONLY=1 to skip the prefill benchmark (needed when the
+    # prefill XLA intermediates at a large context × large batch would OOM, but
+    # the decode state itself fits — e.g. 4K context at pdb=9 with SWA KV opt).
     prefill_only = os.environ.get("BENCH_PREFILL_ONLY", "0") == "1"
+    decode_only = os.environ.get("BENCH_DECODE_ONLY", "0") == "1"
 
     # ====================================================================
     # Phase 1: AR Decode benchmark
@@ -151,7 +155,9 @@ def main(argv: Sequence[str]) -> None:
     # Phase 2: Prefill benchmark
     # ====================================================================
     prefill_len = int(config.max_prefill_predict_length)
-    if prefill_len > 0:
+    if decode_only:
+        print("[BENCH] skipping prefill benchmark (BENCH_DECODE_ONLY=1)", flush=True)
+    elif prefill_len > 0:
         print(f"\n[BENCH] prefill benchmark (seq_len={prefill_len}) ...", flush=True)
         # Synthetic prompt: fill with token ID 1 (typically <s> or pad)
         padded_tokens = jnp.ones((prefill_len,), dtype=jnp.int32)
