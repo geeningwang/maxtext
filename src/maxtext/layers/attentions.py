@@ -952,6 +952,9 @@ class Attention(nnx.Module):
         ar_cache_axis_order=self.ar_cache_axis_order,
         use_chunked_prefill=self.config.use_chunked_prefill,
         model_mode=self.model_mode,
+        swa_window_size=self.sliding_window_size if (
+            self.attention_type == AttentionType.LOCAL_SLIDING and self.sliding_window_size
+        ) else 0,
         rngs=self.rngs,
     )
 

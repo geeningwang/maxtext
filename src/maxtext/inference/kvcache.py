@@ -265,6 +265,7 @@ class KVCache(BaseCache):
       key_axis_order: AxisIdxes = (2, 0, 1, 3),
       use_chunked_prefill: bool = False,
       model_mode: str = MODEL_MODE_PREFILL,
+      swa_window_size: int = 0,
       *,
       # Not used in KVCache but passed in by nnx_wrappers.to_linen.
       # TODO: Remove when bridge no longer needed
@@ -292,6 +293,12 @@ class KVCache(BaseCache):
       key_axis_order: The axis order for the key.
       model_mode: The model mode.
       use_chunked_prefill: Whether to use chunked prefill.
+      swa_window_size: When > 0, enables the sliding-window KV-cache optimisation for
+        LOCAL_SLIDING (SWA) attention layers.  Both the prefill and AR KV caches are
+        capped at this many slots instead of max_prefill_length / (max_target_length -
+        max_prefill_length).  During prefill only the last swa_window_size tokens are
+        stored; during AR decode the cache is a ring buffer of swa_window_size slots.
+        This saves large amounts of HBM when max_prefill_length >> swa_window_size.
       rngs: The random number generators for initialization.
     """
     super().__init__()
@@ -314,6 +321,10 @@ class KVCache(BaseCache):
     self.key_axis_order = key_axis_order
     self.model_mode = model_mode
     self.use_chunked_prefill = use_chunked_prefill
+    self.swa_window_size = swa_window_size
+    # Effective cache slot counts (may be smaller than max_prefill/max_target for SWA).
+    self._prefill_cache_len = min(max_prefill_length, swa_window_size) if swa_window_size > 0 else max_prefill_length
+    self._ar_cache_len = swa_window_size if swa_window_size > 0 else (max_target_length - max_prefill_length)
 
     if model_mode in (MODEL_MODE_PREFILL, MODEL_MODE_AUTOREGRESSIVE):
       self._initialize_prefill_caches(model_mode)
@@ -349,7 +360,7 @@ class KVCache(BaseCache):
   def _initialize_prefill_caches(self, model_mode):
     """Get a shaped abstraction of the state"""
 
-    cache_length = self.max_prefill_length
+    cache_length = self._prefill_cache_len
     dtype = self._get_cached_kv_dtype()
 
     if model_mode == MODEL_MODE_PREFILL:
@@ -416,7 +427,7 @@ class KVCache(BaseCache):
           f"max_target_length: {self.max_target_length} should be greater than max_prefill_length:"
           f" {self.max_prefill_length}!"
       )
-    cache_length = self.max_target_length - self.max_prefill_length
+    cache_length = self._ar_cache_len
 
     if model_mode == MODEL_MODE_PREFILL:
       cache_logical_axis_names = self.prefill_cache_logical_axis_names
@@ -609,8 +620,20 @@ class KVCache(BaseCache):
 
     cached_prefill_key_vars, cached_prefill_value_vars, cached_prefill_segment_id_var = self._get_prefill_cache_vars()
 
-    key_shaped_for_cache = jnp.transpose(key, self.prefill_cache_axis_order)
-    value_shaped_for_cache = jnp.transpose(value, self.prefill_cache_axis_order)
+    # SWA optimisation: only store the last swa_window_size tokens so the prefill
+    # KV cache is bounded by the sliding-window size rather than max_prefill_length.
+    # The full key/value tensors are still returned for the prefill attention pass.
+    if self.swa_window_size > 0 and key.shape[1] > self.swa_window_size:
+      key_to_cache = key[:, -self.swa_window_size :, :, :]
+      value_to_cache = value[:, -self.swa_window_size :, :, :]
+      seg_ids_to_cache = decoder_segment_ids[:, -self.swa_window_size :] if decoder_segment_ids is not None else None
+    else:
+      key_to_cache = key
+      value_to_cache = value
+      seg_ids_to_cache = decoder_segment_ids
+
+    key_shaped_for_cache = jnp.transpose(key_to_cache, self.prefill_cache_axis_order)
+    value_shaped_for_cache = jnp.transpose(value_to_cache, self.prefill_cache_axis_order)
 
     if self.kv_quant:
       prefill_key_axis_names = transpose_tuple(self.cache_logical_axis_names, self.prefill_cache_axis_order)
@@ -626,8 +649,8 @@ class KVCache(BaseCache):
     cached_prefill_key_vars[0].value = key_shaped_for_cache
     cached_prefill_value_vars[0].value = value_shaped_for_cache
 
-    if decoder_segment_ids is not None:
-      cached_prefill_segment_id_var.value = decoder_segment_ids
+    if seg_ids_to_cache is not None:
+      cached_prefill_segment_id_var.value = seg_ids_to_cache
     return key, value, decoder_segment_ids
 
   def update_ar_key_value(
@@ -793,7 +816,7 @@ class KVCache(BaseCache):
     cached_ar_segment_id_var.value = jax.lax.dynamic_update_index_in_dim(
         cached_ar_segment_id_var.value, active_indicator, jnp.squeeze(cache_ar_index_var.value), 1
     )
-    cache_ar_index_var.value = jnp.mod(cache_ar_index_var.value + 1, self.max_target_length - self.max_prefill_length)
+    cache_ar_index_var.value = jnp.mod(cache_ar_index_var.value + 1, self._ar_cache_len)
     cache_ar_lengths_var.value = cache_ar_lengths_var.value.at[:].add(1)
 
     cached_prefill_key_vars, cached_prefill_value_vars, cached_prefill_segment_id_var = self._get_prefill_cache_vars()
