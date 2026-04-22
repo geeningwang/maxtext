@@ -180,8 +180,9 @@ python demos/mimo_v2_flash_demo_jax.py \
 ```
 
 Expected result: the model loads, runs prefill and generate, and exits with code 0 on all
-workers. The generated text may be garbled or off-topic — this is a known limitation (see
-Section 10 troubleshooting). The key check is that no crash or OOM occurs.
+workers. EOS fires cleanly (no `WARNING: EOS never fired` message). The output is a
+step-by-step solution to the math problem, ending with "The total distance traveled is
+420 km." Throughput is approximately 2.3 tok/s.
 
 ## 5. Run The Dedicated TPU Performance Benchmark
 
@@ -189,37 +190,7 @@ The dedicated benchmark script runs 3 warmup steps followed by 50 timed
 `engine.generate()` steps and writes a JSON result file to the path given in
 `inference_microbenchmark_log_file_path`.
 
-### 5a. `scan_layers=false` benchmark (dense dispatch baseline)
-
-Run this on `jingnw-tpu-op`:
-
-```bash
-gcloud compute tpus tpu-vm ssh "$TPU_NAME" --zone "$ZONE" --worker=all \
-  --command='set -e
-. "$HOME/maxtext/maxtext_tpu_venv/bin/activate"
-cd "$HOME/maxtext"
-export PYTHONUNBUFFERED=1
-python3 -m maxtext.inference.scripts.mimo_v2_flash_bench \
-  src/maxtext/configs/base.yml \
-  model_name=mimo-v2-flash \
-  run_name=mimo_v2_flash_bench \
-  load_parameters_path='"$BENCH_CKPT"' \
-  tokenizer_path='"$TOKENIZER"' \
-  max_prefill_predict_length=512 \
-  max_target_length=640 \
-  per_device_batch_size=1 \
-  dtype=bfloat16 \
-  weight_dtype=bfloat16 \
-  ici_tensor_parallelism=4 \
-  ici_expert_parallelism=8 \
-  scan_layers=false \
-  attention=dot_product \
-  checkpoint_storage_use_ocdbt=true \
-  checkpoint_storage_use_zarr3=true \
-  inference_microbenchmark_log_file_path=/tmp/bench_pdb1.json'
-```
-
-### 5b. 4K context benchmark — dot_product attention (`per_device_batch_size=11`)
+### 5a. 4K context benchmark — dot_product attention (`per_device_batch_size=11`)
 
 Current best 4K decode configuration. `per_device_batch_size=11` (total batch = 352)
 achieves **2,809 tok/s** at 125.3 ms/step — a 4.84× improvement over the `pdb=1` baseline.
@@ -253,9 +224,9 @@ python3 -m maxtext.inference.scripts.mimo_v2_flash_bench \
   inference_microbenchmark_log_file_path=/tmp/bench_pdb11.json'
 ```
 
-Expected: decode median ~125.3 ms · **2,809 tok/s** (batch=352). Result file: `/tmp/bench_pdb11.json`.
+Expected: decode median ~125.3 ms · **2,809 tok/s** (batch=352); prefill median ~123.9 ms · **4,134 tok/s** (512 tok). Result file: `/tmp/bench_pdb11.json`.
 
-### 5c. 16K context benchmark — flash attention (`per_device_batch_size=2`)
+### 5b. 16K context benchmark — flash attention (`per_device_batch_size=2`)
 
 `attention=dot_product` OOMs at 16K prefill — the score matrix
 `[4, 16, 16384, 16384]×2B ≈ 34 GB/chip` exceeds 31.25 GB HBM.
@@ -341,21 +312,14 @@ gcloud compute tpus tpu-vm ssh "$TPU_NAME" --zone "$ZONE" --worker=all \
 After the run completes (all workers print `BENCH_EXIT=0`), read the JSON
 result from each worker.
 
-**5a** (`/tmp/bench_pdb1.json`):
-
-```bash
-gcloud compute tpus tpu-vm ssh "$TPU_NAME" --zone "$ZONE" --worker=all \
-  --command='cat /tmp/bench_pdb1.json 2>/dev/null || echo "no result yet"'
-```
-
-**5b** (`/tmp/bench_pdb11.json`):
+**5a** (`/tmp/bench_pdb11.json`):
 
 ```bash
 gcloud compute tpus tpu-vm ssh "$TPU_NAME" --zone "$ZONE" --worker=all \
   --command='cat /tmp/bench_pdb11.json 2>/dev/null || echo "no result yet"'
 ```
 
-**5c** (`/tmp/bench_16k.json`):
+**5b** (`/tmp/bench_16k.json`):
 
 ```bash
 gcloud compute tpus tpu-vm ssh "$TPU_NAME" --zone "$ZONE" --worker=all \
@@ -449,11 +413,11 @@ checkpoint: `mimo-v2-flash-fixed-ocdbt`
 - AR Decode: median `55.2 ms`, throughput `579.8 tok/s` (batch=32)
 - Prefill (512 tok): median `123.8 ms`, throughput `4,136 tok/s`
 
-**5c — `scan_layers=false`, `attention=dot_product`, pdb=11:**
+**5a — `scan_layers=false`, `attention=dot_product`, pdb=11:**
 - AR Decode: median `125.3 ms`, throughput `2,809 tok/s` (batch=352)
 - Prefill (512 tok): median `123.9 ms`, throughput `4,131 tok/s`
 
-**5d — `scan_layers=false`, `attention=flash`, pdb=2, 16K context:**
+**5b — `scan_layers=false`, `attention=flash`, pdb=2, 16K context:**
 - AR Decode: median `61.1 ms`, throughput `1,047 tok/s` (batch=64)
 - Prefill (16K tok): median `3,496.8 ms` TTFT, throughput `4,685 tok/s`
 
