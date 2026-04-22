@@ -278,11 +278,19 @@ python3 -m maxtext.inference.scripts.mimo_v2_flash_bench \
 
 Expected: decode median ~129.2 ms · **2,724 tok/s** (batch=352). Result file: `/tmp/bench_pdb11.json`.
 
-### 5d. 16K prefill benchmark (flash/splash attention)
+### 5d. 16K combined benchmark (flash prefill + decode, `per_device_batch_size=3`)
 
-`attention=dot_product` OOMs at 16K — the score matrix
+`attention=dot_product` OOMs at 16K prefill — the score matrix
 `[4, 16, 16384, 16384]×2B ≈ 34 GB/chip` exceeds 31.25 GB HBM.
 Flash attention tiles computation in VMEM; score matrix never materialises in HBM.
+AR decode automatically falls back to `dot_product` (attends over 1 new token only;
+no NxN score matrix). Both phases run in one job.
+
+`per_device_batch_size=3` (BS=96) is the decode HBM limit — `pdb=4` needs ~457 MB/chip
+for global-attention KV but only ~373 MB is free. SWA KV opt: only the 9 global attention
+layers need full 16K KV slots; the 39 SWA layers remain capped at 128 KV slots.
+Prefill always processes 1 sequence regardless of `pdb`, so `pdb=3` gives identical
+prefill throughput to `pdb=1`.
 
 > **`max_target_length=17408` is required** (not 16384). Must be strictly greater than
 > `max_prefill_predict_length` and divisible by `EP × sa_block_q = 8 × 128 = 1024`.
@@ -296,16 +304,15 @@ gcloud compute tpus tpu-vm ssh "$TPU_NAME" --zone "$ZONE" --worker=all \
 . "$HOME/maxtext/maxtext_tpu_venv/bin/activate"
 cd "$HOME/maxtext"
 export PYTHONUNBUFFERED=1
-export BENCH_PREFILL_ONLY=1
 python3 -m maxtext.inference.scripts.mimo_v2_flash_bench \
   src/maxtext/configs/base.yml \
   model_name=mimo-v2-flash \
-  run_name=mimo_v2_flash_bench_16k_prefill \
+  run_name=mimo_v2_flash_bench_16k \
   load_parameters_path='"$BENCH_CKPT"' \
   tokenizer_path='"$TOKENIZER"' \
   max_prefill_predict_length=16384 \
   max_target_length=17408 \
-  per_device_batch_size=1 \
+  per_device_batch_size=3 \
   dtype=bfloat16 \
   weight_dtype=bfloat16 \
   ici_tensor_parallelism=4 \
@@ -318,61 +325,28 @@ python3 -m maxtext.inference.scripts.mimo_v2_flash_bench \
   sa_block_kv_compute=128 \
   checkpoint_storage_use_ocdbt=true \
   checkpoint_storage_use_zarr3=true \
-  inference_microbenchmark_log_file_path=/tmp/bench_16k_prefill.json'
+  inference_microbenchmark_log_file_path=/tmp/bench_16k.json'
 ```
 
-Expected: prefill median ~3,497 ms TTFT · **4,686 tok/s**. Result file: `/tmp/bench_16k_prefill.json`.
-
-### 5e. 16K decode benchmark (`per_device_batch_size=3`)
-
-AR decode at 16K context. SWA KV opt: only the 9 global attention layers need full 16K KV
-slots; the 39 SWA layers are still capped at 128 KV slots. `per_device_batch_size=3` (BS=96)
-is the maximum — `pdb=4` needs ~457 MB/chip for global KV but only ~373 MB is free.
-AR decode does not need flash attention (attends over 1 new token only; no NxN score matrix).
-
-Run this on `jingnw-tpu-op`:
-
-```bash
-gcloud compute tpus tpu-vm ssh "$TPU_NAME" --zone "$ZONE" --worker=all \
-  --command='set -e
-. "$HOME/maxtext/maxtext_tpu_venv/bin/activate"
-cd "$HOME/maxtext"
-export PYTHONUNBUFFERED=1
-export BENCH_DECODE_ONLY=1
-python3 -m maxtext.inference.scripts.mimo_v2_flash_bench \
-  src/maxtext/configs/base.yml \
-  model_name=mimo-v2-flash \
-  run_name=mimo_v2_flash_bench_16k_decode \
-  load_parameters_path='"$BENCH_CKPT"' \
-  tokenizer_path='"$TOKENIZER"' \
-  max_prefill_predict_length=16384 \
-  max_target_length=17408 \
-  per_device_batch_size=3 \
-  dtype=bfloat16 \
-  weight_dtype=bfloat16 \
-  ici_tensor_parallelism=4 \
-  ici_expert_parallelism=8 \
-  scan_layers=false \
-  attention=dot_product \
-  checkpoint_storage_use_ocdbt=true \
-  checkpoint_storage_use_zarr3=true \
-  inference_microbenchmark_log_file_path=/tmp/bench_16k_decode.json'
-```
-
-Expected: decode median ~71.3 ms · **1,347 tok/s** (batch=96). Result file: `/tmp/bench_16k_decode.json`.
+Expected: decode median ~71.3 ms · **1,347 tok/s** (batch=96); prefill median ~3,497 ms TTFT · **4,686 tok/s**.
+Result file: `/tmp/bench_16k.json` (contains both `decode` and `prefill` keys).
 
 Expected progress markers printed to stdout as the job runs:
 
 ```
 [BENCH] load_params: <N>s
 [BENCH] decode_state initialised
-[BENCH] warmup (3 steps) ...
-[BENCH] warmup done
-[BENCH] timing 50 steps ...
+[BENCH] decode warmup (3 steps) ...
+[BENCH] decode warmup done
+[BENCH] timing 50 decode steps ...
+[BENCH] prefill benchmark (seq_len=16384) ...
+[BENCH] prefill warmup (3 calls) ...
+[BENCH] prefill warmup done
+[BENCH] timing 20 prefill calls ...
 ```
 
-The timed-steps loop takes several minutes. Output from all 8 workers appears
-interleaved.
+The decode phase takes several minutes; the prefill phase adds ~70 s (20 × 3.5 s).
+Output from all 8 workers appears interleaved.
 
 ## 6. Poll The Benchmark
 
