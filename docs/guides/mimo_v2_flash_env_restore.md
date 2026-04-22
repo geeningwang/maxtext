@@ -178,8 +178,8 @@ Expected result: the model prints a response for the default arithmetic prompt.
 ## 5. Run The Dedicated TPU Performance Benchmark
 
 The dedicated benchmark script runs 3 warmup steps followed by 50 timed
-`engine.generate()` steps and writes a JSON result file to
-`/tmp/bench_result.json` on each worker.
+`engine.generate()` steps and writes a JSON result file to the path given in
+`inference_microbenchmark_log_file_path`.
 
 ### 5a. `scan_layers=false` benchmark (dense dispatch baseline)
 
@@ -278,7 +278,7 @@ python3 -m maxtext.inference.scripts.mimo_v2_flash_bench \
 
 Expected: decode median ~129.2 ms · **2,724 tok/s** (batch=352). Result file: `/tmp/bench_pdb11.json`.
 
-### 5d. 16K context benchmark — flash attention (`per_device_batch_size=3`)
+### 5d. 16K context benchmark — flash attention (`per_device_batch_size=2`)
 
 `attention=dot_product` OOMs at 16K prefill — the score matrix
 `[4, 16, 16384, 16384]×2B ≈ 34 GB/chip` exceeds 31.25 GB HBM.
@@ -286,11 +286,12 @@ Flash attention tiles computation in VMEM; score matrix never materialises in HB
 AR decode automatically falls back to `dot_product` (attends over 1 new token only;
 no NxN score matrix). Both phases run in one job.
 
-`per_device_batch_size=3` (BS=96) is the decode HBM limit — `pdb=4` needs ~457 MB/chip
-for global-attention KV but only ~373 MB is free. SWA KV opt: only the 9 global attention
-layers need full 16K KV slots; the 39 SWA layers remain capped at 128 KV slots.
-Prefill always processes 1 sequence regardless of `pdb`, so `pdb=3` gives identical
-prefill throughput to `pdb=1`.
+`per_device_batch_size=2` (BS=64) is the combined-benchmark HBM limit — after
+`init_decode_state` uses 17.98 GB, `pdb=3` leaves only 2.83 GB free and the flash
+prefill XLA binary needs 6.13 GB (`RESOURCE_EXHAUSTED`). SWA KV opt: only the 9
+global attention layers need full 16K KV slots; the 39 SWA layers remain capped at
+128 KV slots. Prefill always processes 1 sequence regardless of `pdb`, so `pdb=2`
+gives identical prefill throughput to `pdb=1`.
 
 > **`max_target_length=17408` is required** (not 16384). Must be strictly greater than
 > `max_prefill_predict_length` and divisible by `EP × sa_block_q = 8 × 128 = 1024`.
@@ -312,7 +313,7 @@ python3 -m maxtext.inference.scripts.mimo_v2_flash_bench \
   tokenizer_path='"$TOKENIZER"' \
   max_prefill_predict_length=16384 \
   max_target_length=17408 \
-  per_device_batch_size=3 \
+  per_device_batch_size=2 \
   dtype=bfloat16 \
   weight_dtype=bfloat16 \
   ici_tensor_parallelism=4 \
@@ -328,7 +329,7 @@ python3 -m maxtext.inference.scripts.mimo_v2_flash_bench \
   inference_microbenchmark_log_file_path=/tmp/bench_16k.json'
 ```
 
-Expected: decode median ~71.3 ms · **1,347 tok/s** (batch=96); prefill median ~3,497 ms TTFT · **4,686 tok/s**.
+Expected: decode median ~61.3 ms · **1,044 tok/s** (batch=64); prefill median ~3,497 ms TTFT · **4,686 tok/s**.
 Result file: `/tmp/bench_16k.json` (contains both `decode` and `prefill` keys).
 
 Expected progress markers printed to stdout as the job runs:
@@ -365,7 +366,7 @@ result from each worker:
 
 ```bash
 gcloud compute tpus tpu-vm ssh "$TPU_NAME" --zone "$ZONE" --worker=all \
-  --command='cat /tmp/bench_result.json 2>/dev/null || echo "no result yet"'
+  --command='cat /tmp/bench_16k.json 2>/dev/null || echo "no result yet"'
 ```
 
 Key fields in the JSON output:
@@ -502,16 +503,16 @@ see perf doc opt #12 for full details.
 - step latency (median): about `3,497 ms` TTFT
 - total throughput: about `4,686 tok/s`
 
-### 2026-04-22 — 16K decode (`per_device_batch_size=3`)
+### 2026-04-22 — 16K decode (`per_device_batch_size=2`)
 
 Commit `ebfcd749`. SWA KV opt: only 9 global attention layers need full 16K KV;
-39 SWA layers remain capped at 128 KV slots.
+39 SWA layers remain capped at 128 KV slots. `pdb=3` OOMs (flash prefill XLA
+binary needs 6.13 GB; after `init_decode_state` only 2.83 GB free).
 
-**AR Decode (16K context, pdb=3, batch=96):**
-- HBM: global KV ~343 MB/chip (fits; pdb=4 needs ~457 MB, OOMs)
-- step latency (median): about `71.3 ms`
-- total throughput: about `1,347 tok/s`
-- per-sequence latency: about `0.74 ms/tok/seq`
+**AR Decode (16K context, pdb=2, batch=64):**
+- step latency (median): about `61.3 ms`
+- total throughput: about `1,044 tok/s`
+- per-sequence latency: about `0.96 ms/tok/seq`
 
 ### Summary of all validated baselines (as of 2026-04-22, commit `ebfcd749`)
 
@@ -520,7 +521,7 @@ Commit `ebfcd749`. SWA KV opt: only 9 global attention layers need full 16K KV;
 | `scan_layers=false`, `attention=dot_product` | 512 tok | 1 (32) | 55.4 ms | 577.5 tok/s | 4,144 tok/s |
 | `scan_layers=true`, `attention=dot_product` | 512 tok | 1 (32) | 68.4 ms | 468 tok/s | 4,200 tok/s |
 | **`scan_layers=false`, `attention=dot_product`** | **512 tok** | **11 (352)** | **129.2 ms** | **2,724 tok/s** | same as above |
-| `scan_layers=false`, `attention=dot_product` | 16K tok | 3 (96) | 71.3 ms | 1,347 tok/s | 4,686 tok/s (`attention=flash`) |
+| `scan_layers=false`, `attention=dot_product` | 16K tok | 2 (64) | 61.3 ms | 1,044 tok/s | 4,686 tok/s (`attention=flash`) |
 
 ### Prior Reference Result For Commit 5ad76eac (regression baseline)
 
@@ -595,10 +596,11 @@ The benchmark module always prints `[BENCH]` markers and does not accept a
 
 ### The demo script (`mimo_v2_flash_demo_jax.py`) produces garbled or repetitive output
 
-This is a known limitation on current HEAD. The demo uses greedy decoding with
-no EOS stopping condition, so the model degenerates into repetitive tokens once
-it passes the natural end of its answer. Example: the response starts correctly
-then repeats phrases like `train train first covering traveling...` indefinitely.
+This is a known limitation on current HEAD. The demo uses nucleus sampling
+(top_p=0.95, temperature=0.6) with no EOS stopping condition, so the model
+degenerates into repetitive tokens once it passes the natural end of its answer.
+Example: the response starts correctly then repeats phrases like
+`取得以及 Ağust取得以及...` indefinitely.
 
 This does **not** affect benchmark measurements — the benchmark script
 (`mimo_v2_flash_bench`) measures `engine.generate()` step latency, not output
