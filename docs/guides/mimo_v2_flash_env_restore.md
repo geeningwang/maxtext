@@ -173,7 +173,9 @@ python demos/mimo_v2_flash_demo_jax.py \
   --ici_expert_parallelism 8'
 ```
 
-Expected result: the model prints a response for the default arithmetic prompt.
+Expected result: the model loads, runs prefill and generate, and exits with code 0 on all
+workers. The generated text may be garbled or off-topic — this is a known limitation (see
+Section 10 troubleshooting). The key check is that no crash or OOM occurs.
 
 ## 5. Run The Dedicated TPU Performance Benchmark
 
@@ -276,7 +278,7 @@ python3 -m maxtext.inference.scripts.mimo_v2_flash_bench \
   inference_microbenchmark_log_file_path=/tmp/bench_pdb11.json'
 ```
 
-Expected: decode median ~129.2 ms · **2,724 tok/s** (batch=352). Result file: `/tmp/bench_pdb11.json`.
+Expected: decode median ~125.3 ms · **2,809 tok/s** (batch=352). Result file: `/tmp/bench_pdb11.json`.
 
 ### 5d. 16K context benchmark — flash attention (`per_device_batch_size=2`)
 
@@ -493,6 +495,22 @@ Commit `711f591f`. Sweep `pdb=1→11`; OOM at `pdb=12`.
 - step latency (median): about `123.6 ms`
 - total throughput: about `4,144 tok/s`
 
+### 2026-04-22 — Full suite re-run on commit `1961e3ee` (doc-only change, warm cache)
+
+checkpoint: `mimo-v2-flash-fixed-ocdbt`
+
+**5a — `scan_layers=false`, `attention=dot_product`, pdb=1:**
+- AR Decode: median `55.2 ms`, throughput `579.8 tok/s` (batch=32)
+- Prefill (512 tok): median `123.8 ms`, throughput `4,136 tok/s`
+
+**5c — `scan_layers=false`, `attention=dot_product`, pdb=11:**
+- AR Decode: median `125.3 ms`, throughput `2,809 tok/s` (batch=352)
+- Prefill (512 tok): median `123.9 ms`, throughput `4,131 tok/s`
+
+**5d — `scan_layers=false`, `attention=flash`, pdb=2, 16K context:**
+- AR Decode: median `61.1 ms`, throughput `1,047 tok/s` (batch=64)
+- Prefill (16K tok): median `3,496.8 ms` TTFT, throughput `4,685 tok/s`
+
 ### 2026-04-22 — 16K prefill with flash/splash attention
 
 Commit `ebfcd749` (plus `9509e9e9`, `d8fe9fc9`). Three code fixes were required;
@@ -520,7 +538,7 @@ binary needs 6.13 GB; after `init_decode_state` only 2.83 GB free).
 |---|---|---|---|---|---|
 | `scan_layers=false`, `attention=dot_product` | 512 tok | 1 (32) | 55.4 ms | 577.5 tok/s | 4,144 tok/s |
 | `scan_layers=true`, `attention=dot_product` | 512 tok | 1 (32) | 68.4 ms | 468 tok/s | 4,200 tok/s |
-| **`scan_layers=false`, `attention=dot_product`** | **512 tok** | **11 (352)** | **129.2 ms** | **2,724 tok/s** | same as above |
+| **`scan_layers=false`, `attention=dot_product`** | **512 tok** | **11 (352)** | **125.3 ms** | **2,809 tok/s** | same as above |
 | `scan_layers=false`, `attention=dot_product` | 16K tok | 2 (64) | 61.3 ms | 1,044 tok/s | 4,686 tok/s (`attention=flash`) |
 
 ### Prior Reference Result For Commit 5ad76eac (regression baseline)
