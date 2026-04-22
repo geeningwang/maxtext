@@ -10,7 +10,7 @@ This document summarises all four validated inference configurations for
 
 | # | Stack | Hardware | Weight format | Status | Output quality |
 |---|---|---|---|---|---|
-| 1 | **MaxText + TPU** | TPU v6e / Ironwood v7 | BF16 (OCDBT checkpoint, FP8 dequantized via `weight_scale_inv`) | ✅ End-to-end generation validated; 129.2 ms/step · 2,724 tok/s at batch=352 (v6e-32, 2026-04-21, `per_device_batch_size=11`); 55.4 ms/step · 577.5 tok/s at batch=32 | Coherent ("420 km" train distance, 2026-04-17, EOS stop); thinking chain may exhaust default `max_new_tokens` before answer — use ≥ 4000 for reliable EOS |
+| 1 | **MaxText + TPU** | TPU v6e / Ironwood v7 | BF16 (OCDBT checkpoint, FP8 dequantized via `weight_scale_inv`) | ✅ End-to-end generation validated; 129.2 ms/step · 2,724 tok/s at batch=352 (v6e-32, 2026-04-21, `per_device_batch_size=11`); 55.4 ms/step · 577.5 tok/s at batch=32; **16K prefill: 4,686 tok/s / 3,497 ms TTFT** (2026-04-22, `attention=flash`) | Coherent ("420 km" train distance, 2026-04-17, EOS stop); thinking chain may exhaust default `max_new_tokens` before answer — use ≥ 4000 for reliable EOS |
 | 2 | **HuggingFace Transformers (CPU)** | AMD EPYC 9B14, 180 vCPUs, 708 GB | BF16 (shard-by-shard FP8→BF16 dequant with `weight_scale_inv`) | ✅ Runs end-to-end | Coherent (`"2. But what if we consider it in a"`) |
 | 3 | **SGLang CPU engine** | AMD EPYC 9B14, 180 vCPUs, 708 GB | FP8→BF16 cast at load (quantization_config=null) | ✅ Runs, 5 patches needed | Garbled (`葭葭葭…`) — FP8 scale tensors stripped |
 | 4 | **llama.cpp (GGUF Q8_0)** | AMD EPYC 9B14, 180 vCPUs, 708 GB | Q8_0 on disk, int8+f32 accumulation in compute | ✅ Runs, no patches needed | Coherent (`"2. But what is 0+0?"`) |
@@ -38,7 +38,7 @@ Our MaxText + TPU v6e-32 measurements are the closest available counterpart.
 | 16K Prefill | 4,861 input tok/s | — | 3,406 ms avg TTFT |
 | 16K / 1K Decode | 94 output tok/s | 8 | 37,979 / 14.71 |
 
-### MaxText + TPU v6e-32 (measured, 2026-04-21)
+### MaxText + TPU v6e-32 (measured, 2026-04-21 / 2026-04-22)
 
 | Scene | E2E Peak Throughput | Peak BS | TTFT / ITL (ms) | Notes |
 | :--- | :--- | :--- | :--- | :--- |
