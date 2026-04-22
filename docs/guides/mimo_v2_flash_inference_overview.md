@@ -44,7 +44,6 @@ Our MaxText + TPU v6e-32 measurements are the closest available counterpart.
 | :--- | :--- | :--- | :--- | :--- |
 | 4K Prefill | **2,847 input tok/s** | 1 | **1,439 ms avg TTFT** | BS=1 only; compute-underutilised |
 | 4K / 1K Decode | **2,541 output tok/s** | **288** (`per_device_batch_size=9`) | — / **113.3 ms/step** | SWA KV opt (`d1227dae`): 39 SWA layers capped at 128-slot window → KV reduced from 4K to 128 slots; BS=9×32=288 now fits |
-| 512-token / 1K Decode *(opt5, not in external ref)* | **2,724 output tok/s** | **352** (`per_device_batch_size=11`) | — / **129.2 ms/step** | Shorter context frees HBM for 11× more batch slots; optimal config as of 2026-04-21 |
 | 16K Prefill | **4,686 input tok/s** | 1 | **3,497 ms avg TTFT** | Flash/splash attention (`attention=flash`, `expert_shard_attention_option=context`); avoids 34 GB score-matrix OOM |
 | 16K / 1K Decode | **1,347 output tok/s** | **96** (`per_device_batch_size=3`, max) | — / **71.3 ms/step** | SWA KV opt: only 9 global layers need full 16K KV; pdb=4 (BS=128) OOM (457 MB needed, 373 MB free) |
 
@@ -76,11 +75,10 @@ Our MaxText + TPU v6e-32 measurements are the closest available counterpart.
   (2) train-mode dot_product fallback (`d8fe9fc9`), and (3) disable `LoadBalancedCausalMask` for
   EP_AS_CONTEXT (`ebfcd749`) — `LoadBalancedCausalMask & SWA-LocalMask` triggers an assertion in
   JAX 0.8.1's `splash_attention_mask_info._process_mask`.
-- **Optimal batch at 512-token context (not in external ref):** MaxText/TPU achieves **2,724 tok/s** at BS=352
+- **Optimal batch at 512-token context (not in external ref):** At 512-token context, MaxText/TPU achieves **2,724 tok/s** at BS=352
   (`per_device_batch_size=11`) — see [opt5 results](mimo_v2_flash_opt5_batch_size_scaling.md).
   The shorter context leaves far more HBM for KV cache, enabling 11× more sequences in parallel.
-  This row is included in the table above for completeness but is not directly comparable to the
-  external reference's 4K-context scenes.
+  This is not directly comparable to the external reference's 4K-context scenes.
 
 ---
 
