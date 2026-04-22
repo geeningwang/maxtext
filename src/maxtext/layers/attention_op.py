@@ -1355,6 +1355,14 @@ class AttentionOp(nnx.Module):
           ],
       )
       def wrap_splash_kernel(multi_head_mask, shard_head_size=1):
+        import sys
+        print(
+            f"[DEBUG make_splash_mha] mask.shape={multi_head_mask.shape} "
+            f"head_shards={shard_head_size} q_seq_shards={cp_size} "
+            f"block_q={sa_config.block_q} block_kv={sa_config.block_kv} "
+            f"mask_types={set(type(m).__name__ for m in multi_head_mask.masks)}",
+            flush=True, file=sys.stderr,
+        )
         splash_kernel = splash_attention_kernel.make_splash_mha(
             mask=multi_head_mask,
             head_shards=shard_head_size,  # the size of the axis if sharding over heads
