@@ -2108,20 +2108,18 @@ class AttentionOp(nnx.Module):
       ar_step = ar_lengths[0].astype(jnp.int32) - 1  # 0-indexed current AR step
 
       # --- Prefill cache anchor ---
-      # When the SWA prefill-cache optimisation is active the cache holds only the
-      # last swa_window_size tokens of the prefill (slot j ↔ absolute position
-      # max_prefill_length - W + j).  The sliding-window mask "attend to slot j iff
-      # j > next_pos - W  AND  j <= next_pos" must map to "j > ar_step".
-      # Setting next_pos = ar_step + W achieves this (and the upper bound is always
-      # satisfied since j < W).
-      # When the cache is full-length, use the original true_length + ar_step anchor.
-      prefill_cache_len = prefill_kv_cache[0].shape[1]
-      if self.sliding_window_size is not None and prefill_cache_len <= self.sliding_window_size:
-        prefill_swa_next_pos = ar_step + self.sliding_window_size
-      else:
-        true_length = jnp.sum(prefill_seg[0] == DECODING_ACTIVE_SEQUENCE_INDICATOR).astype(jnp.int32)
-        # Absolute ROPE position of the current query token in the full sequence.
-        prefill_swa_next_pos = true_length + ar_step
+      # Compute the number of REAL (non-padding) tokens stored in the prefill
+      # cache from the segment IDs.  With the SWA cache optimisation the cache
+      # is bounded to swa_window_size slots and holds the last min(true_len, W)
+      # real tokens anchored at position true_len - min(true_len, W).
+      # In both the truncated and the non-truncated case, summing the ACTIVE
+      # segment indicators gives the correct stored content length:
+      #   - true_len >= W: all W slots are ACTIVE  → sum = W  → next_pos = W + ar_step
+      #   - true_len <  W: first true_len slots ACTIVE, rest padding  → sum = true_len
+      #                   → next_pos = true_len + ar_step  (original formula)
+      true_length = jnp.sum(prefill_seg[0] == DECODING_ACTIVE_SEQUENCE_INDICATOR).astype(jnp.int32)
+      # Absolute ROPE position of the current query token in the full sequence.
+      prefill_swa_next_pos = true_length + ar_step
 
       # --- AR cache anchor ---
       # When the SWA AR-cache optimisation is active the cache is a ring buffer of

@@ -620,13 +620,36 @@ class KVCache(BaseCache):
 
     cached_prefill_key_vars, cached_prefill_value_vars, cached_prefill_segment_id_var = self._get_prefill_cache_vars()
 
-    # SWA optimisation: only store the last swa_window_size tokens so the prefill
-    # KV cache is bounded by the sliding-window size rather than max_prefill_length.
-    # The full key/value tensors are still returned for the prefill attention pass.
+    # SWA optimisation: only store the last swa_window_size tokens of REAL content
+    # so the prefill KV cache is bounded by the sliding-window size rather than
+    # max_prefill_length.  The full key/value tensors are still returned for the
+    # prefill attention pass.
+    #
+    # IMPORTANT: slice from true_length - swa_window_size, NOT from the end of the
+    # padded sequence.  When max_prefill >> true_length, the last swa_window_size
+    # positions of the padded sequence are all padding (segment_id=0).  Slicing
+    # there would store only padding in the cache, making all 39 SWA layers unable
+    # to attend to the prompt during AR decode.
     if self.swa_window_size > 0 and key.shape[1] > self.swa_window_size:
-      key_to_cache = key[:, -self.swa_window_size :, :, :]
-      value_to_cache = value[:, -self.swa_window_size :, :, :]
-      seg_ids_to_cache = decoder_segment_ids[:, -self.swa_window_size :] if decoder_segment_ids is not None else None
+      if decoder_segment_ids is not None:
+        true_len = jnp.sum(
+            decoder_segment_ids[0] == DECODING_ACTIVE_SEQUENCE_INDICATOR
+        ).astype(jnp.int32)
+        start = jnp.maximum(jnp.int32(0), true_len - jnp.int32(self.swa_window_size))
+      else:
+        start = jnp.int32(key.shape[1] - self.swa_window_size)
+      key_to_cache = jax.lax.dynamic_slice(
+          key, (0, start, 0, 0),
+          (key.shape[0], self.swa_window_size, key.shape[2], key.shape[3])
+      )
+      value_to_cache = jax.lax.dynamic_slice(
+          value, (0, start, 0, 0),
+          (value.shape[0], self.swa_window_size, value.shape[2], value.shape[3])
+      )
+      seg_ids_to_cache = (
+          jax.lax.dynamic_slice_in_dim(decoder_segment_ids, start, self.swa_window_size, axis=1)
+          if decoder_segment_ids is not None else None
+      )
     else:
       key_to_cache = key
       value_to_cache = value
