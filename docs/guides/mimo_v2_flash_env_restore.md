@@ -190,11 +190,13 @@ The dedicated benchmark script runs 3 warmup steps followed by 50 timed
 `engine.generate()` steps and writes a JSON result file to the path given in
 `inference_microbenchmark_log_file_path`.
 
-### 5a. 4K context benchmark — dot_product attention (`per_device_batch_size=11`)
+### 5a. 4K context benchmark — dot_product attention (`per_device_batch_size=20`)
 
-Current best 4K decode configuration. `per_device_batch_size=11` (total batch = 352)
-achieves **2,809 tok/s** at 125.3 ms/step — a 4.84× improvement over the `pdb=1` baseline.
-`pdb=12` OOMs (XLA HLO temp allocation); `pdb=11` is the maximum.
+Current best 4K decode configuration. `per_device_batch_size=20` (total batch = 640)
+achieves **3,322 tok/s** at 192.7 ms/step — a 5.75× improvement over the `pdb=1` baseline.
+`pdb=24` OOMs (XLA HLO temp allocation needs 598.88 MB, 581.92 MB free); `pdb=20` is the maximum.
+The SWA KV cache fix (`b6a3d096`) freed HBM previously consumed by 39 SWA layers storing
+full 512-slot padded prefill windows, raising the ceiling from the former pdb=11.
 
 Run this on `jingnw-tpu-op`:
 
@@ -207,12 +209,12 @@ export PYTHONUNBUFFERED=1
 python3 -m maxtext.inference.scripts.mimo_v2_flash_bench \
   src/maxtext/configs/base.yml \
   model_name=mimo-v2-flash \
-  run_name=mimo_v2_flash_bench_pdb11 \
+  run_name=mimo_v2_flash_bench_pdb20 \
   load_parameters_path='"$BENCH_CKPT"' \
   tokenizer_path='"$TOKENIZER"' \
   max_prefill_predict_length=512 \
   max_target_length=640 \
-  per_device_batch_size=11 \
+  per_device_batch_size=20 \
   dtype=bfloat16 \
   weight_dtype=bfloat16 \
   ici_tensor_parallelism=4 \
@@ -221,10 +223,10 @@ python3 -m maxtext.inference.scripts.mimo_v2_flash_bench \
   attention=dot_product \
   checkpoint_storage_use_ocdbt=true \
   checkpoint_storage_use_zarr3=true \
-  inference_microbenchmark_log_file_path=/tmp/bench_pdb11.json'
+  inference_microbenchmark_log_file_path=/tmp/bench_pdb20.json'
 ```
 
-Expected: decode median ~125.3 ms · **2,809 tok/s** (batch=352); prefill median ~123.9 ms · **4,134 tok/s** (512 tok). Result file: `/tmp/bench_pdb11.json`.
+Expected: decode median ~192.7 ms · **3,322 tok/s** (batch=640); prefill median ~123.8 ms · **4,137 tok/s** (512 tok). Result file: `/tmp/bench_pdb20.json`.
 
 ### 5b. 16K context benchmark — flash attention (`per_device_batch_size=2`)
 
@@ -312,11 +314,11 @@ gcloud compute tpus tpu-vm ssh "$TPU_NAME" --zone "$ZONE" --worker=all \
 After the run completes (all workers print `BENCH_EXIT=0`), read the JSON
 result from each worker.
 
-**5a** (`/tmp/bench_pdb11.json`):
+**5a** (`/tmp/bench_pdb20.json`):
 
 ```bash
 gcloud compute tpus tpu-vm ssh "$TPU_NAME" --zone "$ZONE" --worker=all \
-  --command='cat /tmp/bench_pdb11.json 2>/dev/null || echo "no result yet"'
+  --command='cat /tmp/bench_pdb20.json 2>/dev/null || echo "no result yet"'
 ```
 
 **5b** (`/tmp/bench_16k.json`):
@@ -421,6 +423,22 @@ checkpoint: `mimo-v2-flash-fixed-ocdbt`
 - AR Decode: median `61.1 ms`, throughput `1,047 tok/s` (batch=64)
 - Prefill (16K tok): median `3,496.8 ms` TTFT, throughput `4,685 tok/s`
 
+### 2026-04-22 — Batch size ceiling sweep after SWA KV cache fix (`b6a3d096`)
+
+The SWA KV cache fix stores only actual prompt tokens (up to window size) in the
+39 SWA layer prefill caches, freeing HBM previously used by padding slots. This
+raised the 4K decode ceiling from pdb=11 to pdb=20.
+
+| pdb | Batch | Decode median | Decode throughput |
+|---|---|---|---|
+| 11 | 352 | 125.0 ms | 2,815 tok/s |
+| 12 | 384 | 130.1 ms | 2,952 tok/s |
+| 16 | 512 | 160.3 ms | 3,194 tok/s |
+| **20 (max)** | **640** | **192.7 ms** | **3,322 tok/s** |
+| 24 | 768 | OOM (598.88 MB needed, 581.92 MB free) | — |
+
+Prefill (512 tok) unchanged at ~123.8 ms / ~4,137 tok/s across all pdb values.
+
 ### 2026-04-22 — 16K prefill with flash/splash attention
 
 Commit `ebfcd749` (plus `9509e9e9`, `d8fe9fc9`). Three code fixes were required;
@@ -447,7 +465,7 @@ binary needs 6.13 GB; after `init_decode_state` only 2.83 GB free).
 | Config | Context | `pdb` (BS) | Decode median | Decode throughput | Prefill throughput |
 |---|---|---|---|---|---|
 | `scan_layers=false`, `attention=dot_product` | 512 tok | 1 (32) | 55.4 ms | 577.5 tok/s | 4,144 tok/s |
-| **`scan_layers=false`, `attention=dot_product`** | **512 tok** | **11 (352)** | **125.3 ms** | **2,809 tok/s** | same as above |
+| **`scan_layers=false`, `attention=dot_product`** | **512 tok** | **20 (640)** | **192.7 ms** | **3,322 tok/s** | same as above |
 | `scan_layers=false`, `attention=dot_product` | 16K tok | 2 (64) | 61.3 ms | 1,044 tok/s | 4,686 tok/s (`attention=flash`) |
 
 ### Prior Reference Result For Commit 5ad76eac (regression baseline)

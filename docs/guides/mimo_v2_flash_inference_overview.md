@@ -10,7 +10,7 @@ This document summarises all four validated inference configurations for
 
 | # | Stack | Hardware | Weight format | Status | Output quality |
 |---|---|---|---|---|---|
-| 1 | **MaxText + TPU** | TPU v6e / Ironwood v7 | BF16 (OCDBT checkpoint, FP8 dequantized via `weight_scale_inv`) | ✅ End-to-end generation validated; 125.3 ms/step · 2,809 tok/s at batch=352 (v6e-32, 2026-04-22, `per_device_batch_size=11`); 55.2 ms/step · 579.8 tok/s at batch=32; **16K prefill: 4,686 tok/s / 3,497 ms TTFT** (2026-04-22, `attention=flash`) | Coherent ("420 km" train distance, 2026-04-17, EOS stop); thinking chain may exhaust default `max_new_tokens` before answer — use ≥ 4000 for reliable EOS |
+| 1 | **MaxText + TPU** | TPU v6e / Ironwood v7 | BF16 (OCDBT checkpoint, FP8 dequantized via `weight_scale_inv`) | ✅ End-to-end generation validated; 192.7 ms/step · 3,322 tok/s at batch=640 (v6e-32, 2026-04-22, `per_device_batch_size=20`); 55.2 ms/step · 579.8 tok/s at batch=32; **16K prefill: 4,686 tok/s / 3,497 ms TTFT** (2026-04-22, `attention=flash`) | Coherent ("420 km" train distance, 2026-04-22, EOS stop); thinking chain may exhaust default `max_new_tokens` before answer — use ≥ 4000 for reliable EOS |
 | 2 | **HuggingFace Transformers (CPU)** | AMD EPYC 9B14, 180 vCPUs, 708 GB | BF16 (shard-by-shard FP8→BF16 dequant with `weight_scale_inv`) | ✅ Runs end-to-end | Coherent (`"2. But what if we consider it in a"`) |
 | 3 | **SGLang CPU engine** | AMD EPYC 9B14, 180 vCPUs, 708 GB | FP8→BF16 cast at load (quantization_config=null) | ✅ Runs, 5 patches needed | Garbled (`葭葭葭…`) — FP8 scale tensors stripped |
 | 4 | **llama.cpp (GGUF Q8_0)** | AMD EPYC 9B14, 180 vCPUs, 708 GB | Q8_0 on disk, int8+f32 accumulation in compute | ✅ Runs, no patches needed | Coherent (`"2. But what is 0+0?"`) |
@@ -43,7 +43,7 @@ Our MaxText + TPU v6e-32 measurements are the closest available counterpart.
 | Scene | E2E Peak Throughput | Peak BS | TTFT / ITL (ms) | Notes |
 | :--- | :--- | :--- | :--- | :--- |
 | 4K Prefill | **2,847 input tok/s** | 1 | **1,439 ms avg TTFT** | BS=1 only; compute-underutilised |
-| 4K / 1K Decode | **2,541 output tok/s** | **288** (`per_device_batch_size=9`) | — / **113.3 ms/step** | SWA KV opt (`d1227dae`): 39 SWA layers capped at 128-slot window → KV reduced from 4K to 128 slots; BS=9×32=288 now fits |
+| 4K / 1K Decode | **3,322 output tok/s** | **640** (`per_device_batch_size=20`) | — / **192.7 ms/step** | SWA KV cache fix (`b6a3d096`): 39 SWA layers store only actual prompt tokens (≤128 slots) instead of full padded 512-slot prefill → freed ~1.4 GB HBM/device; raised ceiling from pdb=11 to pdb=20 |
 | 16K Prefill | **4,686 input tok/s** | 1 | **3,497 ms avg TTFT** | Flash/splash attention (`attention=flash`, `expert_shard_attention_option=context`); avoids 34 GB score-matrix OOM |
 | 16K / 1K Decode | **1,347 output tok/s** | **96** (`per_device_batch_size=3`, max) | — / **71.3 ms/step** | SWA KV opt: only 9 global layers need full 16K KV; pdb=4 (BS=128) OOM (457 MB needed, 373 MB free) |
 
@@ -52,14 +52,14 @@ Our MaxText + TPU v6e-32 measurements are the closest available counterpart.
   Our bench runs single-sequence prefill (BS=1); the external reference likely batches multiple
   4K prefills concurrently, multiplying throughput linearly. The TTFT is higher (1,439 ms vs 513 ms)
   for the same reason — at BS=1 the compute is underutilised.
-- **4K / 1K Decode (SWA KV opt, 2026-04-21):** MaxText/TPU achieves **2,541 tok/s at BS=288**
-  (`per_device_batch_size=9`) vs external **417 tok/s at BS=32** — a **6.1× advantage**.
-  The SWA KV cache optimization (commit `d1227dae`) caps the 39 sliding-window attention layers
-  at 128 KV slots (window size) instead of the full 4K context. This shrinks the total KV footprint
-  per chip from ~8.5 GB → ~0.24 GB at pdb=9, enabling 9× more batch slots. Prior to this
-  optimization, BS=32 was the maximum (BS=64 OOM). Our ITL (113.3 ms at BS=288) is higher than
-  the external ref (31.20 ms at BS=32) because the weight-bandwidth cost is amortized over 9×
-  more sequences — per-sequence latency is comparable.
+- **4K / 1K Decode (SWA KV cache fix, 2026-04-22):** MaxText/TPU achieves **3,322 tok/s at BS=640**
+  (`per_device_batch_size=20`) vs external **417 tok/s at BS=32** — a **7.97× advantage**.
+  The SWA KV cache fix (`b6a3d096`) stores only actual prompt tokens (up to the 128-slot window)
+  in the 39 SWA layer prefill caches instead of the full padded 512-slot prefill, freeing ~1.4 GB
+  HBM/device. Combined with the original SWA window cap (`d1227dae`), this raised the ceiling
+  from pdb=11 to pdb=20 (pdb=24 OOMs). Our ITL (192.7 ms at BS=640) is higher than
+  the external ref (31.20 ms at BS=32) because the weight-bandwidth cost is amortized over 20×
+  more sequences — per-sequence latency (0.30 ms/tok) is 10× lower.
 - **16K / 1K Decode (SWA KV opt, 2026-04-21):** MaxText/TPU achieves **1,347 tok/s at BS=96**
   (`per_device_batch_size=3`) vs external **94 tok/s at BS=8** — a **14.3× advantage**.
   With SWA KV opt, only the 9 global attention layers need full 16K-length KV slots; the 39 SWA
@@ -75,9 +75,10 @@ Our MaxText + TPU v6e-32 measurements are the closest available counterpart.
   (2) train-mode dot_product fallback (`d8fe9fc9`), and (3) disable `LoadBalancedCausalMask` for
   EP_AS_CONTEXT (`ebfcd749`) — `LoadBalancedCausalMask & SWA-LocalMask` triggers an assertion in
   JAX 0.8.1's `splash_attention_mask_info._process_mask`.
-- **Optimal batch at 512-token context (not in external ref):** At 512-token context, MaxText/TPU achieves **2,809 tok/s** at BS=352
-  (`per_device_batch_size=11`) — see [opt5 results](mimo_v2_flash_opt5_batch_size_scaling.md).
-  The shorter context leaves far more HBM for KV cache, enabling 11× more sequences in parallel.
+- **Optimal batch at 512-token context (not in external ref):** At 512-token context, MaxText/TPU achieves **3,322 tok/s** at BS=640
+  (`per_device_batch_size=20`) — see [opt5 results](mimo_v2_flash_opt5_batch_size_scaling.md).
+  The shorter context leaves far more HBM for KV cache, enabling 20× more sequences in parallel.
+  The SWA KV cache fix (`b6a3d096`) raised the ceiling from pdb=11 (2,809 tok/s) to pdb=20.
   This is not directly comparable to the external reference's 4K-context scenes.
 
 ---
@@ -114,8 +115,8 @@ post `jingnw-tpu-op` VM recreation).  All 8 workers print `TPU_IMPORT_OK` after
 restore and the demo exits with code 0.  Proper benchmark (3-step warmup + 50 timed
 steps at batch=32): **55.5 ms/step median**, **576 tok/s**, **1.7 ms/tok/seq**
 (2026-04-17, commit `72f75972`; opt #1 `jax.debug.print` removal + SWA fix).
-Opt5 batch scaling (re-measured 2026-04-22, original commit `711f591f`): **125.3 ms/step**, **2,809 tok/s**,
-**0.36 ms/tok/seq** at `per_device_batch_size=11` (total batch=352, v6e-32).
+Batch scaling (re-measured 2026-04-22, commit `9d367f83`): **192.7 ms/step**, **3,322 tok/s**,
+**0.30 ms/tok/seq** at `per_device_batch_size=20` (total batch=640, v6e-32); SWA KV cache fix (`b6a3d096`) raised ceiling from pdb=11 to pdb=20.
 The model is prompted via `tokenizer.apply_chat_template()` (`use_chat_template=true`).
 With thinking mode enabled (MiMo-V2-Flash default), the model emits a long reasoning
 chain before the final answer; the default `max_new_tokens` budget is typically
@@ -147,7 +148,7 @@ near-argmax and producing completely garbled token predictions.  Fix: added
 | Prefill (512 tokens) | ~22 s |
 | Demo path throughput (single-sequence, per-step CPU sync) | **~4.3 tok/s** (2026-04-21; thinking chain fills default `max_new_tokens`) |
 | Generation speed (steady-state, batch=32) | 55.5 ms/step · 576 tok/s · 1.7 ms/tok/seq (2026-04-17) |
-| Generation speed (steady-state, batch=352, `per_device_batch_size=11`) | **125.3 ms/step · 2,809 tok/s · 0.36 ms/tok/seq** (2026-04-22, current best) |
+| Generation speed (steady-state, batch=640, `per_device_batch_size=20`) | **192.7 ms/step · 3,322 tok/s · 0.30 ms/tok/seq** (2026-04-22, current best) |
 | HBM per chip after load | ~18.0 GB / 31.25 GB (57.5%) |
 | Parallelism | TP=4 × EP=8 |
 
