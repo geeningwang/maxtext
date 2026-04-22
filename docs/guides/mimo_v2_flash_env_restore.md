@@ -208,7 +208,7 @@ python3 -m maxtext.inference.scripts.mimo_v2_flash_bench \
   attention=dot_product \
   checkpoint_storage_use_ocdbt=true \
   checkpoint_storage_use_zarr3=true \
-  inference_microbenchmark_log_file_path=/tmp/bench_result.json'
+  inference_microbenchmark_log_file_path=/tmp/bench_pdb1.json'
 ```
 
 ### 5b. `scan_layers=true` benchmark (4-phase stacked checkpoint)
@@ -239,8 +239,127 @@ python3 -m maxtext.inference.scripts.mimo_v2_flash_bench \
   checkpoint_storage_use_ocdbt=true \
   checkpoint_storage_use_zarr3=true \
   async_checkpointing=false \
-  inference_microbenchmark_log_file_path=/tmp/bench_result.json'
+  inference_microbenchmark_log_file_path=/tmp/bench_scan.json'
 ```
+
+### 5c. Optimal throughput benchmark — 4K context (`per_device_batch_size=11`)
+
+Current best 4K decode configuration. `per_device_batch_size=11` (total batch = 352)
+achieves **2,724 tok/s** at 129.2 ms/step — a 4.72× improvement over the `pdb=1` baseline.
+`pdb=12` OOMs (XLA HLO temp allocation); `pdb=11` is the maximum.
+
+Run this on `jingnw-tpu-op`:
+
+```bash
+gcloud compute tpus tpu-vm ssh "$TPU_NAME" --zone "$ZONE" --worker=all \
+  --command='set -e
+. "$HOME/maxtext/maxtext_tpu_venv/bin/activate"
+cd "$HOME/maxtext"
+export PYTHONUNBUFFERED=1
+python3 -m maxtext.inference.scripts.mimo_v2_flash_bench \
+  src/maxtext/configs/base.yml \
+  model_name=mimo-v2-flash \
+  run_name=mimo_v2_flash_bench_pdb11 \
+  load_parameters_path='"$BENCH_CKPT"' \
+  tokenizer_path='"$TOKENIZER"' \
+  max_prefill_predict_length=512 \
+  max_target_length=640 \
+  per_device_batch_size=11 \
+  dtype=bfloat16 \
+  weight_dtype=bfloat16 \
+  ici_tensor_parallelism=4 \
+  ici_expert_parallelism=8 \
+  scan_layers=false \
+  attention=dot_product \
+  checkpoint_storage_use_ocdbt=true \
+  checkpoint_storage_use_zarr3=true \
+  inference_microbenchmark_log_file_path=/tmp/bench_pdb11.json'
+```
+
+Expected: decode median ~129.2 ms · **2,724 tok/s** (batch=352). Result file: `/tmp/bench_pdb11.json`.
+
+### 5d. 16K prefill benchmark (flash/splash attention)
+
+`attention=dot_product` OOMs at 16K — the score matrix
+`[4, 16, 16384, 16384]×2B ≈ 34 GB/chip` exceeds 31.25 GB HBM.
+Flash attention tiles computation in VMEM; score matrix never materialises in HBM.
+
+> **`max_target_length=17408` is required** (not 16384). Must be strictly greater than
+> `max_prefill_predict_length` and divisible by `EP × sa_block_q = 8 × 128 = 1024`.
+> `17408 = 17 × 1024` satisfies both. Using `16384` raises `ValueError`.
+
+Run this on `jingnw-tpu-op`:
+
+```bash
+gcloud compute tpus tpu-vm ssh "$TPU_NAME" --zone "$ZONE" --worker=all \
+  --command='set -e
+. "$HOME/maxtext/maxtext_tpu_venv/bin/activate"
+cd "$HOME/maxtext"
+export PYTHONUNBUFFERED=1
+export BENCH_PREFILL_ONLY=1
+python3 -m maxtext.inference.scripts.mimo_v2_flash_bench \
+  src/maxtext/configs/base.yml \
+  model_name=mimo-v2-flash \
+  run_name=mimo_v2_flash_bench_16k_prefill \
+  load_parameters_path='"$BENCH_CKPT"' \
+  tokenizer_path='"$TOKENIZER"' \
+  max_prefill_predict_length=16384 \
+  max_target_length=17408 \
+  per_device_batch_size=1 \
+  dtype=bfloat16 \
+  weight_dtype=bfloat16 \
+  ici_tensor_parallelism=4 \
+  ici_expert_parallelism=8 \
+  scan_layers=false \
+  attention=flash \
+  expert_shard_attention_option=context \
+  sa_block_q=128 \
+  sa_block_kv=128 \
+  sa_block_kv_compute=128 \
+  checkpoint_storage_use_ocdbt=true \
+  checkpoint_storage_use_zarr3=true \
+  inference_microbenchmark_log_file_path=/tmp/bench_16k_prefill.json'
+```
+
+Expected: prefill median ~3,497 ms TTFT · **4,686 tok/s**. Result file: `/tmp/bench_16k_prefill.json`.
+
+### 5e. 16K decode benchmark (`per_device_batch_size=3`)
+
+AR decode at 16K context. SWA KV opt: only the 9 global attention layers need full 16K KV
+slots; the 39 SWA layers are still capped at 128 KV slots. `per_device_batch_size=3` (BS=96)
+is the maximum — `pdb=4` needs ~457 MB/chip for global KV but only ~373 MB is free.
+AR decode does not need flash attention (attends over 1 new token only; no NxN score matrix).
+
+Run this on `jingnw-tpu-op`:
+
+```bash
+gcloud compute tpus tpu-vm ssh "$TPU_NAME" --zone "$ZONE" --worker=all \
+  --command='set -e
+. "$HOME/maxtext/maxtext_tpu_venv/bin/activate"
+cd "$HOME/maxtext"
+export PYTHONUNBUFFERED=1
+export BENCH_DECODE_ONLY=1
+python3 -m maxtext.inference.scripts.mimo_v2_flash_bench \
+  src/maxtext/configs/base.yml \
+  model_name=mimo-v2-flash \
+  run_name=mimo_v2_flash_bench_16k_decode \
+  load_parameters_path='"$BENCH_CKPT"' \
+  tokenizer_path='"$TOKENIZER"' \
+  max_prefill_predict_length=16384 \
+  max_target_length=17408 \
+  per_device_batch_size=3 \
+  dtype=bfloat16 \
+  weight_dtype=bfloat16 \
+  ici_tensor_parallelism=4 \
+  ici_expert_parallelism=8 \
+  scan_layers=false \
+  attention=dot_product \
+  checkpoint_storage_use_ocdbt=true \
+  checkpoint_storage_use_zarr3=true \
+  inference_microbenchmark_log_file_path=/tmp/bench_16k_decode.json'
+```
+
+Expected: decode median ~71.3 ms · **1,347 tok/s** (batch=96). Result file: `/tmp/bench_16k_decode.json`.
 
 Expected progress markers printed to stdout as the job runs:
 
@@ -287,8 +406,9 @@ Key fields in the JSON output:
 
 ## 8. Reference Results
 
-All runs: `jingnw-node` (v6e-32), `per_device_batch_size=1`,
-`ici_tensor_parallelism=4`, `ici_expert_parallelism=8`, `max_target_length=640`.
+Default settings unless noted: `jingnw-node` (v6e-32),
+`ici_tensor_parallelism=4`, `ici_expert_parallelism=8`.
+See individual subsections for `per_device_batch_size`, `max_target_length`, and `attention` values.
 
 > **Note on `load_params` time:** The first run after a full environment restore
 > hits a cold GCS cache and takes noticeably longer (~40 s). Subsequent runs on
@@ -382,12 +502,51 @@ restore.  Both `scan_layers` modes verified working on the same commit.
 - step latency (min): about `123.4 ms`
 - total throughput: about `4,144 tok/s`
 
-### Summary of current baselines (2026-04-20, commit `055a4c2d`)
+### 2026-04-21 — Opt5 batch size scaling (`per_device_batch_size=11`, 4K context)
 
-| Config | Decode Median | Decode Throughput | Prefill Median (512 tok) | Prefill Throughput |
-|---|---|---|---|---|
-| `scan_layers=false` (OCDBT ckpt) | 55.4 ms | 577.5 tok/s | 123.6 ms | 4,144 tok/s |
-| `scan_layers=true` (stacked ckpt) | 68.4 ms | 468 tok/s | 121.9 ms | 4,200 tok/s |
+Commit `711f591f`. Sweep `pdb=1→11`; OOM at `pdb=12`.
+
+**AR Decode (4K context, pdb=11, batch=352):**
+- HBM after decode-state init: ~18.9 GB / 31.25 GB per device
+- timed steps: `50`
+- step latency (median): about `129.2 ms`
+- step latency (min): about `128.8 ms`
+- total throughput: about `2,724 tok/s`
+- per-sequence latency: about `0.37 ms/tok/seq`
+
+**Prefill (512 tokens, unchanged — compute-bound, independent of decode batch):**
+- step latency (median): about `123.6 ms`
+- total throughput: about `4,144 tok/s`
+
+### 2026-04-22 — 16K prefill with flash/splash attention
+
+Commit `ebfcd749` (plus `9509e9e9`, `d8fe9fc9`). Three code fixes were required;
+see perf doc opt #12 for full details.
+
+**16K Prefill (`attention=flash`, `expert_shard_attention_option=context`, pdb=1):**
+- timed steps: `20`
+- step latency (median): about `3,497 ms` TTFT
+- total throughput: about `4,686 tok/s`
+
+### 2026-04-22 — 16K decode (`per_device_batch_size=3`)
+
+Commit `ebfcd749`. SWA KV opt: only 9 global attention layers need full 16K KV;
+39 SWA layers remain capped at 128 KV slots.
+
+**AR Decode (16K context, pdb=3, batch=96):**
+- HBM: global KV ~343 MB/chip (fits; pdb=4 needs ~457 MB, OOMs)
+- step latency (median): about `71.3 ms`
+- total throughput: about `1,347 tok/s`
+- per-sequence latency: about `0.74 ms/tok/seq`
+
+### Summary of all validated baselines (as of 2026-04-22, commit `ebfcd749`)
+
+| Config | Context | `pdb` (BS) | Decode median | Decode throughput | Prefill throughput |
+|---|---|---|---|---|---|
+| `scan_layers=false`, `attention=dot_product` | 512 tok | 1 (32) | 55.4 ms | 577.5 tok/s | 4,144 tok/s |
+| `scan_layers=true`, `attention=dot_product` | 512 tok | 1 (32) | 68.4 ms | 468 tok/s | 4,200 tok/s |
+| **`scan_layers=false`, `attention=dot_product`** | **512 tok** | **11 (352)** | **129.2 ms** | **2,724 tok/s** | same as above |
+| `scan_layers=false`, `attention=dot_product` | 16K tok | 3 (96) | 71.3 ms | 1,347 tok/s | 4,686 tok/s (`attention=flash`) |
 
 ### Prior Reference Result For Commit 5ad76eac (regression baseline)
 
