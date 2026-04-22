@@ -32,7 +32,9 @@ The commands below assume you are already logged in to the manager VM
 
 ### Runtime Package Versions (TPU Workers)
 
-Verified on 2026-04-15 from worker 0 after a full install via `uv pip install -e ".[tpu]" --resolution=lowest`:
+Verified on 2026-04-22 from worker 0 after a full install via sections 2–3
+(`uv pip install -e ".[tpu]" --resolution=lowest` + `uv pip install transformers safetensors huggingface_hub`).
+`tpu-requirements.txt` pins `numpy<2.1` and `transformers<5.0` to keep these versions stable.
 
 | Package | Version |
 |---|---|
