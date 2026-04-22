@@ -315,7 +315,7 @@ The stable baseline (commit `055a4c2d`) is:
 | #2 | Local sparse gmm | ✅ Done (minimal gain) | None |
 | #3 | Int8 KV cache | ❌ Rejected | None |
 | #4 | Ragged-A2A sparse MoE for decode | ❌ Reverted | None |
-| **#5** | **Batch size > 1 (this plan)** | **✅ Done** | **Throughput-optimal: `per_device_batch_size=8` (2,428 tok/s, 4.21× baseline)** |
+| **#5** | **Batch size > 1 (this plan)** | **✅ Done** | **Throughput-optimal: `per_device_batch_size=11` (2,724 tok/s, 4.72× baseline)** |
 | #6 | Int8/FP8 weight quantisation | 📋 Planned | Can be stacked on top of opt5 — run weight quant benchmark at `per_device_batch_size=8` |
 | #7 | Sparse MoE for prefill | 📋 Planned | Independent; operates on prefill path; combine with opt5 result |
 | #8 | Speculative decoding | 📋 Planned | Orthogonal — reduces per-sequence latency; stack on opt5's optimal batch |
@@ -331,7 +331,10 @@ The stable baseline (commit `055a4c2d`) is:
 | 1 (baseline) | 32 | 55.4 ms | 577 tok/s | 1.00× | 100% |
 | 2 | 64 | 62.0 ms | 1,032 tok/s | 1.79× | 89% |
 | 4 | 128 | 77.5 ms | 1,652 tok/s | 2.86× | 72% |
-| **8** | **256** | **105.4 ms** | **2,428 tok/s** | **4.21×** | **53%** |
+| 8 | 256 | 105.4 ms | 2,428 tok/s | 4.21× | 53% |
+| 10 | 320 | 117.9 ms | 2,715 tok/s | 4.70× | 47% |
+| **11** | **352** | **129.2 ms** | **2,724 tok/s** | **4.72×** | **43%** |
+| 12 | 384 | OOM | — | — | — |
 | 16 | 512 | OOM | — | — | — |
 
 *Scaling efficiency = actual throughput / ideal linear throughput*

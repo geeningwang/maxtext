@@ -18,7 +18,10 @@ Benchmarks use `src/maxtext/inference/scripts/mimo_v2_flash_bench.py`
 | 2026-04-17 | **#8 SWA fix + debug logging cleanup** (commit `72f75972`) — dense baseline re-confirmed | **55.5 ms** | **576 tok/s** | **1.7 ms/tok** | ✅ |
 | 2026-04-20 | #9 Ragged-A2A sparse EP routing (opt4) — reverted, 83% regression | 101.5 ms | 315.5 tok/s | 3.2 ms/tok | ❌ Reverted |
 | 2026-04-20 | **#10 Revert opt4; add prefill benchmark** (commit `055a4c2d`) — both scan modes verified | **55.4 ms** | **577.5 tok/s** | **1.7 ms/tok** | ✅ |
-| 2026-04-21 | **#11 Batch size scaling (opt5)** — sweep per_device_batch_size=1→11, OOM at 12 (commits `6d067cdf`–`711f591f`) | **129.2 ms** | **2,724 tok/s** | **0.37 ms/tok** | ✅ Current best |
+| 2026-04-21 | **#11 Batch size scaling (opt5)** — sweep per_device_batch_size=1→11, OOM at 12 (commits `6d067cdf`–`711f591f`) | **129.2 ms** | **2,724 tok/s** | **0.37 ms/tok** | ✅ 512-tok best |
+| 2026-04-22 | **#12 Flash/splash attention — 16K context** (`attention=flash`, `expert_shard_attention_option=context`, commits `9509e9e9`–`ebfcd749`) — default `attention=dot_product` OOMs (34 GB score matrix); 3 code fixes required; 16K prefill: **4,686 tok/s / 3,497 ms TTFT** | 71.3 ms‡ | 1,347 tok/s‡ | 0.74 ms/tok‡ | ✅ New 16K config |
+
+‡ 16K decode context at BS=96 (`per_device_batch_size=3`, max before OOM); not directly comparable to 512-token-context rows above which use BS=352.
 
 † A/B comparison (true vs false) shows **0% Δ** in both median step latency and throughput.
 The absolute numbers are 32× lower than the opt #1 baseline (56.5 ms) — a separate regression
