@@ -1176,6 +1176,14 @@ class AttentionOp(nnx.Module):
     cp_size = self.config.context_parallel_size
     load_balanced_context_parallel = self.config.context_parallel_load_balance
 
+    # EP_AS_CONTEXT assigns contiguous token chunks to each device (tokens [i*chunk, (i+1)*chunk)).
+    # LoadBalancedCausalMask interleaves tokens across devices (device i gets tokens i, i+cp, i+2cp, ...).
+    # These two approaches are incompatible: using LoadBalancedCausalMask with EP_AS_CONTEXT would
+    # produce a broken combined mask (LoadBalancedCausalMask & LocalMask fails with AssertionError).
+    # Similarly, reorder_sequence must NOT be applied for EP_AS_CONTEXT.
+    if self.config.expert_shard_attention_option == EP_AS_CONTEXT:
+      load_balanced_context_parallel = False
+
     # Transpose to ('batch', 'heads', 'length', 'kv')
     query = jnp.transpose(query, axes=(0, 2, 1, 3))
     key = jnp.transpose(key, axes=(0, 2, 1, 3))
@@ -1355,14 +1363,6 @@ class AttentionOp(nnx.Module):
           ],
       )
       def wrap_splash_kernel(multi_head_mask, shard_head_size=1):
-        import sys
-        print(
-            f"[DEBUG make_splash_mha] mask.shape={multi_head_mask.shape} "
-            f"head_shards={shard_head_size} q_seq_shards={cp_size} "
-            f"block_q={sa_config.block_q} block_kv={sa_config.block_kv} "
-            f"mask_types={set(type(m).__name__ for m in multi_head_mask.masks)}",
-            flush=True, file=sys.stderr,
-        )
         splash_kernel = splash_attention_kernel.make_splash_mha(
             mask=multi_head_mask,
             head_shards=shard_head_size,  # the size of the axis if sharding over heads
