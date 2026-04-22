@@ -45,7 +45,7 @@ Our MaxText + TPU v6e-32 measurements are the closest available counterpart.
 | 4K Prefill | **2,847 input tok/s** | 1 | **1,439 ms avg TTFT** | BS=1 only; compute-underutilised |
 | 4K / 1K Decode | **2,541 output tok/s** | **288** (`per_device_batch_size=9`) | — / **113.3 ms/step** | SWA KV opt (`d1227dae`): 39 SWA layers capped at 128-slot window → KV reduced from 4K to 128 slots; BS=9×32=288 now fits |
 | 512-token / 1K Decode *(opt5, not in external ref)* | **2,724 output tok/s** | **352** (`per_device_batch_size=11`) | — / **129.2 ms/step** | Shorter context frees HBM for 11× more batch slots; optimal config as of 2026-04-21 |
-| 16K Prefill | OOM (v6e-32, 31.25 GB/chip) | — | — | XLA attention intermediates at 16K exceed 31.25 GB/chip even with SWA KV opt; needs Ironwood v7 or weight quantization |
+| 16K Prefill | **4,686 input tok/s** | 1 | **3,497 ms avg TTFT** | Flash/splash attention (`attention=flash`, `expert_shard_attention_option=context`); avoids 34 GB score-matrix OOM |
 | 16K / 1K Decode | **1,347 output tok/s** | **96** (`per_device_batch_size=3`, max) | — / **71.3 ms/step** | SWA KV opt: only 9 global layers need full 16K KV; pdb=4 (BS=128) OOM (457 MB needed, 373 MB free) |
 
 **Comparability notes:**
@@ -67,10 +67,15 @@ Our MaxText + TPU v6e-32 measurements are the closest available counterpart.
   layers are still capped at 128 slots. At pdb=3 the global KV is ~343 MB/chip (fits in 373 MB
   free); pdb=4 needs ~457 MB and OOMs. The step latency (71.3 ms) is lower than 4K decode
   (113.3 ms) because the 16K decode has a smaller batch (96 vs 288) — weight bandwidth dominates.
-- **16K Prefill OOM:** XLA attention intermediates at 16K sequence length require 34–36 GB/chip
-  (both `scan_layers=false` and `scan_layers=true`), exceeding 31.25 GB/chip even with SWA KV opt.
-  Root cause: XLA materialises full-context attention score tensors during prefill compilation.
-  Fix requires Ironwood v7 (192 GB/chip) or weight quantisation (~9 GB/chip footprint).
+- **16K Prefill (flash attention, 2026-04-22):** MaxText/TPU achieves **4,686 tok/s** (TTFT 3,497 ms) vs
+  external **4,861 tok/s** (TTFT 3,406 ms) — a **0.96× match**. The default `attention=dot_product`
+  OOMs because the score matrix `[4, 16, 16384, 16384]×2B ≈ 34 GB/chip` exceeds 31.25 GB.
+  Splash/flash attention (`attention=flash`, `expert_shard_attention_option=context`,
+  `sa_block_q=128 sa_block_kv=128`) tiles computation in VMEM — score matrix never materialises in HBM.
+  Three code fixes were required: (1) decode-mode dot_product fallback (`9509e9e9`),
+  (2) train-mode dot_product fallback (`d8fe9fc9`), and (3) disable `LoadBalancedCausalMask` for
+  EP_AS_CONTEXT (`ebfcd749`) — `LoadBalancedCausalMask & SWA-LocalMask` triggers an assertion in
+  JAX 0.8.1's `splash_attention_mask_info._process_mask`.
 - **Optimal batch at 512-token context (not in external ref):** MaxText/TPU achieves **2,724 tok/s** at BS=352
   (`per_device_batch_size=11`) — see [opt5 results](mimo_v2_flash_opt5_batch_size_scaling.md).
   The shorter context leaves far more HBM for KV cache, enabling 11× more sequences in parallel.
