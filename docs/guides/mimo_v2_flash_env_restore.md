@@ -242,7 +242,7 @@ python3 -m maxtext.inference.scripts.mimo_v2_flash_bench \
   inference_microbenchmark_log_file_path=/tmp/bench_scan.json'
 ```
 
-### 5c. 4K context benchmark — optimal throughput (`per_device_batch_size=11`)
+### 5c. 4K context benchmark — dot_product attention (`per_device_batch_size=11`)
 
 Current best 4K decode configuration. `per_device_batch_size=11` (total batch = 352)
 achieves **2,724 tok/s** at 129.2 ms/step — a 4.72× improvement over the `pdb=1` baseline.
@@ -278,7 +278,7 @@ python3 -m maxtext.inference.scripts.mimo_v2_flash_bench \
 
 Expected: decode median ~129.2 ms · **2,724 tok/s** (batch=352). Result file: `/tmp/bench_pdb11.json`.
 
-### 5d. 16K context benchmark — flash prefill + decode (`per_device_batch_size=3`)
+### 5d. 16K context benchmark — flash attention (`per_device_batch_size=3`)
 
 `attention=dot_product` OOMs at 16K prefill — the score matrix
 `[4, 16, 16384, 16384]×2B ≈ 34 GB/chip` exceeds 31.25 GB HBM.
