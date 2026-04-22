@@ -10,7 +10,7 @@ This document summarises all four validated inference configurations for
 
 | # | Stack | Hardware | Weight format | Status | Output quality |
 |---|---|---|---|---|---|
-| 1 | **MaxText + TPU** | TPU v6e / Ironwood v7 | BF16 (OCDBT checkpoint, FP8 dequantized via `weight_scale_inv`) | ✅ End-to-end generation validated; 129.2 ms/step · 2,724 tok/s at batch=352 (v6e-32, 2026-04-21, `per_device_batch_size=11`); 55.4 ms/step · 577.5 tok/s at batch=32; **16K prefill: 4,686 tok/s / 3,497 ms TTFT** (2026-04-22, `attention=flash`) | Coherent ("420 km" train distance, 2026-04-17, EOS stop); thinking chain may exhaust default `max_new_tokens` before answer — use ≥ 4000 for reliable EOS |
+| 1 | **MaxText + TPU** | TPU v6e / Ironwood v7 | BF16 (OCDBT checkpoint, FP8 dequantized via `weight_scale_inv`) | ✅ End-to-end generation validated; 125.3 ms/step · 2,809 tok/s at batch=352 (v6e-32, 2026-04-22, `per_device_batch_size=11`); 55.2 ms/step · 579.8 tok/s at batch=32; **16K prefill: 4,686 tok/s / 3,497 ms TTFT** (2026-04-22, `attention=flash`) | Coherent ("420 km" train distance, 2026-04-17, EOS stop); thinking chain may exhaust default `max_new_tokens` before answer — use ≥ 4000 for reliable EOS |
 | 2 | **HuggingFace Transformers (CPU)** | AMD EPYC 9B14, 180 vCPUs, 708 GB | BF16 (shard-by-shard FP8→BF16 dequant with `weight_scale_inv`) | ✅ Runs end-to-end | Coherent (`"2. But what if we consider it in a"`) |
 | 3 | **SGLang CPU engine** | AMD EPYC 9B14, 180 vCPUs, 708 GB | FP8→BF16 cast at load (quantization_config=null) | ✅ Runs, 5 patches needed | Garbled (`葭葭葭…`) — FP8 scale tensors stripped |
 | 4 | **llama.cpp (GGUF Q8_0)** | AMD EPYC 9B14, 180 vCPUs, 708 GB | Q8_0 on disk, int8+f32 accumulation in compute | ✅ Runs, no patches needed | Coherent (`"2. But what is 0+0?"`) |
@@ -75,7 +75,7 @@ Our MaxText + TPU v6e-32 measurements are the closest available counterpart.
   (2) train-mode dot_product fallback (`d8fe9fc9`), and (3) disable `LoadBalancedCausalMask` for
   EP_AS_CONTEXT (`ebfcd749`) — `LoadBalancedCausalMask & SWA-LocalMask` triggers an assertion in
   JAX 0.8.1's `splash_attention_mask_info._process_mask`.
-- **Optimal batch at 512-token context (not in external ref):** At 512-token context, MaxText/TPU achieves **2,724 tok/s** at BS=352
+- **Optimal batch at 512-token context (not in external ref):** At 512-token context, MaxText/TPU achieves **2,809 tok/s** at BS=352
   (`per_device_batch_size=11`) — see [opt5 results](mimo_v2_flash_opt5_batch_size_scaling.md).
   The shorter context leaves far more HBM for KV cache, enabling 11× more sequences in parallel.
   This is not directly comparable to the external reference's 4K-context scenes.
@@ -114,8 +114,8 @@ post `jingnw-tpu-op` VM recreation).  All 8 workers print `TPU_IMPORT_OK` after
 restore and the demo exits with code 0.  Proper benchmark (3-step warmup + 50 timed
 steps at batch=32): **55.5 ms/step median**, **576 tok/s**, **1.7 ms/tok/seq**
 (2026-04-17, commit `72f75972`; opt #1 `jax.debug.print` removal + SWA fix).
-Opt5 batch scaling (2026-04-21, commit `711f591f`): **129.2 ms/step**, **2,724 tok/s**,
-**0.37 ms/tok/seq** at `per_device_batch_size=11` (total batch=352, v6e-32).
+Opt5 batch scaling (re-measured 2026-04-22, original commit `711f591f`): **125.3 ms/step**, **2,809 tok/s**,
+**0.36 ms/tok/seq** at `per_device_batch_size=11` (total batch=352, v6e-32).
 The model is prompted via `tokenizer.apply_chat_template()` (`use_chat_template=true`).
 With thinking mode enabled (MiMo-V2-Flash default), the model emits a long reasoning
 chain before the final answer; the default `max_new_tokens` budget is typically
@@ -147,7 +147,7 @@ near-argmax and producing completely garbled token predictions.  Fix: added
 | Prefill (512 tokens) | ~22 s |
 | Demo path throughput (single-sequence, per-step CPU sync) | **~4.3 tok/s** (2026-04-21; thinking chain fills default `max_new_tokens`) |
 | Generation speed (steady-state, batch=32) | 55.5 ms/step · 576 tok/s · 1.7 ms/tok/seq (2026-04-17) |
-| Generation speed (steady-state, batch=352, `per_device_batch_size=11`) | **129.2 ms/step · 2,724 tok/s · 0.37 ms/tok/seq** (2026-04-21, current best) |
+| Generation speed (steady-state, batch=352, `per_device_batch_size=11`) | **125.3 ms/step · 2,809 tok/s · 0.36 ms/tok/seq** (2026-04-22, current best) |
 | HBM per chip after load | ~18.0 GB / 31.25 GB (57.5%) |
 | Parallelism | TP=4 × EP=8 |
 

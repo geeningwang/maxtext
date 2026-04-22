@@ -26,8 +26,7 @@ The commands below assume you are already logged in to the manager VM
 - network: `default`
 - subnetwork: `default`
 - checkpoint for inference (demo): `gs://jingnw-mimo-v2-flash-us-east5/mimo-v2-flash-fixed-ocdbt/checkpoints/0/items`
-- checkpoint for benchmark (`scan_layers=false`): `gs://jingnw-mimo-v2-flash-us-east5/mimo-v2-flash-fixed-ocdbt/checkpoints/0/items`
-- checkpoint for benchmark (`scan_layers=true`): `gs://jingnw-mimo-v2-flash-us-east5/mimo-v2-flash-4phase-stacked/checkpoints/0/items`
+- checkpoint for benchmark: `gs://jingnw-mimo-v2-flash-us-east5/mimo-v2-flash-fixed-ocdbt/checkpoints/0/items`
 - tokenizer: `XiaomiMiMo/MiMo-V2-Flash`
 - benchmark commit: latest `MiMo-V2-Flash` branch HEAD
 
@@ -76,6 +75,14 @@ Verified on 2026-04-15 from worker 0 after a full install via `uv pip install -e
 
 ## 1. Set Local Shell Variables
 
+> **Important:** Shell variables are not persisted between terminal sessions.
+> If you reconnect to `jingnw-tpu-op` or open a new terminal, re-run all
+> exports in this section before running any commands in later sections.
+> The `'"$VAR"'` constructs used in `gcloud ssh --command` strings expand
+> shell variables on the ops VM before the command is sent over SSH — an
+> unset variable silently becomes an empty string and will cause cryptic
+> errors like `could not parse resource []`.
+
 Run this on `jingnw-tpu-op`:
 
 ```bash
@@ -85,7 +92,6 @@ export TAG=MiMo-V2-Flash
 export BENCH_COMMIT=origin/MiMo-V2-Flash
 export CKPT=gs://jingnw-mimo-v2-flash-us-east5/mimo-v2-flash-fixed-ocdbt/checkpoints/0/items
 export BENCH_CKPT=gs://jingnw-mimo-v2-flash-us-east5/mimo-v2-flash-fixed-ocdbt/checkpoints/0/items
-export SCAN_CKPT=gs://jingnw-mimo-v2-flash-us-east5/mimo-v2-flash-4phase-stacked/checkpoints/0/items
 export TOKENIZER=XiaomiMiMo/MiMo-V2-Flash
 
 gcloud config set project tpu-launchpad-playground
@@ -213,41 +219,10 @@ python3 -m maxtext.inference.scripts.mimo_v2_flash_bench \
   inference_microbenchmark_log_file_path=/tmp/bench_pdb1.json'
 ```
 
-### 5b. `scan_layers=true` benchmark (4-phase stacked checkpoint)
-
-Run this on `jingnw-tpu-op`:
-
-```bash
-gcloud compute tpus tpu-vm ssh "$TPU_NAME" --zone "$ZONE" --worker=all \
-  --command='set -e
-. "$HOME/maxtext/maxtext_tpu_venv/bin/activate"
-cd "$HOME/maxtext"
-export PYTHONUNBUFFERED=1
-python3 -m maxtext.inference.scripts.mimo_v2_flash_bench \
-  src/maxtext/configs/base.yml \
-  model_name=mimo-v2-flash \
-  run_name=mimo_v2_flash_scan_bench \
-  load_parameters_path='"$SCAN_CKPT"' \
-  tokenizer_path='"$TOKENIZER"' \
-  max_prefill_predict_length=512 \
-  max_target_length=640 \
-  per_device_batch_size=1 \
-  dtype=bfloat16 \
-  weight_dtype=bfloat16 \
-  ici_tensor_parallelism=4 \
-  ici_expert_parallelism=8 \
-  scan_layers=true \
-  attention=dot_product \
-  checkpoint_storage_use_ocdbt=true \
-  checkpoint_storage_use_zarr3=true \
-  async_checkpointing=false \
-  inference_microbenchmark_log_file_path=/tmp/bench_scan.json'
-```
-
-### 5c. 4K context benchmark — dot_product attention (`per_device_batch_size=11`)
+### 5b. 4K context benchmark — dot_product attention (`per_device_batch_size=11`)
 
 Current best 4K decode configuration. `per_device_batch_size=11` (total batch = 352)
-achieves **2,724 tok/s** at 129.2 ms/step — a 4.72× improvement over the `pdb=1` baseline.
+achieves **2,809 tok/s** at 125.3 ms/step — a 4.84× improvement over the `pdb=1` baseline.
 `pdb=12` OOMs (XLA HLO temp allocation); `pdb=11` is the maximum.
 
 Run this on `jingnw-tpu-op`:
@@ -280,7 +255,7 @@ python3 -m maxtext.inference.scripts.mimo_v2_flash_bench \
 
 Expected: decode median ~125.3 ms · **2,809 tok/s** (batch=352). Result file: `/tmp/bench_pdb11.json`.
 
-### 5d. 16K context benchmark — flash attention (`per_device_batch_size=2`)
+### 5c. 16K context benchmark — flash attention (`per_device_batch_size=2`)
 
 `attention=dot_product` OOMs at 16K prefill — the score matrix
 `[4, 16, 16384, 16384]×2B ≈ 34 GB/chip` exceeds 31.25 GB HBM.
@@ -364,7 +339,23 @@ gcloud compute tpus tpu-vm ssh "$TPU_NAME" --zone "$ZONE" --worker=all \
 ## 7. Read The Benchmark Results
 
 After the run completes (all workers print `BENCH_EXIT=0`), read the JSON
-result from each worker:
+result from each worker.
+
+**5a** (`/tmp/bench_pdb1.json`):
+
+```bash
+gcloud compute tpus tpu-vm ssh "$TPU_NAME" --zone "$ZONE" --worker=all \
+  --command='cat /tmp/bench_pdb1.json 2>/dev/null || echo "no result yet"'
+```
+
+**5b** (`/tmp/bench_pdb11.json`):
+
+```bash
+gcloud compute tpus tpu-vm ssh "$TPU_NAME" --zone "$ZONE" --worker=all \
+  --command='cat /tmp/bench_pdb11.json 2>/dev/null || echo "no result yet"'
+```
+
+**5c** (`/tmp/bench_16k.json`):
 
 ```bash
 gcloud compute tpus tpu-vm ssh "$TPU_NAME" --zone "$ZONE" --worker=all \
@@ -414,57 +405,12 @@ checkpoint: `mimo-v2-flash-fixed-ocdbt`
 - total throughput: about `576 tok/s` (batch=32)
 - per-sequence latency: about `1.7 ms/tok/seq`
 
-### 2026-04-17 — Commit 539cc043 (`scan_layers=true`, stacked checkpoint, bench-only)
-
-> **Note:** The 4-phase decoder code was lost in revert `30fd5e55`.  This
-> benchmark timing is valid but the demo path produces garbled output.
-
-checkpoint: `mimo-v2-flash-4phase-stacked`
-
-- `load_params`: about `34.4–34.5 s` (warm GCS cache)
-- HBM after decode-state init: `17.98 GB / 31.25 GB` per device
-- timed steps: `50`
-- step latency (mean): about `68.3 ms`
-- step latency (median): about `68.3 ms`
-- step latency (min): about `68.0 ms`
-- step latency (p90): about `68.4 ms`
-- total throughput: about `468 tok/s` (batch=32)
-- per-sequence latency: about `2.1 ms/tok/seq`
-
-Results from all 8 workers are nearly identical, which is expected for a
-synchronous collective workload.
-
-### 2026-04-20 — Post-opt4 revert (dense dispatch, `scan_layers=true`, decode + prefill)
-
-checkpoint: `mimo-v2-flash-4phase-stacked`
-
-After reverting the ragged-A2A sparse MoE dispatch (opt4, see plan post-mortem),
-the benchmark now measures both AR decode and prefill in a single run.
-
-**AR Decode:**
-- `load_params`: about `34.7 s`
-- timed steps: `50`
-- step latency (median): about `68.4 ms`
-- step latency (min): about `68.3 ms`
-- total throughput: about `468 tok/s` (batch=32)
-
-**Prefill (seq_len=512):**
-- timed calls: `20`
-- step latency (median): about `121.9 ms`
-- step latency (min): about `121.8 ms`
-- total throughput: about `4,200 tok/s`
-
-The decode result matches the prior `scan_layers=true` baseline (68.3 ms),
-confirming the revert is clean.  The opt4 ragged-A2A implementation measured
-101.5 ms — an 83% regression caused by ICI collective overhead with small
-T=32 during AR decode (see opt4 plan doc for full post-mortem).
-
 ### 2026-04-20 — Post-opt4 revert (dense dispatch, `scan_layers=false`, decode + prefill)
 
 checkpoint: `mimo-v2-flash-fixed-ocdbt`
 
 Re-confirmed dense no-scan baseline on commit `055a4c2d` after full environment
-restore.  Both `scan_layers` modes verified working on the same commit.
+restore.
 
 **AR Decode:**
 - `load_params`: about `40.0 s` (cold GCS cache after restore)
@@ -537,7 +483,6 @@ binary needs 6.13 GB; after `init_decode_state` only 2.83 GB free).
 | Config | Context | `pdb` (BS) | Decode median | Decode throughput | Prefill throughput |
 |---|---|---|---|---|---|
 | `scan_layers=false`, `attention=dot_product` | 512 tok | 1 (32) | 55.4 ms | 577.5 tok/s | 4,144 tok/s |
-| `scan_layers=true`, `attention=dot_product` | 512 tok | 1 (32) | 68.4 ms | 468 tok/s | 4,200 tok/s |
 | **`scan_layers=false`, `attention=dot_product`** | **512 tok** | **11 (352)** | **125.3 ms** | **2,809 tok/s** | same as above |
 | `scan_layers=false`, `attention=dot_product` | 16K tok | 2 (64) | 61.3 ms | 1,044 tok/s | 4,686 tok/s (`attention=flash`) |
 
