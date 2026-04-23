@@ -1590,7 +1590,19 @@ class MaxEngine(_BaseEngine):
     elif metadata.tokenizer_type == TokenizerType.sentencepiece:
       return token_utils.SentencePieceTokenizer(metadata)
     elif metadata.tokenizer_type == TokenizerType.huggingface:
-      tokenizer_model = token_utils.HuggingFaceTokenizer(metadata)
+      # transformers>=5.0 calls list_repo_templates() when token is any non-None value
+      # (including empty string). httpx 0.28+ rejects 'Authorization: Bearer ' (empty
+      # value after Bearer) as an illegal header. Normalize proto3 default "" to None
+      # so no Authorization header is sent for unauthenticated public models.
+      class _HuggingFaceTokenizerCompat(token_utils.HuggingFaceTokenizer):  # pylint: disable=invalid-name
+        """Compat subclass: normalizes empty access_token to None."""
+
+        def __init__(self, md):
+          from transformers import AutoTokenizer  # pylint: disable=import-outside-toplevel
+          self.tokenizer = AutoTokenizer.from_pretrained(md.path, token=md.access_token or None)
+          self.metadata = md
+
+      tokenizer_model = _HuggingFaceTokenizerCompat(metadata)
       if tokenizer_model.tokenizer.pad_token_id is None:
         if tokenizer_model.tokenizer.unk_token_id is not None:
           tokenizer_model.tokenizer.pad_token_id = tokenizer_model.tokenizer.unk_token_id
