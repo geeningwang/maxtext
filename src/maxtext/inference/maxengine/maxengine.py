@@ -1595,12 +1595,58 @@ class MaxEngine(_BaseEngine):
       # value after Bearer) as an illegal header. Normalize proto3 default "" to None
       # so no Authorization header is sent for unauthenticated public models.
       class _HuggingFaceTokenizerCompat(token_utils.HuggingFaceTokenizer):  # pylint: disable=invalid-name
-        """Compat subclass: normalizes empty access_token to None."""
+        """Compat subclass for transformers>=5.0.
+
+        Fixes two breaking changes vs transformers 4.x:
+        1. Normalizes empty access_token ('') to None so no 'Authorization: Bearer '
+           header is sent (httpx 0.28+ rejects empty Bearer values).
+        2. Overrides encode() to handle BatchEncoding returned by apply_chat_template()
+           when return_tensors is specified (transformers>=5.0 changed return type from
+           a plain numpy array to BatchEncoding; JetStream's .squeeze() call fails).
+        """
 
         def __init__(self, md):
           from transformers import AutoTokenizer  # pylint: disable=import-outside-toplevel
           self.tokenizer = AutoTokenizer.from_pretrained(md.path, token=md.access_token or None)
           self.metadata = md
+
+        def encode(self, s, **kwargs):
+          """Tokenize string, handling BatchEncoding from transformers>=5.0."""
+          import numpy as np  # pylint: disable=import-outside-toplevel
+          from jetstream.engine.token_utils import pad_tokens  # pylint: disable=import-outside-toplevel
+          is_bos = kwargs.pop("is_bos", True)
+          prefill_lengths = kwargs.pop("prefill_lengths", None)
+          max_prefill_length = kwargs.pop("max_prefill_length", None)
+          jax_padding = kwargs.pop("jax_padding", True)
+
+          if getattr(self.metadata, "use_chat_template", False):
+            result = self.tokenizer.apply_chat_template(
+                [{"role": "user", "content": s}],
+                add_generation_prompt=True,
+                return_tensors="np",
+            )
+            # transformers>=5.0: apply_chat_template returns BatchEncoding when
+            # return_tensors is set; extract input_ids to get the numpy array.
+            if not isinstance(result, np.ndarray):
+              result = result["input_ids"]
+            tokens = result.squeeze()
+            is_bos = False
+          else:
+            result = self.tokenizer.encode(s, add_special_tokens=False, return_tensors="np")
+            if not isinstance(result, np.ndarray):
+              result = result["input_ids"]
+            tokens = result.squeeze()
+
+          tokens, true_length = pad_tokens(
+              tokens,
+              self.bos_id,
+              self.pad_id,
+              is_bos=is_bos,
+              prefill_lengths=prefill_lengths,
+              max_prefill_length=max_prefill_length,
+              jax_padding=jax_padding,
+          )
+          return tokens, true_length
 
       tokenizer_model = _HuggingFaceTokenizerCompat(metadata)
       if tokenizer_model.tokenizer.pad_token_id is None:
