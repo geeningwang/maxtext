@@ -192,13 +192,16 @@ The dedicated benchmark script runs 3 warmup steps followed by 50 timed
 `engine.generate()` steps and writes a JSON result file to the path given in
 `inference_microbenchmark_log_file_path`.
 
-### 5a. 4K context benchmark — dot_product attention (`per_device_batch_size=20`)
+### 5a. 4K/1K benchmark — flash+context attention (`per_device_batch_size=9`)
 
-Current best 4K decode configuration. `per_device_batch_size=20` (total batch = 640)
-achieves **3,322 tok/s** at 192.7 ms/step — a 5.75× improvement over the `pdb=1` baseline.
-`pdb=24` OOMs (XLA HLO temp allocation needs 598.88 MB, 581.92 MB free); `pdb=20` is the maximum.
-The SWA KV cache fix (`b6a3d096`) freed HBM previously consumed by 39 SWA layers storing
-full 512-slot padded prefill windows, raising the ceiling from the former pdb=11.
+Correct 4K/1K configuration: 4096-token input, 1024-token max generation (total KV capacity = 5120).
+`per_device_batch_size=9` (total batch = 288) achieves **2,536 tok/s** at 113.6 ms/step.
+pdb=10 OOMs during XLA decode compile (339 MB needed, 241 MB free); pdb=9 is the maximum.
+Prefill at 4096 tokens: 823 ms TTFT · **4,977 tok/s** (single sequence).
+
+> **Note on the former 5a benchmark (`max_target_length=640`, `pdb=20`, 3,322 tok/s):**
+> That config used only 512 prefill + 128 decode tokens, not the 4K/1K scene.
+> It is preserved in the reference results below for historical comparison.
 
 Run this on `jingnw-tpu-op`:
 
@@ -211,24 +214,25 @@ export PYTHONUNBUFFERED=1
 python3 -m maxtext.inference.scripts.mimo_v2_flash_bench \
   src/maxtext/configs/base.yml \
   model_name=mimo-v2-flash \
-  run_name=mimo_v2_flash_bench_pdb20 \
+  run_name=mimo_v2_flash_bench_4k1k_pdb9 \
   load_parameters_path='"$BENCH_CKPT"' \
   tokenizer_path='"$TOKENIZER"' \
-  max_prefill_predict_length=512 \
-  max_target_length=640 \
-  per_device_batch_size=20 \
+  max_prefill_predict_length=4096 \
+  max_target_length=5120 \
+  per_device_batch_size=9 \
   dtype=bfloat16 \
   weight_dtype=bfloat16 \
   ici_tensor_parallelism=4 \
   ici_expert_parallelism=8 \
   scan_layers=false \
-  attention=dot_product \
+  attention=flash \
+  expert_shard_attention_option=context \
   checkpoint_storage_use_ocdbt=true \
   checkpoint_storage_use_zarr3=true \
-  inference_microbenchmark_log_file_path=/tmp/bench_pdb20.json'
+  inference_microbenchmark_log_file_path=/tmp/bench_4k1k_pdb9.json'
 ```
 
-Expected: decode median ~192.7 ms · **3,322 tok/s** (batch=640); prefill median ~123.8 ms · **4,137 tok/s** (512 tok). Result file: `/tmp/bench_pdb20.json`.
+Expected: decode median ~113.6 ms · **2,536 tok/s** (batch=288); prefill median ~823 ms · **4,977 tok/s** (4096 tok). Result file: `/tmp/bench_4k1k_pdb9.json`.
 
 ### 5b. 16K context benchmark — flash attention (`per_device_batch_size=2`)
 
@@ -281,8 +285,14 @@ python3 -m maxtext.inference.scripts.mimo_v2_flash_bench \
   inference_microbenchmark_log_file_path=/tmp/bench_16k.json'
 ```
 
-Expected: decode median ~61.3 ms · **1,044 tok/s** (batch=64); prefill median ~3,497 ms TTFT · **4,686 tok/s**.
-Result file: `/tmp/bench_16k.json` (contains both `decode` and `prefill` keys).
+Expected: decode median ~71.0 ms · **1,353 tok/s** (batch=96); prefill at pdb=1: ~3,372 ms TTFT · **4,860 tok/s**.
+Result file: `/tmp/bench_16k.json` (decode phase only; prefill requires separate pdb=1 run — see note below).
+
+> **16K/1K prefill note:** The XLA prefill JIT program for 16384-token sequences requires 6.13 GB
+> of HBM scratch space. At pdb=3 (max decode batch), only 2.94 GB is free — not enough.
+> To benchmark prefill, run a **separate** job with `per_device_batch_size=1` and
+> `inference_microbenchmark_log_file_path=/tmp/bench_16k1k_pdb1.json`.
+> In real serving, prefill and decode run as separate phases so this is not a practical constraint.
 
 Expected progress markers printed to stdout as the job runs:
 
@@ -316,11 +326,11 @@ gcloud compute tpus tpu-vm ssh "$TPU_NAME" --zone "$ZONE" --worker=all \
 After the run completes (all workers print `BENCH_EXIT=0`), read the JSON
 result from each worker.
 
-**5a** (`/tmp/bench_pdb20.json`):
+**5a** (`/tmp/bench_4k1k_pdb9.json`):
 
 ```bash
 gcloud compute tpus tpu-vm ssh "$TPU_NAME" --zone "$ZONE" --worker=all \
-  --command='cat /tmp/bench_pdb20.json 2>/dev/null || echo "no result yet"'
+  --command='cat /tmp/bench_4k1k_pdb9.json 2>/dev/null || echo "no result yet"'
 ```
 
 **5b** (`/tmp/bench_16k.json`):
@@ -431,7 +441,7 @@ checkpoint: `mimo-v2-flash-fixed-ocdbt`
 
 The SWA KV cache fix stores only actual prompt tokens (up to window size) in the
 39 SWA layer prefill caches, freeing HBM previously used by padding slots. This
-raised the 4K decode ceiling from pdb=11 to pdb=20.
+raised the 4K decode ceiling from pdb=11 to pdb=20 (with `max_target=640`, not the 4K/1K scene).
 
 | pdb | Batch | Decode median | Decode throughput |
 |---|---|---|---|
@@ -450,8 +460,8 @@ see perf doc opt #12 for full details.
 
 **16K Prefill (`attention=flash`, `expert_shard_attention_option=context`, pdb=1):**
 - timed steps: `20`
-- step latency (median): about `3,497 ms` TTFT
-- total throughput: about `4,686 tok/s`
+- step latency (median): about `3,372 ms` TTFT
+- total throughput: about `4,860 tok/s`
 
 ### 2026-04-22 — 16K decode (`per_device_batch_size=2`)
 
@@ -463,6 +473,24 @@ binary needs 6.13 GB; after `init_decode_state` only 2.83 GB free).
 - step latency (median): about `61.3 ms`
 - total throughput: about `1,044 tok/s`
 - per-sequence latency: about `0.96 ms/tok/seq`
+
+### 2026-04-23 — Correct 4K/1K and 16K/1K benchmarks (commit `961094af`)
+
+checkpoint: `mimo-v2-flash-fixed-ocdbt`. All scenes use `attention=flash`,
+`expert_shard_attention_option=context`. `max_prefill/max_target` now match the
+external reference scene definitions.
+
+**5a — 4K/1K decode (`max_prefill=4096, max_target=5120`, pdb=9, batch=288):**
+- `load_params`: ~35–36 s (warm GCS cache)
+- AR Decode: median `113.6 ms`, throughput `2,536 tok/s`
+- Prefill (4096 tok): median `823.0 ms`, throughput `4,977 tok/s`
+- pdb=10 OOMs (XLA compile: 339 MB needed, 241 MB free)
+
+**5b — 16K/1K decode (`max_prefill=16384, max_target=17408`, pdb=3, batch=96):**
+- `load_params`: ~42–43 s (warm GCS cache)
+- AR Decode: median `71.0 ms`, throughput `1,353 tok/s`
+- Prefill (16384 tok) at pdb=1: median `3,372 ms` TTFT, throughput `4,860 tok/s`
+- pdb=4 OOMs (decode state). Prefill at pdb=3 OOMs (6.13 GB needed, 2.94 GB free).
 
 ### 2026-04-23 — Full restore re-run on commit `043b2e64` (cold GCS cache, new cluster)
 
@@ -480,13 +508,14 @@ section 0.
 - AR Decode: median `62.4 ms`, throughput `1,025.0 tok/s` (batch=64)
 - Prefill (16K tok): median `3,492.8 ms` TTFT, throughput `4,690.8 tok/s`
 
-### Summary of all validated baselines (as of 2026-04-22, commit `ebfcd749`)
+### Summary of all validated baselines (as of 2026-04-23, commit `961094af`)
 
-| Config | Context | `pdb` (BS) | Decode median | Decode throughput | Prefill throughput |
+| Config | Scene | `pdb` (BS) | Decode median | Decode throughput | Prefill throughput |
 |---|---|---|---|---|---|
-| `scan_layers=false`, `attention=dot_product` | 512 tok | 1 (32) | 55.4 ms | 577.5 tok/s | 4,144 tok/s |
-| **`scan_layers=false`, `attention=dot_product`** | **512 tok** | **20 (640)** | **192.7 ms** | **3,322 tok/s** | same as above |
-| `scan_layers=false`, `attention=dot_product` | 16K tok | 2 (64) | 61.3 ms | 1,044 tok/s | 4,686 tok/s (`attention=flash`) |
+| `attention=dot_product` | 512-tok context | 1 (32) | 55.4 ms | 577.5 tok/s | 4,144 tok/s |
+| `attention=dot_product`, `max_target=640` | 512+128 tok (legacy) | 20 (640) | 192.7 ms | 3,322 tok/s | 4,137 tok/s |
+| **`attention=flash`+context** | **4K / 1K** | **9 (288)** | **113.6 ms** | **2,536 tok/s** | **4,977 tok/s (4096 tok)** |
+| **`attention=flash`+context** | **16K / 1K** | **3 (96)** | **71.0 ms** | **1,353 tok/s** | **4,860 tok/s (16384 tok, pdb=1)** |
 
 ### Prior Reference Result For Commit 5ad76eac (regression baseline)
 
