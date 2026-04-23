@@ -1238,9 +1238,19 @@ def get_prefill_kv_cache_annotations(model, config, rng, mesh, page_state: None 
   """Get a shaped abstraction of the state (including optimizer)"""
 
   def init_kv_cache(model, config):
+    # When chunked prefill is enabled the model is called one chunk at a time,
+    # so the traced input length must equal the chunk size (not the full
+    # max_prefill_predict_length).  Using the full length would give a
+    # non-square attention mask (Q=max_prefill, KV=chunk_size) which causes
+    # splash attention mask preprocessing to fail with an empty-list error.
+    prefill_input_len = (
+        config.prefill_chunk_size
+        if config.use_chunked_prefill
+        else config.max_prefill_predict_length
+    )
     input_shape = (
         config.micro_batch_size_to_train_on,
-        config.max_prefill_predict_length,
+        prefill_input_len,
     )
     image_shape = mm_processor.get_dummy_image_shape_for_init(
         config.model_name, batch_size=config.micro_batch_size_to_train_on
