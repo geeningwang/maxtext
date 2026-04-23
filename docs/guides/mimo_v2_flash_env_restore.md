@@ -347,8 +347,10 @@ Default settings unless noted: `jingnw-node` (v6e-32),
 See individual subsections for `per_device_batch_size`, `max_target_length`, and `attention` values.
 
 > **Note on `load_params` time:** The first run after a full environment restore
-> hits a cold GCS cache and takes noticeably longer (~40 s). Subsequent runs on
-> the same cluster use a warm cache and return to the ~29–30 s baseline.
+> hits a cold GCS cache and takes noticeably longer (~40–50 s, depending on
+> configuration — 5a ≈ 42 s, 5b ≈ 50 s due to larger 16K KV allocation).
+> Subsequent runs on the same cluster use a warm cache and return to the
+> ~29–30 s baseline.
 
 ### 2026-04-17 — Commit 1a6b9579 (cold GCS cache, post-restore)
 
@@ -462,6 +464,22 @@ binary needs 6.13 GB; after `init_decode_state` only 2.83 GB free).
 - total throughput: about `1,044 tok/s`
 - per-sequence latency: about `0.96 ms/tok/seq`
 
+### 2026-04-23 — Full restore re-run on commit `043b2e64` (cold GCS cache, new cluster)
+
+checkpoint: `mimo-v2-flash-fixed-ocdbt`. Full environment restore from scratch
+(new TPU cluster + ops VM). All package versions confirmed matching the table in
+section 0.
+
+**5a — `scan_layers=false`, `attention=dot_product`, pdb=20, 4K context:**
+- `load_params`: `42.6 s` (cold GCS cache)
+- AR Decode: median `192.4 ms`, throughput `3,326.6 tok/s` (batch=640)
+- Prefill (512 tok): median `123.8 ms`, throughput `4,137–4,138 tok/s`
+
+**5b — `scan_layers=false`, `attention=flash`, pdb=2, 16K context:**
+- `load_params`: `50.6 s` (cold GCS cache; higher than 5a due to 16K KV allocation)
+- AR Decode: median `62.4 ms`, throughput `1,025.0 tok/s` (batch=64)
+- Prefill (16K tok): median `3,492.8 ms` TTFT, throughput `4,690.8 tok/s`
+
 ### Summary of all validated baselines (as of 2026-04-22, commit `ebfcd749`)
 
 | Config | Context | `pdb` (BS) | Decode median | Decode throughput | Prefill throughput |
@@ -543,13 +561,12 @@ The benchmark module always prints `[BENCH]` markers and does not accept a
 
 ### The demo script (`mimo_v2_flash_demo_jax.py`) produces garbled or repetitive output
 
-This is a known limitation on current HEAD. The demo uses nucleus sampling
-(top_p=0.95, temperature=0.6) with no EOS stopping condition, so the model
-degenerates into repetitive tokens once it passes the natural end of its answer.
-Example: the response starts correctly then repeats phrases like
-`取得以及 Ağust取得以及...` indefinitely.
+> **Note:** This issue was resolved on commit `043b2e64`. The demo now fires EOS
+> cleanly (`Status: EOS fired (clean stop)`) and produces correct output. If you
+> see this on a fresh restore, verify you are on the latest `MiMo-V2-Flash` HEAD.
 
-This does **not** affect benchmark measurements — the benchmark script
-(`mimo_v2_flash_bench`) measures `engine.generate()` step latency, not output
-quality. The demo is only useful for verifying that the model loads and produces
-non-crash output; treat the generated text as a sanity-check only.
+In earlier revisions the demo used nucleus sampling (top_p=0.95, temperature=0.6)
+with no EOS stopping condition, causing the model to degenerate into repetitive
+tokens after the natural end of the answer (e.g. `取得以及 Ağust取得以及...`).
+This has been fixed. Benchmark measurements (`mimo_v2_flash_bench`) are not
+affected either way — they measure `engine.generate()` step latency only.
