@@ -980,6 +980,31 @@ class AttentionOp(nnx.Module):
               wv_product_einsum=wv_product_einsum,
           )
 
+        if model_mode == MODEL_MODE_PREFILL and self.config.use_chunked_prefill:
+          # fallback to dot_product for chunked prefill because:
+          #   1. splash CausalMask has no position-offset support: for chunks beyond the first
+          #      (previous_chunk is not None), the true causal mask is shifted by the previous
+          #      KV length, but splash always starts from position 0 → incorrect attention.
+          #   2. With EP_AS_CONTEXT (expert_shard_attention_option=context), the splash kernel
+          #      internal Q-block partitioning via manual_sharding_spec(EP) requires at least
+          #      q_len / block_q / EP_size ≥ 4 Q blocks per device. Short chunk sizes
+          #      (e.g. prefill_chunk_size=4096 < block_q * EP * 4) violate this and cause
+          #      ValueError: need at least one array to concatenate in make_splash_mha.
+          #   dot_product correctly handles the previous_chunk offset via mask slicing.
+          return self.apply_attention_dot(
+              query,
+              key,
+              value,
+              decoder_segment_ids,
+              model_mode,
+              previous_chunk,
+              bidirectional_mask=bidirectional_mask,
+              record_max_logits=record_max_logits,
+              swa_next_pos=swa_next_pos,
+              qk_product_einsum=qk_product_einsum,
+              wv_product_einsum=wv_product_einsum,
+          )
+
         out, max_logits = self.tpu_flash_attention(
             query,
             key,
