@@ -559,6 +559,23 @@ class KVCache(BaseCache):
         f"> max length[{self.max_prefill_length}]"
     )
 
+    # MLA compatibility: the prefill cache is initialised with the compressed KV head
+    # count (e.g. 1 head for MLA latent KV), but key/value carry the full decompressed
+    # head count.  dynamic_update_slice requires all non-sliced axes to match exactly,
+    # so we rebuild the cache buffer with the correct head shape when they differ.
+    # Shape is a static property known at trace time so this branch is zero-cost at
+    # runtime.  On the first chunk (next_pos=0) this produces a zeros buffer of the
+    # right shape; on subsequent chunks the cache was already written with the correct
+    # head count so the shapes match and this is a no-op.
+    if cached_key_value.shape != key_shaped_for_cache.shape:
+      corrected_key_shape = list(key_shaped_for_cache.shape)
+      corrected_key_shape[cache_seq_axis] = cached_key_value.shape[cache_seq_axis]
+      cached_key_value = jnp.zeros(corrected_key_shape, dtype=cached_key_value.dtype)
+    if cached_value_value.shape != value_shaped_for_cache.shape:
+      corrected_value_shape = list(value_shaped_for_cache.shape)
+      corrected_value_shape[cache_seq_axis] = cached_value_value.shape[cache_seq_axis]
+      cached_value_value = jnp.zeros(corrected_value_shape, dtype=cached_value_value.dtype)
+
     # We don't zero out remain values. Use segment id to mask out.
     cached_prefill_key_vars[0].value = jax.lax.dynamic_update_slice_in_dim(
         cached_key_value, key_shaped_for_cache, next_pos, cache_seq_axis
