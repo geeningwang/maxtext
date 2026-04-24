@@ -171,6 +171,8 @@ python -c "import maxtext; print(\"TPU_IMPORT_OK\")"'
 
 ## 4. Smoke Test The JAX Demo
 
+### 4a. Default 512-token prefill
+
 Run this on `jingnw-tpu-op`:
 
 ```bash
@@ -188,6 +190,35 @@ Expected result: the model loads, runs prefill and generate, and exits with code
 workers. EOS fires cleanly (no `WARNING: EOS never fired` message). The output is a
 step-by-step solution to the math problem, ending with "The total distance traveled is
 420 km." Throughput is approximately 2.3 tok/s.
+
+### 4b. 16K chunked prefill smoke test
+
+Exercises the chunked prefill code path (4 × 4096-token chunks, pdb=1).
+Uses `--use_chunked_prefill` and `--prefill_chunk_size 4096` flags added to the demo.
+
+Run this on `jingnw-tpu-op`:
+
+```bash
+gcloud compute tpus tpu-vm ssh "$TPU_NAME" --zone "$ZONE" --worker=all --command='set -e
+. "$HOME/maxtext/maxtext_tpu_venv/bin/activate"
+cd "$HOME/maxtext"
+python demos/mimo_v2_flash_demo_jax.py \
+  --checkpoint_path '"$CKPT"' \
+  --tokenizer_path '"$TOKENIZER"' \
+  --ici_tensor_parallelism 4 \
+  --ici_expert_parallelism 8 \
+  --max_prefill 16384 \
+  --max_new_tokens 1024 \
+  --use_chunked_prefill \
+  --prefill_chunk_size 4096'
+```
+
+Expected result: EOS fires cleanly. The primary worker (rank 0) outputs the correct
+step-by-step solution ending with "420 km". Non-primary workers may show partial/different
+text because they receive only shard-local logits in the EP=8 distributed setup.
+Throughput is approximately 5–6 tok/s (pdb=1, single sequence).
+
+Validated 2026-04-24 on commit `fcc915f8` (branch `feature/chunked-prefill-16k`).
 
 ## 5. Run The Dedicated TPU Performance Benchmark
 
