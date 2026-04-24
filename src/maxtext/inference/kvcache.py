@@ -553,11 +553,38 @@ class KVCache(BaseCache):
     seq_axis = self.prefill_cache_logical_axis_names.index(CACHE_SEQUENCE)
     cache_seq_axis = self.prefill_cache_axis_order.index(seq_axis)
 
-    assert next_pos + key_shaped_for_cache.shape[cache_seq_axis] <= self.max_prefill_length, (
-        f"Previous kv cache[{next_pos}] + "
-        f"current kv cache[{key_shaped_for_cache.shape[cache_seq_axis]}] "
-        f"> max length[{self.max_prefill_length}]"
-    )
+    # `_prefill_cache_len` equals `swa_window_size` for SWA attention layers and
+    # `max_prefill_length` for global layers.  For SWA layers the cache can be
+    # much smaller than `chunk_size` (e.g. window=128, chunk=4096), so we must
+    # truncate the write to the last `cache_len` tokens and always write at slot 0.
+    cache_len = self._prefill_cache_len
+    chunk_seq_len = key_shaped_for_cache.shape[cache_seq_axis]
+
+    if self.swa_window_size > 0 and chunk_seq_len > cache_len:
+      # SWA: current chunk completely fills/overflows the cache.
+      # Keep only the last cache_len tokens; they represent the most recent window.
+      src_start = chunk_seq_len - cache_len
+      key_shaped_for_cache = jax.lax.dynamic_slice_in_dim(
+          key_shaped_for_cache, src_start, cache_len, axis=cache_seq_axis
+      )
+      value_shaped_for_cache = jax.lax.dynamic_slice_in_dim(
+          value_shaped_for_cache, src_start, cache_len, axis=cache_seq_axis
+      )
+      if decoder_segment_ids is not None:
+        decoder_segment_ids = jax.lax.dynamic_slice_in_dim(decoder_segment_ids, src_start, cache_len, axis=1)
+        segment_id_seq_len = cache_len
+      cache_write_pos = 0
+    else:
+      assert next_pos + chunk_seq_len <= self.max_prefill_length, (
+          f"Previous kv cache[{next_pos}] + "
+          f"current kv cache[{chunk_seq_len}] "
+          f"> max length[{self.max_prefill_length}]"
+      )
+      cache_write_pos = next_pos
+
+    # After SWA truncation, key_shaped_for_cache.shape[cache_seq_axis] is the number
+    # of tokens we will actually write.
+    written_seq_len = key_shaped_for_cache.shape[cache_seq_axis]
 
     # MLA compatibility: the prefill cache is initialised with the compressed KV head
     # count (e.g. 1 head for MLA latent KV), but key/value carry the full decompressed
@@ -578,34 +605,36 @@ class KVCache(BaseCache):
 
     # We don't zero out remain values. Use segment id to mask out.
     cached_prefill_key_vars[0].value = jax.lax.dynamic_update_slice_in_dim(
-        cached_key_value, key_shaped_for_cache, next_pos, cache_seq_axis
+        cached_key_value, key_shaped_for_cache, cache_write_pos, cache_seq_axis
     )
     cached_prefill_value_vars[0].value = jax.lax.dynamic_update_slice_in_dim(
-        cached_value_value, value_shaped_for_cache, next_pos, cache_seq_axis
+        cached_value_value, value_shaped_for_cache, cache_write_pos, cache_seq_axis
     )
 
     if decoder_segment_ids is not None:
       # Need zero out the remain values to prevent wrong mask in autoregressive.
-      previous_segment_id = cached_prefill_segment_id_var.value[:, :next_pos]
+      previous_segment_id = cached_prefill_segment_id_var.value[:, :cache_write_pos]
       cached_prefill_segment_id_var.value = jnp.zeros_like(cached_prefill_segment_id_var.value, dtype=jnp.int32)
+      if cache_write_pos > 0:
+        cached_prefill_segment_id_var.value = jax.lax.dynamic_update_slice_in_dim(
+            cached_prefill_segment_id_var.value, previous_segment_id, start_index=0, axis=1
+        )
       cached_prefill_segment_id_var.value = jax.lax.dynamic_update_slice_in_dim(
-          cached_prefill_segment_id_var.value, previous_segment_id, start_index=0, axis=1
-      )
-      cached_prefill_segment_id_var.value = jax.lax.dynamic_update_slice_in_dim(
-          cached_prefill_segment_id_var.value, decoder_segment_ids, next_pos, axis=1
+          cached_prefill_segment_id_var.value, decoder_segment_ids, cache_write_pos, axis=1
       )
 
-    # Return needed kv cache to reduce computation of attention.
+    # Return the portion of the cache that holds valid tokens for this attention step.
+    return_seq_len = cache_write_pos + written_seq_len
     needed_prefill_key_value = jax.lax.dynamic_slice_in_dim(
-        cached_prefill_key_vars[0].value, start_index=0, slice_size=(next_pos + self.key_seq_len), axis=cache_seq_axis
+        cached_prefill_key_vars[0].value, start_index=0, slice_size=return_seq_len, axis=cache_seq_axis
     )
     needed_prefill_value_value = jax.lax.dynamic_slice_in_dim(
-        cached_prefill_value_vars[0].value, start_index=0, slice_size=(next_pos + self.value_seq_len), axis=cache_seq_axis
+        cached_prefill_value_vars[0].value, start_index=0, slice_size=return_seq_len, axis=cache_seq_axis
     )
     needed_segment_id = None
     if decoder_segment_ids is not None:
       needed_segment_id = jax.lax.dynamic_slice_in_dim(
-          cached_prefill_segment_id_var.value, start_index=0, slice_size=(next_pos + segment_id_seq_len), axis=1
+          cached_prefill_segment_id_var.value, start_index=0, slice_size=return_seq_len, axis=1
       )
 
     return (
