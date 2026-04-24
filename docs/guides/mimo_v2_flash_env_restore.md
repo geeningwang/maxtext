@@ -66,8 +66,11 @@ Verified on 2026-04-22 from worker 0 after a full install via sections 2–3
    Targeting a single worker will cause the collective to hang indefinitely.
 3. Do not use `pkill` in this environment. If you must stop a process, find the
    exact PID and use `kill <pid>`.
-4. For multi-worker SSH commands, run `ssh-add ~/.ssh/google_compute_engine`
-  on `jingnw-tpu-op` first.
+4. For multi-worker SSH commands, ensure the SSH agent is running and the key
+  is loaded on `jingnw-tpu-op` first: `eval "$(ssh-agent -s)" && ssh-add ~/.ssh/google_compute_engine`.
+  Running `ssh-add` alone fails with "Could not open a connection to your authentication agent"
+  if the agent was not started. SSH 255 return codes from `gcloud tpu-vm ssh --worker=all`
+  are almost always caused by a missing or expired agent.
 5. When polling a long-running benchmark, check every 20 to 30 seconds. Do not
    use long sleeps.
 6. At startup, each worker prints exactly 8 lines (one per device) like
@@ -285,8 +288,8 @@ python3 -m maxtext.inference.scripts.mimo_v2_flash_bench \
   inference_microbenchmark_log_file_path=/tmp/bench_16k.json'
 ```
 
-Expected: decode median ~71.0 ms · **1,353 tok/s** (batch=96); prefill at pdb=1: ~3,372 ms TTFT · **4,860 tok/s**.
-Result file: `/tmp/bench_16k.json` (decode phase only; prefill requires separate pdb=1 run — see note below).
+Expected: decode median ~62–63 ms · **1,025 tok/s** (batch=64, pdb=2); prefill median ~3,493 ms TTFT · **4,691 tok/s**.
+Result file: `/tmp/bench_16k.json`.
 
 > **16K/1K prefill note:** The XLA prefill JIT program for 16384-token sequences requires 6.13 GB
 > of HBM scratch space. At pdb=3 (max decode batch), only 2.94 GB is free — not enough.
@@ -508,7 +511,44 @@ section 0.
 - AR Decode: median `62.4 ms`, throughput `1,025.0 tok/s` (batch=64)
 - Prefill (16K tok): median `3,492.8 ms` TTFT, throughput `4,690.8 tok/s`
 
-### Summary of all validated baselines (as of 2026-04-23, commit `961094af`)
+### 2026-04-24 — 5a/5b re-run confirming baselines (commit `1b4cd37d`, warm GCS cache)
+
+checkpoint: `mimo-v2-flash-fixed-ocdbt`. Branch `feature/chunked-prefill-16k`.
+Chunked-prefill fixes present but not exercised by 5a/5b (both use non-chunked prefill).
+Baselines are stable and identical to the 2026-04-23 reference.
+
+**5a — 4K/1K (`max_prefill=4096, max_target=5120`, pdb=9, batch=288):**
+- `load_params`: `39.2 s` (warm GCS cache)
+- AR Decode: median `113.5 ms`, throughput `2,536 tok/s`
+- Prefill (4096 tok): median `823.0 ms`, throughput `4,977 tok/s`
+
+**5b — 16K/1K (`max_prefill=16384, max_target=17408`, pdb=2, batch=64):**
+- `load_params`: `45.7 s` (warm GCS cache)
+- AR Decode: median `62.5 ms`, throughput `1,025 tok/s`
+- Prefill (16384 tok): median `3,493.0 ms` TTFT, throughput `4,691 tok/s`
+
+### 2026-04-24 — 16K/1K chunked prefill at pdb=3 (commit `1b4cd37d`)
+
+checkpoint: `mimo-v2-flash-fixed-ocdbt`. Branch `feature/chunked-prefill-16k`.
+Five bugs fixed across this branch (MLA shape, non-square trace, splash+EP_AS_CONTEXT,
+SWA cache overflow, SWA attention mask). Config: `use_chunked_prefill=true`,
+`prefill_chunk_size=4096` (4 × 4096 = 16384 token prompt processed in 4 serial chunks).
+`attention=dot_product` forced for chunked prefill (splash incompatible with chunk offsets).
+
+**AR Decode (16K context, pdb=3, batch=96):**
+- `load_params`: `40.9 s` (warm GCS cache)
+- step latency (median): `71.1 ms`
+- throughput: `1,349 tok/s`
+- per-sequence latency: `0.74 ms/tok/seq`
+
+**Chunked Prefill (seq_len=16384, 4 × 4096-token chunks):**
+- step latency (median): `5,521.6 ms` TTFT
+- throughput: `2,967 tok/s`
+- Note: ~64% slower TTFT than non-chunked flash (3,493 ms) because dot_product
+  is used (no NxN score matrix tiling) and chunks are processed serially.
+  Win: pdb=3 decode batch no longer OOMs during prefill.
+
+### Summary of all validated baselines (as of 2026-04-24, commit `1b4cd37d`)
 
 | Config | Scene | `pdb` (BS) | Decode median | Decode throughput | Prefill throughput |
 |---|---|---|---|---|---|
@@ -516,6 +556,7 @@ section 0.
 | `attention=dot_product`, `max_target=640` | 512+128 tok (legacy) | 20 (640) | 192.7 ms | 3,322 tok/s | 4,137 tok/s |
 | **`attention=flash`+context** | **4K / 1K** | **9 (288)** | **113.6 ms** | **2,536 tok/s** | **4,977 tok/s (4096 tok)** |
 | **`attention=flash`+context** | **16K / 1K** | **3 (96)** | **71.0 ms** | **1,353 tok/s** | **4,860 tok/s (16384 tok, pdb=1)** |
+| **chunked prefill (4×4096), dot_product** | **16K / 1K** | **3 (96)** | **71.1 ms** | **1,349 tok/s** | **2,967 tok/s (chunked, 5,522 ms TTFT)** |
 
 ### Prior Reference Result For Commit 5ad76eac (regression baseline)
 
