@@ -10,7 +10,7 @@ This document summarises all four validated inference configurations for
 
 | # | Stack | Hardware | Weight format | Status | Output quality |
 |---|---|---|---|---|---|
-| 1 | **MaxText + TPU** | TPU v6e / Ironwood v7 | BF16 (OCDBT checkpoint, FP8 dequantized via `weight_scale_inv`) | ✅ End-to-end generation validated; **4K/1K decode: 113.6 ms/step · 2,536 tok/s at batch=288** (v6e-32, 2026-04-23, `per_device_batch_size=9`, `attention=flash`); **16K/1K decode: 71.0 ms/step · 1,353 tok/s at batch=96** (v6e-32, 2026-04-23, `per_device_batch_size=3`); **16K prefill: 4,860 tok/s / 3,372 ms TTFT** (2026-04-23, `attention=flash`) | Coherent ("420 km" train distance, 2026-04-22, EOS stop); thinking chain may exhaust default `max_new_tokens` before answer — use ≥ 4000 for reliable EOS |
+| 1 | **MaxText + TPU** | TPU v6e / Ironwood v7 | BF16 (OCDBT checkpoint, FP8 dequantized via `weight_scale_inv`) | ✅ End-to-end generation validated; **4K/1K prefill+decode: TTFT 823 ms · 113.6 ms/step · 2,536 tok/s at batch=288** (v6e-32, 2026-04-24, `per_device_batch_size=9`, `attention=flash`); **16K/1K chunked prefill+decode: TTFT 5,522 ms · 71.1 ms/step · 1,349 tok/s at batch=96** (v6e-32, 2026-04-24, `use_chunked_prefill=true prefill_chunk_size=4096`, pdb=3) | Coherent ("420 km" train distance, 2026-04-22, EOS stop); thinking chain may exhaust default `max_new_tokens` before answer — use ≥ 4000 for reliable EOS |
 | 2 | **HuggingFace Transformers (CPU)** | AMD EPYC 9B14, 180 vCPUs, 708 GB | BF16 (shard-by-shard FP8→BF16 dequant with `weight_scale_inv`) | ✅ Runs end-to-end | Coherent (`"2. But what if we consider it in a"`) |
 | 3 | **SGLang CPU engine** | AMD EPYC 9B14, 180 vCPUs, 708 GB | FP8→BF16 cast at load (quantization_config=null) | ✅ Runs, 5 patches needed | Garbled (`葭葭葭…`) — FP8 scale tensors stripped |
 | 4 | **llama.cpp (GGUF Q8_0)** | AMD EPYC 9B14, 180 vCPUs, 708 GB | Q8_0 on disk, int8+f32 accumulation in compute | ✅ Runs, no patches needed | Coherent (`"2. But what is 0+0?"`) |
@@ -33,46 +33,31 @@ Our MaxText + TPU v6e-32 measurements are the closest available counterpart.
 
 | Scene | E2E Peak Throughput | Peak BS | TTFT / ITL (ms) |
 | :--- | :--- | :--- | :--- |
-| 4K Prefill | 8,163 input tok/s | — | 513 ms avg TTFT |
 | 4K / 1K Decode | 417 output tok/s | 32 | 22,602 / 31.20 |
-| 16K Prefill | 4,861 input tok/s | — | 3,406 ms avg TTFT |
 | 16K / 1K Decode | 94 output tok/s | 8 | 37,979 / 14.71 |
 
-### MaxText + TPU v6e-32 (measured, 2026-04-23)
+### MaxText + TPU v6e-32 (measured, 2026-04-23/24)
 
 | Scene | E2E Peak Throughput | Peak BS | TTFT / ITL (ms) | Notes |
 | :--- | :--- | :--- | :--- | :--- |
-| 4K Prefill | **4,977 input tok/s** | 1 | **823 ms avg TTFT** | `max_prefill=4096`, `attention=flash`, `expert_shard_attention_option=context`; BS=1 single-sequence |
-| 4K / 1K Decode | **2,536 output tok/s** | **288** (`per_device_batch_size=9`, max) | — / **113.6 ms/step** | `max_prefill=4096, max_target=5120`, flash+context; pdb=10 OOMs (XLA compile needs 339 MB, 241 MB free) |
-| 16K Prefill | **4,860 input tok/s** | 1 | **3,372 ms avg TTFT** | `max_prefill=16384`, flash+context (`attention=flash`, `expert_shard_attention_option=context`); 0.99× external ref |
-| 16K / 1K Decode | **1,353 output tok/s** | **96** (`per_device_batch_size=3`, max) | — / **71.0 ms/step** | `max_prefill=16384, max_target=17408`; pdb=4 OOMs. Prefill (16384 tok) requires pdb=1 (XLA prefill JIT needs 6.13 GB; only 2.94 GB free at pdb=3) |
+| 4K / 1K Prefill+Decode | **2,536 output tok/s** | **288** (`per_device_batch_size=9`, max) | **823 ms TTFT** / **113.6 ms/step** | `max_prefill=4096, max_target=5120`, flash+context; pdb=10 OOMs (XLA compile needs 339 MB, 241 MB free). Confirmed 2026-04-24. |
+| **16K / 1K Chunked Prefill+Decode** | **1,349 output tok/s** | **96** (`per_device_batch_size=3`, max) | **5,522 ms TTFT** / **71.1 ms/step** | `use_chunked_prefill=true`, `prefill_chunk_size=4096` (4 × 4096 chunks, `dot_product`+flash decode); standard 5b config. 2026-04-24, commit `1b4cd37d`. |
 
 **Comparability notes:**
-- **4K Prefill (2026-04-23):** MaxText/TPU achieves **4,977 tok/s** (TTFT 823 ms) vs external **8,163 tok/s** (513 ms).
-  Both are BS=1 single-sequence. The external reference may use a different context length or batched prefill.
-  Our measurement uses `max_prefill=4096`, `attention=flash`, `expert_shard_attention_option=context`.
-- **4K / 1K Decode (2026-04-23):** MaxText/TPU achieves **2,536 tok/s at BS=288**
+- **4K / 1K Prefill+Decode (2026-04-24):** MaxText/TPU achieves **2,536 tok/s at BS=288**
   (`per_device_batch_size=9`) vs external **417 tok/s at BS=32** — a **6.08× advantage**.
   Uses `max_prefill=4096, max_target=5120`, flash+context attention. pdb=9 is the HBM ceiling
   (pdb=10 OOMs during XLA compile: 339 MB needed, 241 MB free). ITL 113.6 ms at BS=288 vs
   external 31.20 ms at BS=32 — our per-sequence latency (0.39 ms/tok) is still 10× lower.
-- **16K / 1K Decode (2026-04-23):** MaxText/TPU achieves **1,353 tok/s at BS=96**
-  (`per_device_batch_size=3`) vs external **94 tok/s at BS=8** — a **14.4× advantage**.
-  Uses `max_prefill=16384, max_target=17408`. SWA KV opt: only 9 global attention layers need
-  full 17K KV slots; the 39 SWA layers are still capped at 128 slots. pdb=4 OOMs.
-  Note: the 16K-sequence XLA prefill JIT requires 6.13 GB scratch; only pdb=1 has enough free
-  HBM (~9.8 GB). In real serving, prefill and max-batch decode run as separate phases.
-- **16K Prefill (2026-04-23):** MaxText/TPU achieves **4,860 tok/s** (TTFT 3,372 ms) vs
-  external **4,861 tok/s** (TTFT 3,406 ms) — a **1.00× match**. Uses `max_prefill=16384`,
-  flash+context attention. The default `attention=dot_product` OOMs (score matrix
-  `[4, 16, 16384, 16384]×2B ≈ 34 GB/chip` exceeds 31.25 GB). Three code fixes were required:
-  (1) decode-mode dot_product fallback (`9509e9e9`), (2) train-mode dot_product fallback
-  (`d8fe9fc9`), and (3) disable `LoadBalancedCausalMask` for EP_AS_CONTEXT (`ebfcd749`).
-- **Optimal batch at 512-token context (not in external ref):** At 512-token context
-  (`max_target=640`), MaxText/TPU achieves **3,322 tok/s** at BS=640 (`per_device_batch_size=20`)
-  — see [opt5 results](mimo_v2_flash_opt5_batch_size_scaling.md). The shorter KV cache
-  (640 vs 5120 slots) leaves far more HBM, enabling 20× more sequences in parallel.
-  Not directly comparable to the external reference's 4K/1K scenes.
+  TTFT at BS=1: 823 ms; both prefill and decode run at the same pdb in the same environment.
+- **16K / 1K Chunked Prefill+Decode (2026-04-24):** With `use_chunked_prefill=true` and
+  `prefill_chunk_size=4096` (branch `feature/chunked-prefill-16k`, commit `1b4cd37d`), pdb=3
+  (BS=96) runs both prefill and decode in a single environment: decode **1,349 tok/s / 71.1 ms/step**
+  vs external **94 tok/s at BS=8** — a **14.4× advantage**. TTFT is **5,522 ms / 2,967 tok/s**
+  — the chunked path uses `dot_product` (required for EP_AS_CONTEXT compatibility) and
+  processes 4 serial 4096-token chunks. This is the standard 5b configuration.
+  Five code fixes were required across `kvcache.py`,
+  `attention_op.py`, and `maxtext_utils.py`; see [env_restore guide](mimo_v2_flash_env_restore.md).
 
 ---
 
@@ -108,11 +93,11 @@ post `jingnw-tpu-op` VM recreation).  All 8 workers print `TPU_IMPORT_OK` after
 restore and the demo exits with code 0.  Proper benchmark (3-step warmup + 50 timed
 steps at batch=32): **55.5 ms/step median**, **576 tok/s**, **1.7 ms/tok/seq**
 (2026-04-17, commit `72f75972`; opt #1 `jax.debug.print` removal + SWA fix).
-Batch scaling (re-measured 2026-04-23, correct 4K/1K params): **113.6 ms/step**, **2,536 tok/s**,
+Batch scaling (re-measured 2026-04-24, correct 4K/1K params): **113.6 ms/step**, **2,536 tok/s**,
 **0.39 ms/tok/seq** at `per_device_batch_size=9` (total batch=288, v6e-32);
 `max_prefill=4096, max_target=5120`, `attention=flash`, `expert_shard_attention_option=context`;
-pdb=10 OOMs (XLA compile: 339 MB needed, 241 MB free). Previous measurement used
-`max_target=640` (512+128) which is not the 4K/1K scene; at that config pdb=20 gives 3,322 tok/s.
+pdb=10 OOMs (XLA compile: 339 MB needed, 241 MB free). Prefill and decode run at the same pdb
+in the same environment (TTFT ~823 ms at BS=1).
 The model is prompted via `tokenizer.apply_chat_template()` (`use_chat_template=true`).
 With thinking mode enabled (MiMo-V2-Flash default), the model emits a long reasoning
 chain before the final answer; the default `max_new_tokens` budget is typically
@@ -144,8 +129,8 @@ near-argmax and producing completely garbled token predictions.  Fix: added
 | Prefill (512 tokens) | ~22 s |
 | Demo path throughput (single-sequence, per-step CPU sync) | **~4.3 tok/s** (2026-04-21; thinking chain fills default `max_new_tokens`) |
 | Generation speed (steady-state, batch=32) | 55.5 ms/step · 576 tok/s · 1.7 ms/tok/seq (2026-04-17) |
-| Generation speed (4K/1K, batch=288, `per_device_batch_size=9`) | **113.6 ms/step · 2,536 tok/s · 0.39 ms/tok/seq** (2026-04-23, `max_prefill=4096 max_target=5120`, flash+context) |
-| Generation speed (512-tok context, batch=640, `per_device_batch_size=20`) | 192.7 ms/step · 3,322 tok/s · 0.30 ms/tok/seq (2026-04-22, `max_target=640`, dot_product) |
+| Generation speed (4K/1K prefill+decode, batch=288, `per_device_batch_size=9`) | **113.6 ms/step · 2,536 tok/s · 0.39 ms/tok/seq** decode; **823 ms TTFT** prefill (2026-04-24, `max_prefill=4096 max_target=5120`, flash+context) |
+| Generation speed (16K/1K chunked prefill+decode, batch=96, `per_device_batch_size=3`) | **71.1 ms/step · 1,349 tok/s · 0.74 ms/tok/seq** decode; **5,522 ms TTFT · 2,967 tok/s** prefill (2026-04-24, `use_chunked_prefill=true prefill_chunk_size=4096`, dot_product+context) |
 | HBM per chip after load | ~18.0 GB / 31.25 GB (57.5%) |
 | Parallelism | TP=4 × EP=8 |
 

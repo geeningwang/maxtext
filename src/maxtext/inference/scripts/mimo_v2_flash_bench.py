@@ -53,6 +53,7 @@ from absl import app
 
 from maxtext.configs import pyconfig
 from maxtext.inference.maxengine import maxengine
+from maxtext.inference.maxengine.maxengine import ExistingPrefix
 from maxtext.utils import max_utils
 
 _WARMUP_STEPS = 3
@@ -158,21 +159,48 @@ def main(argv: Sequence[str]) -> None:
     if decode_only:
         print("[BENCH] skipping prefill benchmark (BENCH_DECODE_ONLY=1)", flush=True)
     elif prefill_len > 0:
-        print(f"\n[BENCH] prefill benchmark (seq_len={prefill_len}) ...", flush=True)
+        use_chunked = engine.use_chunked_prefill
+        chunk_size = engine.prefill_chunk_size if use_chunked else prefill_len
+        n_chunks = prefill_len // chunk_size if use_chunked else 1
+        print(
+            f"\n[BENCH] prefill benchmark (seq_len={prefill_len}, "
+            f"chunked={use_chunked}, chunk_size={chunk_size}, n_chunks={n_chunks}) ...",
+            flush=True,
+        )
         # Synthetic prompt: fill with token ID 1 (typically <s> or pad)
-        padded_tokens = jnp.ones((prefill_len,), dtype=jnp.int32)
+        chunk_tokens = jnp.ones((chunk_size,), dtype=jnp.int32)
 
-        # Warmup — each prefill call processes one sequence
+        def _run_prefill(rng):
+            """Run one full prefill (chunked or monolithic) and return result."""
+            prefix_result, first_token = engine.prefill(
+                params=params,
+                padded_tokens=chunk_tokens,
+                true_length=chunk_size,
+                rng=rng,
+                slot=0,
+            )
+            for i in range(1, n_chunks):
+                existing_prefix = ExistingPrefix(
+                    cache=prefix_result["cache"],
+                    # Shape encodes write position for KV cache; actual values unused.
+                    common_prefix_tokens=jnp.ones((i * chunk_size,), dtype=jnp.int32),
+                )
+                rng, rng_pf = jax.random.split(rng)
+                prefix_result, first_token = engine.prefill(
+                    params=params,
+                    existing_prefix=existing_prefix,
+                    padded_tokens=chunk_tokens,
+                    true_length=chunk_size,
+                    rng=rng_pf,
+                    slot=0,
+                )
+            return prefix_result, first_token
+
+        # Warmup — triggers JIT compilation for each chunk position
         print(f"[BENCH] prefill warmup ({_PREFILL_WARMUP} calls) ...", flush=True)
         for _ in range(_PREFILL_WARMUP):
             rng, rng_pf = jax.random.split(rng)
-            result = engine.prefill(
-                params=params,
-                padded_tokens=padded_tokens,
-                true_length=prefill_len,
-                rng=rng_pf,
-                slot=0,
-            )
+            result = _run_prefill(rng_pf)
             jax.block_until_ready(result)
         print("[BENCH] prefill warmup done", flush=True)
 
@@ -182,13 +210,7 @@ def main(argv: Sequence[str]) -> None:
         for _ in range(_PREFILL_TIMED):
             rng, rng_pf = jax.random.split(rng)
             t_pf = time.perf_counter()
-            result = engine.prefill(
-                params=params,
-                padded_tokens=padded_tokens,
-                true_length=prefill_len,
-                rng=rng_pf,
-                slot=0,
-            )
+            result = _run_prefill(rng_pf)
             jax.block_until_ready(result)
             prefill_times_ms.append((time.perf_counter() - t_pf) * 1000)
 

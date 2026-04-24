@@ -66,8 +66,11 @@ Verified on 2026-04-22 from worker 0 after a full install via sections 2–3
    Targeting a single worker will cause the collective to hang indefinitely.
 3. Do not use `pkill` in this environment. If you must stop a process, find the
    exact PID and use `kill <pid>`.
-4. For multi-worker SSH commands, run `ssh-add ~/.ssh/google_compute_engine`
-  on `jingnw-tpu-op` first.
+4. For multi-worker SSH commands, ensure the SSH agent is running and the key
+  is loaded on `jingnw-tpu-op` first: `eval "$(ssh-agent -s)" && ssh-add ~/.ssh/google_compute_engine`.
+  Running `ssh-add` alone fails with "Could not open a connection to your authentication agent"
+  if the agent was not started. SSH 255 return codes from `gcloud tpu-vm ssh --worker=all`
+  are almost always caused by a missing or expired agent.
 5. When polling a long-running benchmark, check every 20 to 30 seconds. Do not
    use long sleeps.
 6. At startup, each worker prints exactly 8 lines (one per device) like
@@ -168,6 +171,11 @@ python -c "import maxtext; print(\"TPU_IMPORT_OK\")"'
 
 ## 4. Smoke Test The JAX Demo
 
+### 4a. Default 512-token prefill (optional quick sanity check)
+
+*Skip this if you only need to verify chunked prefill. Run it as a fast (~2 min)
+environment sanity check before committing to the longer 4b test.*
+
 Run this on `jingnw-tpu-op`:
 
 ```bash
@@ -185,6 +193,35 @@ Expected result: the model loads, runs prefill and generate, and exits with code
 workers. EOS fires cleanly (no `WARNING: EOS never fired` message). The output is a
 step-by-step solution to the math problem, ending with "The total distance traveled is
 420 km." Throughput is approximately 2.3 tok/s.
+
+### 4b. 16K chunked prefill smoke test (primary functional test)
+
+Exercises the chunked prefill code path (4 × 4096-token chunks, pdb=1).
+Uses `--use_chunked_prefill` and `--prefill_chunk_size 4096` flags added to the demo.
+
+Run this on `jingnw-tpu-op`:
+
+```bash
+gcloud compute tpus tpu-vm ssh "$TPU_NAME" --zone "$ZONE" --worker=all --command='set -e
+. "$HOME/maxtext/maxtext_tpu_venv/bin/activate"
+cd "$HOME/maxtext"
+python demos/mimo_v2_flash_demo_jax.py \
+  --checkpoint_path '"$CKPT"' \
+  --tokenizer_path '"$TOKENIZER"' \
+  --ici_tensor_parallelism 4 \
+  --ici_expert_parallelism 8 \
+  --max_prefill 16384 \
+  --max_new_tokens 1024 \
+  --use_chunked_prefill \
+  --prefill_chunk_size 4096'
+```
+
+Expected result: EOS fires cleanly. The primary worker (rank 0) outputs the correct
+step-by-step solution ending with "420 km". Non-primary workers may show partial/different
+text because they receive only shard-local logits in the EP=8 distributed setup.
+Throughput is approximately 5–6 tok/s (pdb=1, single sequence).
+
+Validated 2026-04-24 on commit `fcc915f8` (branch `feature/chunked-prefill-16k`).
 
 ## 5. Run The Dedicated TPU Performance Benchmark
 
@@ -234,20 +271,18 @@ python3 -m maxtext.inference.scripts.mimo_v2_flash_bench \
 
 Expected: decode median ~113.6 ms · **2,536 tok/s** (batch=288); prefill median ~823 ms · **4,977 tok/s** (4096 tok). Result file: `/tmp/bench_4k1k_pdb9.json`.
 
-### 5b. 16K context benchmark — flash attention (`per_device_batch_size=2`)
+### 5b. 16K context benchmark — chunked prefill (`per_device_batch_size=3`)
 
-`attention=dot_product` OOMs at 16K prefill — the score matrix
-`[4, 16, 16384, 16384]×2B ≈ 34 GB/chip` exceeds 31.25 GB HBM.
-Flash attention tiles computation in VMEM; score matrix never materialises in HBM.
-AR decode automatically falls back to `dot_product` (attends over 1 new token only;
-no NxN score matrix). Both phases run in one job.
+Chunked prefill (`use_chunked_prefill=true`, `prefill_chunk_size=4096`) splits the 16K
+prompt into 4 serial 4096-token chunks, each processed with `dot_product` attention.
+This avoids the XLA flash-prefill binary (which needs 6.13 GB scratch, exceeding free
+HBM at pdb=3) and allows prefill and decode to run at the same `pdb=3` in one job.
+AR decode uses `attention=flash` as usual (only 1 new token per step, no NxN matrix).
+SWA KV opt: only the 9 global attention layers need full 16K KV slots; the 39 SWA
+layers remain capped at 128 KV slots.
 
-`per_device_batch_size=2` (BS=64) is the combined-benchmark HBM limit — after
-`init_decode_state` uses 17.98 GB, `pdb=3` leaves only 2.83 GB free and the flash
-prefill XLA binary needs 6.13 GB (`RESOURCE_EXHAUSTED`). SWA KV opt: only the 9
-global attention layers need full 16K KV slots; the 39 SWA layers remain capped at
-128 KV slots. Prefill always processes 1 sequence regardless of `pdb`, so `pdb=2`
-gives identical prefill throughput to `pdb=1`.
+`per_device_batch_size=3` (BS=96) is the HBM ceiling for this combined environment.
+pdb=4 OOMs during decode-state init.
 
 > **`max_target_length=17408` is required** (not 16384). Must be strictly greater than
 > `max_prefill_predict_length` and divisible by `EP × sa_block_q = 8 × 128 = 1024`.
@@ -269,7 +304,7 @@ python3 -m maxtext.inference.scripts.mimo_v2_flash_bench \
   tokenizer_path='"$TOKENIZER"' \
   max_prefill_predict_length=16384 \
   max_target_length=17408 \
-  per_device_batch_size=2 \
+  per_device_batch_size=3 \
   dtype=bfloat16 \
   weight_dtype=bfloat16 \
   ici_tensor_parallelism=4 \
@@ -277,22 +312,15 @@ python3 -m maxtext.inference.scripts.mimo_v2_flash_bench \
   scan_layers=false \
   attention=flash \
   expert_shard_attention_option=context \
-  sa_block_q=128 \
-  sa_block_kv=128 \
-  sa_block_kv_compute=128 \
+  use_chunked_prefill=true \
+  prefill_chunk_size=4096 \
   checkpoint_storage_use_ocdbt=true \
   checkpoint_storage_use_zarr3=true \
   inference_microbenchmark_log_file_path=/tmp/bench_16k.json'
 ```
 
-Expected: decode median ~71.0 ms · **1,353 tok/s** (batch=96); prefill at pdb=1: ~3,372 ms TTFT · **4,860 tok/s**.
-Result file: `/tmp/bench_16k.json` (decode phase only; prefill requires separate pdb=1 run — see note below).
-
-> **16K/1K prefill note:** The XLA prefill JIT program for 16384-token sequences requires 6.13 GB
-> of HBM scratch space. At pdb=3 (max decode batch), only 2.94 GB is free — not enough.
-> To benchmark prefill, run a **separate** job with `per_device_batch_size=1` and
-> `inference_microbenchmark_log_file_path=/tmp/bench_16k1k_pdb1.json`.
-> In real serving, prefill and decode run as separate phases so this is not a practical constraint.
+Expected: decode median ~71.1 ms · **1,349 tok/s** (batch=96, pdb=3); prefill median ~5,522 ms TTFT · **2,967 tok/s** (4 × 4096 chunks).
+Result file: `/tmp/bench_16k.json`.
 
 Expected progress markers printed to stdout as the job runs:
 
@@ -508,14 +536,53 @@ section 0.
 - AR Decode: median `62.4 ms`, throughput `1,025.0 tok/s` (batch=64)
 - Prefill (16K tok): median `3,492.8 ms` TTFT, throughput `4,690.8 tok/s`
 
-### Summary of all validated baselines (as of 2026-04-23, commit `961094af`)
+### 2026-04-24 — 5a/5b re-run as non-chunked baseline (commit `1b4cd37d`, warm GCS cache)
+
+checkpoint: `mimo-v2-flash-fixed-ocdbt`. Branch `feature/chunked-prefill-16k`.
+Run without chunked prefill to confirm the standard flash baseline is unaffected by the
+chunked-prefill code changes. Going forward, 5b uses chunked prefill (see benchmark command
+in section 5b); this entry is kept as a historical non-chunked reference.
+
+**5a — 4K/1K (`max_prefill=4096, max_target=5120`, pdb=9, batch=288):**
+- `load_params`: `39.2 s` (warm GCS cache)
+- AR Decode: median `113.5 ms`, throughput `2,536 tok/s`
+- Prefill (4096 tok): median `823.0 ms`, throughput `4,977 tok/s`
+
+**5b — 16K/1K (`max_prefill=16384, max_target=17408`, non-chunked flash prefill, pdb=2, batch=64):**
+- `load_params`: `45.7 s` (warm GCS cache)
+- AR Decode: median `62.5 ms`, throughput `1,025 tok/s`
+- Prefill (16384 tok): median `3,493.0 ms` TTFT, throughput `4,691 tok/s`
+- Note: non-chunked flash prefill OOMs at pdb=3; only pdb=2 feasible without chunked prefill.
+
+### 2026-04-24 — 16K/1K chunked prefill at pdb=3 (commit `1b4cd37d`)
+
+checkpoint: `mimo-v2-flash-fixed-ocdbt`. Branch `feature/chunked-prefill-16k`.
+Five bugs fixed across this branch (MLA shape, non-square trace, splash+EP_AS_CONTEXT,
+SWA cache overflow, SWA attention mask). Config: `use_chunked_prefill=true`,
+`prefill_chunk_size=4096` (4 × 4096 = 16384 token prompt processed in 4 serial chunks).
+`attention=dot_product` forced for chunked prefill (splash incompatible with chunk offsets).
+
+**AR Decode (16K context, pdb=3, batch=96):**
+- `load_params`: `40.9 s` (warm GCS cache)
+- step latency (median): `71.1 ms`
+- throughput: `1,349 tok/s`
+- per-sequence latency: `0.74 ms/tok/seq`
+
+**Chunked Prefill (seq_len=16384, 4 × 4096-token chunks):**
+- step latency (median): `5,521.6 ms` TTFT
+- throughput: `2,967 tok/s`
+- Note: ~64% slower TTFT than non-chunked flash (3,493 ms) because dot_product
+  is used (no NxN score matrix tiling) and chunks are processed serially.
+  Win: pdb=3 decode batch no longer OOMs during prefill.
+
+### Summary of all validated baselines (as of 2026-04-24, commit `1b4cd37d`)
 
 | Config | Scene | `pdb` (BS) | Decode median | Decode throughput | Prefill throughput |
 |---|---|---|---|---|---|
 | `attention=dot_product` | 512-tok context | 1 (32) | 55.4 ms | 577.5 tok/s | 4,144 tok/s |
 | `attention=dot_product`, `max_target=640` | 512+128 tok (legacy) | 20 (640) | 192.7 ms | 3,322 tok/s | 4,137 tok/s |
-| **`attention=flash`+context** | **4K / 1K** | **9 (288)** | **113.6 ms** | **2,536 tok/s** | **4,977 tok/s (4096 tok)** |
-| **`attention=flash`+context** | **16K / 1K** | **3 (96)** | **71.0 ms** | **1,353 tok/s** | **4,860 tok/s (16384 tok, pdb=1)** |
+| **`attention=flash`+context** | **4K / 1K** | **9 (288)** | **113.6 ms** | **2,536 tok/s** | **4,977 tok/s (823 ms TTFT)** |
+| **chunked prefill (4×4096)+context** | **16K / 1K** | **3 (96)** | **71.1 ms** | **1,349 tok/s** | **2,967 tok/s (5,522 ms TTFT)** |
 
 ### Prior Reference Result For Commit 5ad76eac (regression baseline)
 

@@ -528,10 +528,12 @@ class KVCache(BaseCache):
     assert not self.kv_quant, "Not support kv_quant now."
     if decoder_segment_ids is not None:
       _, segment_id_seq_len = decoder_segment_ids.shape
-      assert self.key_seq_len == segment_id_seq_len, f"{self.key_seq_len=}, {segment_id_seq_len=} should match."
+      # key_seq_len is a placeholder (=1) set at init time for cache shape tracing;
+      # compare against the actual runtime key sequence length instead.
+      assert key.shape[1] == segment_id_seq_len, f"key seq len {key.shape[1]} != segment_id_seq_len {segment_id_seq_len}"
 
     assert key.dtype == value.dtype, "Key and Value Dtypes should match."
-    assert self.key_seq_len == self.value_seq_len, f"{self.key_seq_len=}, {self.value_seq_len=} should match."
+    assert key.shape[1] == value.shape[1], f"key seq len {key.shape[1]} != value seq len {value.shape[1]}"
 
     next_pos = 0
     if previous_chunk is not None:
@@ -553,42 +555,128 @@ class KVCache(BaseCache):
     seq_axis = self.prefill_cache_logical_axis_names.index(CACHE_SEQUENCE)
     cache_seq_axis = self.prefill_cache_axis_order.index(seq_axis)
 
-    assert next_pos + key_shaped_for_cache.shape[cache_seq_axis] <= self.max_prefill_length, (
+    # `_prefill_cache_len` equals `swa_window_size` for SWA attention layers and
+    # `max_prefill_length` for global layers.
+    cache_len = self._prefill_cache_len
+    chunk_seq_len = key_shaped_for_cache.shape[cache_seq_axis]
+
+    if self.swa_window_size > 0 and chunk_seq_len > cache_len:
+      # ── SWA chunked-prefill path ─────────────────────────────────────────────
+      # The SWA prefill cache has only `swa_window_size` (e.g. 128) slots, while
+      # each chunk is much larger (e.g. 4096 tokens).
+      #
+      # CACHE WRITE: store the last `cache_len` tokens of the current chunk.
+      #   This is the same truncation used by kv_cache_prefill for non-chunked SWA
+      #   prefill; it ensures the AR-decode phase always has the most-recent window
+      #   of real tokens to attend to.
+      #
+      # ATTENTION RETURN: return the original full-chunk key/value (not the cache
+      #   content) together with the original decoder_segment_ids.  The caller
+      #   (attention_op.__call__) passes previous_chunk=None when it detects this
+      #   path, so generate_attention_mask computes within-chunk local coordinates:
+      #     causal mask  : col <= row          (standard within-chunk causal)
+      #     sliding mask : col > row - window  (within-chunk SWA)
+      #   Cross-chunk SWA context (last `window` tokens of prev chunk) is dropped;
+      #   this only affects the first `window` queries of chunks 2–4, a ~3% approx.
+      swa_src_start = chunk_seq_len - cache_len
+      key_to_write = jax.lax.dynamic_slice_in_dim(
+          key_shaped_for_cache, swa_src_start, cache_len, axis=cache_seq_axis
+      )
+      value_to_write = jax.lax.dynamic_slice_in_dim(
+          value_shaped_for_cache, swa_src_start, cache_len, axis=cache_seq_axis
+      )
+
+      # MLA compat: cache may have been initialised with a different head count
+      # (e.g. 1 compressed head vs 96 decompressed).  Rebuild the buffer with
+      # matching heads before dynamic_update_slice.
+      if cached_key_value.shape != key_to_write.shape:
+        corrected = list(key_to_write.shape)
+        corrected[cache_seq_axis] = cached_key_value.shape[cache_seq_axis]
+        cached_key_value = jnp.zeros(corrected, dtype=cached_key_value.dtype)
+      if cached_value_value.shape != value_to_write.shape:
+        corrected = list(value_to_write.shape)
+        corrected[cache_seq_axis] = cached_value_value.shape[cache_seq_axis]
+        cached_value_value = jnp.zeros(corrected, dtype=cached_value_value.dtype)
+
+      cached_prefill_key_vars[0].value = jax.lax.dynamic_update_slice_in_dim(
+          cached_key_value, key_to_write, 0, cache_seq_axis
+      )
+      cached_prefill_value_vars[0].value = jax.lax.dynamic_update_slice_in_dim(
+          cached_value_value, value_to_write, 0, cache_seq_axis
+      )
+
+      if decoder_segment_ids is not None:
+        seg_to_write = jax.lax.dynamic_slice_in_dim(
+            decoder_segment_ids, swa_src_start, cache_len, axis=1
+        )
+        cached_prefill_segment_id_var.value = jnp.zeros_like(
+            cached_prefill_segment_id_var.value, dtype=jnp.int32
+        )
+        cached_prefill_segment_id_var.value = jax.lax.dynamic_update_slice_in_dim(
+            cached_prefill_segment_id_var.value, seg_to_write, 0, axis=1
+        )
+
+      # Return the full current chunk for within-chunk attention.
+      return key, value, decoder_segment_ids
+
+    # ── Non-SWA (global attention) chunked-prefill path ──────────────────────
+    assert next_pos + chunk_seq_len <= self.max_prefill_length, (
         f"Previous kv cache[{next_pos}] + "
-        f"current kv cache[{key_shaped_for_cache.shape[cache_seq_axis]}] "
+        f"current kv cache[{chunk_seq_len}] "
         f"> max length[{self.max_prefill_length}]"
     )
+    cache_write_pos = next_pos
+    written_seq_len = chunk_seq_len
+
+    # MLA compatibility: the prefill cache is initialised with the compressed KV head
+    # count (e.g. 1 head for MLA latent KV), but key/value carry the full decompressed
+    # head count.  dynamic_update_slice requires all non-sliced axes to match exactly,
+    # so we rebuild the cache buffer with the correct head shape when they differ.
+    # Shape is a static property known at trace time so this branch is zero-cost at
+    # runtime.  On the first chunk (next_pos=0) this produces a zeros buffer of the
+    # right shape; on subsequent chunks the cache was already written with the correct
+    # head count so the shapes match and this is a no-op.
+    if cached_key_value.shape != key_shaped_for_cache.shape:
+      corrected_key_shape = list(key_shaped_for_cache.shape)
+      corrected_key_shape[cache_seq_axis] = cached_key_value.shape[cache_seq_axis]
+      cached_key_value = jnp.zeros(corrected_key_shape, dtype=cached_key_value.dtype)
+    if cached_value_value.shape != value_shaped_for_cache.shape:
+      corrected_value_shape = list(value_shaped_for_cache.shape)
+      corrected_value_shape[cache_seq_axis] = cached_value_value.shape[cache_seq_axis]
+      cached_value_value = jnp.zeros(corrected_value_shape, dtype=cached_value_value.dtype)
 
     # We don't zero out remain values. Use segment id to mask out.
     cached_prefill_key_vars[0].value = jax.lax.dynamic_update_slice_in_dim(
-        cached_key_value, key_shaped_for_cache, next_pos, cache_seq_axis
+        cached_key_value, key_shaped_for_cache, cache_write_pos, cache_seq_axis
     )
     cached_prefill_value_vars[0].value = jax.lax.dynamic_update_slice_in_dim(
-        cached_value_value, value_shaped_for_cache, next_pos, cache_seq_axis
+        cached_value_value, value_shaped_for_cache, cache_write_pos, cache_seq_axis
     )
 
     if decoder_segment_ids is not None:
       # Need zero out the remain values to prevent wrong mask in autoregressive.
-      previous_segment_id = cached_prefill_segment_id_var.value[:, :next_pos]
+      previous_segment_id = cached_prefill_segment_id_var.value[:, :cache_write_pos]
       cached_prefill_segment_id_var.value = jnp.zeros_like(cached_prefill_segment_id_var.value, dtype=jnp.int32)
+      if cache_write_pos > 0:
+        cached_prefill_segment_id_var.value = jax.lax.dynamic_update_slice_in_dim(
+            cached_prefill_segment_id_var.value, previous_segment_id, start_index=0, axis=1
+        )
       cached_prefill_segment_id_var.value = jax.lax.dynamic_update_slice_in_dim(
-          cached_prefill_segment_id_var.value, previous_segment_id, start_index=0, axis=1
-      )
-      cached_prefill_segment_id_var.value = jax.lax.dynamic_update_slice_in_dim(
-          cached_prefill_segment_id_var.value, decoder_segment_ids, next_pos, axis=1
+          cached_prefill_segment_id_var.value, decoder_segment_ids, cache_write_pos, axis=1
       )
 
-    # Return needed kv cache to reduce computation of attention.
+    # Return the portion of the cache that holds valid tokens for this attention step.
+    return_seq_len = cache_write_pos + written_seq_len
     needed_prefill_key_value = jax.lax.dynamic_slice_in_dim(
-        cached_prefill_key_vars[0].value, start_index=0, slice_size=(next_pos + self.key_seq_len), axis=cache_seq_axis
+        cached_prefill_key_vars[0].value, start_index=0, slice_size=return_seq_len, axis=cache_seq_axis
     )
     needed_prefill_value_value = jax.lax.dynamic_slice_in_dim(
-        cached_prefill_value_vars[0].value, start_index=0, slice_size=(next_pos + self.value_seq_len), axis=cache_seq_axis
+        cached_prefill_value_vars[0].value, start_index=0, slice_size=return_seq_len, axis=cache_seq_axis
     )
     needed_segment_id = None
     if decoder_segment_ids is not None:
       needed_segment_id = jax.lax.dynamic_slice_in_dim(
-          cached_prefill_segment_id_var.value, start_index=0, slice_size=(next_pos + segment_id_seq_len), axis=1
+          cached_prefill_segment_id_var.value, start_index=0, slice_size=return_seq_len, axis=1
       )
 
     return (
