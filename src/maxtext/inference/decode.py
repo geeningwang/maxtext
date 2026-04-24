@@ -225,6 +225,8 @@ def main(argv: Sequence[str]) -> None:
         for chunk_idx in range(n_chunks):
           chunk_start = chunk_idx * chunk_size
           chunk_true_len = max(0, min(true_length - chunk_start, chunk_size))
+          if chunk_true_len <= 0:
+            break  # no more real tokens; leave remaining cache as zeros (masked)
           chunk_tokens = jnp.asarray(tokens[chunk_start : chunk_start + chunk_size])
           if chunk_idx == 0:
             prefill_result, first_token = engine.prefill(
@@ -248,8 +250,6 @@ def main(argv: Sequence[str]) -> None:
                 rng=rng_pf,
                 slot=i,
             )
-          if chunk_true_len <= 0:
-            break
       else:
         prefill_result, first_token = engine.prefill(
             params=params,
