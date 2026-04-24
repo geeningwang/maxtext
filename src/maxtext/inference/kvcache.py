@@ -556,37 +556,77 @@ class KVCache(BaseCache):
     cache_seq_axis = self.prefill_cache_axis_order.index(seq_axis)
 
     # `_prefill_cache_len` equals `swa_window_size` for SWA attention layers and
-    # `max_prefill_length` for global layers.  For SWA layers the cache can be
-    # much smaller than `chunk_size` (e.g. window=128, chunk=4096), so we must
-    # truncate the write to the last `cache_len` tokens and always write at slot 0.
+    # `max_prefill_length` for global layers.
     cache_len = self._prefill_cache_len
     chunk_seq_len = key_shaped_for_cache.shape[cache_seq_axis]
 
     if self.swa_window_size > 0 and chunk_seq_len > cache_len:
-      # SWA: current chunk completely fills/overflows the cache.
-      # Keep only the last cache_len tokens; they represent the most recent window.
-      src_start = chunk_seq_len - cache_len
-      key_shaped_for_cache = jax.lax.dynamic_slice_in_dim(
-          key_shaped_for_cache, src_start, cache_len, axis=cache_seq_axis
+      # ── SWA chunked-prefill path ─────────────────────────────────────────────
+      # The SWA prefill cache has only `swa_window_size` (e.g. 128) slots, while
+      # each chunk is much larger (e.g. 4096 tokens).
+      #
+      # CACHE WRITE: store the last `cache_len` tokens of the current chunk.
+      #   This is the same truncation used by kv_cache_prefill for non-chunked SWA
+      #   prefill; it ensures the AR-decode phase always has the most-recent window
+      #   of real tokens to attend to.
+      #
+      # ATTENTION RETURN: return the original full-chunk key/value (not the cache
+      #   content) together with the original decoder_segment_ids.  The caller
+      #   (attention_op.__call__) passes previous_chunk=None when it detects this
+      #   path, so generate_attention_mask computes within-chunk local coordinates:
+      #     causal mask  : col <= row          (standard within-chunk causal)
+      #     sliding mask : col > row - window  (within-chunk SWA)
+      #   Cross-chunk SWA context (last `window` tokens of prev chunk) is dropped;
+      #   this only affects the first `window` queries of chunks 2–4, a ~3% approx.
+      swa_src_start = chunk_seq_len - cache_len
+      key_to_write = jax.lax.dynamic_slice_in_dim(
+          key_shaped_for_cache, swa_src_start, cache_len, axis=cache_seq_axis
       )
-      value_shaped_for_cache = jax.lax.dynamic_slice_in_dim(
-          value_shaped_for_cache, src_start, cache_len, axis=cache_seq_axis
+      value_to_write = jax.lax.dynamic_slice_in_dim(
+          value_shaped_for_cache, swa_src_start, cache_len, axis=cache_seq_axis
       )
-      if decoder_segment_ids is not None:
-        decoder_segment_ids = jax.lax.dynamic_slice_in_dim(decoder_segment_ids, src_start, cache_len, axis=1)
-        segment_id_seq_len = cache_len
-      cache_write_pos = 0
-    else:
-      assert next_pos + chunk_seq_len <= self.max_prefill_length, (
-          f"Previous kv cache[{next_pos}] + "
-          f"current kv cache[{chunk_seq_len}] "
-          f"> max length[{self.max_prefill_length}]"
-      )
-      cache_write_pos = next_pos
 
-    # After SWA truncation, key_shaped_for_cache.shape[cache_seq_axis] is the number
-    # of tokens we will actually write.
-    written_seq_len = key_shaped_for_cache.shape[cache_seq_axis]
+      # MLA compat: cache may have been initialised with a different head count
+      # (e.g. 1 compressed head vs 96 decompressed).  Rebuild the buffer with
+      # matching heads before dynamic_update_slice.
+      if cached_key_value.shape != key_to_write.shape:
+        corrected = list(key_to_write.shape)
+        corrected[cache_seq_axis] = cached_key_value.shape[cache_seq_axis]
+        cached_key_value = jnp.zeros(corrected, dtype=cached_key_value.dtype)
+      if cached_value_value.shape != value_to_write.shape:
+        corrected = list(value_to_write.shape)
+        corrected[cache_seq_axis] = cached_value_value.shape[cache_seq_axis]
+        cached_value_value = jnp.zeros(corrected, dtype=cached_value_value.dtype)
+
+      cached_prefill_key_vars[0].value = jax.lax.dynamic_update_slice_in_dim(
+          cached_key_value, key_to_write, 0, cache_seq_axis
+      )
+      cached_prefill_value_vars[0].value = jax.lax.dynamic_update_slice_in_dim(
+          cached_value_value, value_to_write, 0, cache_seq_axis
+      )
+
+      if decoder_segment_ids is not None:
+        seg_to_write = jax.lax.dynamic_slice_in_dim(
+            decoder_segment_ids, swa_src_start, cache_len, axis=1
+        )
+        cached_prefill_segment_id_var.value = jnp.zeros_like(
+            cached_prefill_segment_id_var.value, dtype=jnp.int32
+        )
+        cached_prefill_segment_id_var.value = jax.lax.dynamic_update_slice_in_dim(
+            cached_prefill_segment_id_var.value, seg_to_write, 0, axis=1
+        )
+
+      # Return the full current chunk for within-chunk attention.
+      return key, value, decoder_segment_ids
+
+    # ── Non-SWA (global attention) chunked-prefill path ──────────────────────
+    assert next_pos + chunk_seq_len <= self.max_prefill_length, (
+        f"Previous kv cache[{next_pos}] + "
+        f"current kv cache[{chunk_seq_len}] "
+        f"> max length[{self.max_prefill_length}]"
+    )
+    cache_write_pos = next_pos
+    written_seq_len = chunk_seq_len
 
     # MLA compatibility: the prefill cache is initialised with the compressed KV head
     # count (e.g. 1 head for MLA latent KV), but key/value carry the full decompressed
