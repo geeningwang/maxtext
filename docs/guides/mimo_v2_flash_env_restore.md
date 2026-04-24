@@ -138,6 +138,11 @@ Notes:
   Python 3.12 preinstalled.
 - The ops VM does not run the distributed TPU job, but keeping a matching
   checkout there is useful for inspection and ad hoc commands.
+- **VS Code Remote caveat:** if VS Code is connected to `jingnw-tpu-op` with
+  `~/maxtext` as the active workspace, the `rm -rf "$HOME/maxtext"` line will
+  destroy the workspace and disconnect the session. In that case, skip the
+  `rm -rf` and `git clone` lines — if `~/maxtext` is already on the correct
+  branch and commit, just run the `uv venv` and `uv pip install` lines.
 
 ## 3. Restore The Environment On All TPU Workers
 
@@ -146,6 +151,20 @@ Notes:
 > section 1 before continuing. The `'"$TAG"'` construct in the command below
 > interpolates `$TAG` on the ops VM before the string is sent over SSH — if `TAG`
 > is unset the checkout will silently target an empty ref and fail.
+
+> **Wait for TPU READY before continuing.** If you just created `jingnw-node`,
+> poll until it reaches `READY` state before attempting SSH. Running the section 3
+> command while the TPU is still in `CREATING` produces a confusing Python
+> `TypeError` traceback from the gcloud SDK (worker IPs not yet assigned).
+
+```bash
+# Wait for READY (typically 2–5 min after creation)
+while [[ "$(gcloud compute tpus tpu-vm describe "$TPU_NAME" --zone "$ZONE" --format='value(state)' 2>/dev/null)" != "READY" ]]; do
+  echo "$(date '+%H:%M:%S') waiting for TPU READY..."
+  sleep 30
+done
+echo "TPU READY"
+```
 
 Run this on `jingnw-tpu-op`:
 
@@ -216,12 +235,13 @@ python demos/mimo_v2_flash_demo_jax.py \
   --prefill_chunk_size 4096'
 ```
 
-Expected result: EOS fires cleanly. The primary worker (rank 0) outputs the correct
-step-by-step solution ending with "420 km". Non-primary workers may show partial/different
-text because they receive only shard-local logits in the EP=8 distributed setup.
+Expected result: EOS fires cleanly on all workers. All workers output the correct
+step-by-step solution ending with "420 km". Workers may additionally produce
+multilingual continuation text (e.g. Polish) between `</think>` and the EOS token —
+this is cosmetic and does not affect correctness or EOS detection.
 Throughput is approximately 5–6 tok/s (pdb=1, single sequence).
 
-Validated 2026-04-24 on commit `fcc915f8` (branch `feature/chunked-prefill-16k`).
+Validated 2026-04-24 on commit `f21e9632` (branch `MiMo-V2-Flash`, post-merge).
 
 ## 5. Run The Dedicated TPU Performance Benchmark
 
@@ -575,7 +595,28 @@ SWA cache overflow, SWA attention mask). Config: `use_chunked_prefill=true`,
   is used (no NxN score matrix tiling) and chunks are processed serially.
   Win: pdb=3 decode batch no longer OOMs during prefill.
 
-### Summary of all validated baselines (as of 2026-04-24, commit `1b4cd37d`)
+### 2026-04-24 — Full restore re-run on merge commit `f21e9632` (cold GCS cache, new cluster)
+
+checkpoint: `mimo-v2-flash-fixed-ocdbt`. Branch `MiMo-V2-Flash` (chunked-prefill merge).
+Full environment restore from scratch (new TPU cluster + ops VM).
+
+**5a — 4K/1K (`max_prefill=4096, max_target=5120`, pdb=9, batch=288):**
+- `load_params`: `37.8–38.1 s` (cold GCS cache)
+- AR Decode: median `113.7 ms`, throughput `2,533 tok/s`
+- Prefill (4096 tok): median `823.1 ms`, throughput `4,976 tok/s`
+
+**5b — 16K/1K chunked (`max_prefill=16384, max_target=17408`, pdb=3, batch=96):**
+- `load_params`: `36.4–36.9 s` (warm cache from 5a run on same cluster)
+- AR Decode: median `71.2 ms`, throughput `1,349 tok/s`
+- Prefill (16384 tok, 4×4096 chunks): median `5,521.5 ms` TTFT, throughput `2,967 tok/s`
+
+**Demo smoke tests (sections 4a and 4b):**
+- 4a (512-tok full prefill): EOS fired, output "420 km", 2.3 tok/s — all 8 workers ✓
+- 4b (16K chunked prefill): EOS fired, output "420 km", 5.7 tok/s — all 8 workers ✓
+  Note: 4b workers additionally output Polish-language continuation text after `</think>`
+  before EOS. This is cosmetic; the correct answer and EOS are unaffected.
+
+### Summary of all validated baselines (as of 2026-04-24, commit `f21e9632`)
 
 | Config | Scene | `pdb` (BS) | Decode median | Decode throughput | Prefill throughput |
 |---|---|---|---|---|---|
