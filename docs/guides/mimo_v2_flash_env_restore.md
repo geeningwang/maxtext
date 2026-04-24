@@ -171,7 +171,10 @@ python -c "import maxtext; print(\"TPU_IMPORT_OK\")"'
 
 ## 4. Smoke Test The JAX Demo
 
-### 4a. Default 512-token prefill
+### 4a. Default 512-token prefill (optional quick sanity check)
+
+*Skip this if you only need to verify chunked prefill. Run it as a fast (~2 min)
+environment sanity check before committing to the longer 4b test.*
 
 Run this on `jingnw-tpu-op`:
 
@@ -191,7 +194,7 @@ workers. EOS fires cleanly (no `WARNING: EOS never fired` message). The output i
 step-by-step solution to the math problem, ending with "The total distance traveled is
 420 km." Throughput is approximately 2.3 tok/s.
 
-### 4b. 16K chunked prefill smoke test
+### 4b. 16K chunked prefill smoke test (primary functional test)
 
 Exercises the chunked prefill code path (4 × 4096-token chunks, pdb=1).
 Uses `--use_chunked_prefill` and `--prefill_chunk_size 4096` flags added to the demo.
