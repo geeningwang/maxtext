@@ -28,6 +28,7 @@ from maxtext.configs import pyconfig
 from maxtext.common import profiler
 from maxtext.common.gcloud_stub import jetstream, is_decoupled
 from maxtext.inference.maxengine import maxengine
+from maxtext.inference.maxengine.maxengine import ExistingPrefix
 from maxtext.multimodal import processor as mm_processor
 from maxtext.multimodal import utils as mm_utils
 from maxtext.utils import max_utils
@@ -215,19 +216,54 @@ def main(argv: Sequence[str]) -> None:
   rng, rng_prefill = jax.random.split(rng)  # Split RNG before calling prefill
   for i in range(_NUM_STREAMS):
     with jax.profiler.StepTraceAnnotation("prefill", stream=i):
-      prefill_result, first_token = engine.prefill(
-          params=params,
-          padded_tokens=tokens,
-          positions=position_ids,
-          mrope_deltas=mrope_position_deltas,
-          images=processor_outputs.pixel_values if config.use_multimodal else None,
-          image_masks=processor_outputs.pixel_mask if config.use_multimodal and "llama4" in config.model_name else None,
-          audio_values=processor_outputs.audio_values if config.use_audio else None,
-          audio_masks=processor_outputs.audio_mask if config.use_audio else None,
-          true_length=true_length,
-          rng=rng_prefill,
-          slot=i,
-      )
+      if engine.use_chunked_prefill:
+        chunk_size = engine.prefill_chunk_size
+        n_chunks = config.max_prefill_predict_length // chunk_size
+        rng_chunk = rng_prefill
+        prefill_result = None
+        first_token = None
+        for chunk_idx in range(n_chunks):
+          chunk_start = chunk_idx * chunk_size
+          chunk_true_len = max(0, min(true_length - chunk_start, chunk_size))
+          chunk_tokens = jnp.asarray(tokens[chunk_start : chunk_start + chunk_size])
+          if chunk_idx == 0:
+            prefill_result, first_token = engine.prefill(
+                params=params,
+                padded_tokens=chunk_tokens,
+                true_length=chunk_true_len,
+                rng=rng_chunk,
+                slot=i,
+            )
+          else:
+            existing_prefix = ExistingPrefix(
+                cache=prefill_result["cache"],
+                common_prefix_tokens=jnp.ones((chunk_idx * chunk_size,), dtype=jnp.int32),
+            )
+            rng_chunk, rng_pf = jax.random.split(rng_chunk)
+            prefill_result, first_token = engine.prefill(
+                params=params,
+                existing_prefix=existing_prefix,
+                padded_tokens=chunk_tokens,
+                true_length=chunk_true_len,
+                rng=rng_pf,
+                slot=i,
+            )
+          if chunk_true_len <= 0:
+            break
+      else:
+        prefill_result, first_token = engine.prefill(
+            params=params,
+            padded_tokens=tokens,
+            positions=position_ids,
+            mrope_deltas=mrope_position_deltas,
+            images=processor_outputs.pixel_values if config.use_multimodal else None,
+            image_masks=processor_outputs.pixel_mask if config.use_multimodal and "llama4" in config.model_name else None,
+            audio_values=processor_outputs.audio_values if config.use_audio else None,
+            audio_masks=processor_outputs.audio_mask if config.use_audio else None,
+            true_length=true_length,
+            rng=rng_prefill,
+            slot=i,
+        )
     prefill_result_list.append(prefill_result)
     first_token_list.append(first_token)
   _probe_hbm("after_prefill")
