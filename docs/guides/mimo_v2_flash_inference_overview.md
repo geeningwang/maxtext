@@ -41,7 +41,7 @@ Our MaxText + TPU v6e-32 measurements are the closest available counterpart.
 | Scene | E2E Peak Throughput | Peak BS | TTFT / ITL (ms) | Notes |
 | :--- | :--- | :--- | :--- | :--- |
 | 4K / 1K Prefill+Decode | **2,536 output tok/s** | **288** (`per_device_batch_size=9`, max) | **823 ms TTFT** / **113.6 ms/step** | `max_prefill=4096, max_target=5120`, flash+context; pdb=10 OOMs (XLA compile needs 339 MB, 241 MB free). Confirmed 2026-04-24. |
-| **16K / 1K Chunked Prefill+Decode** | **1,349 output tok/s** | **96** (`per_device_batch_size=3`) | **5,522 ms TTFT** / **71.1 ms/step** | `use_chunked_prefill=true`, `prefill_chunk_size=4096` (4 × 4096 chunks, `dot_product`); pdb=3 decode and prefill both feasible in same env. 2026-04-24, commit `1b4cd37d`. |
+| **16K / 1K Chunked Prefill+Decode** | **1,349 output tok/s** | **96** (`per_device_batch_size=3`, max) | **5,522 ms TTFT** / **71.1 ms/step** | `use_chunked_prefill=true`, `prefill_chunk_size=4096` (4 × 4096 chunks, `dot_product`+flash decode); standard 5b config. 2026-04-24, commit `1b4cd37d`. |
 
 **Comparability notes:**
 - **4K / 1K Prefill+Decode (2026-04-24):** MaxText/TPU achieves **2,536 tok/s at BS=288**
@@ -55,7 +55,8 @@ Our MaxText + TPU v6e-32 measurements are the closest available counterpart.
   (BS=96) runs both prefill and decode in a single environment: decode **1,349 tok/s / 71.1 ms/step**
   vs external **94 tok/s at BS=8** — a **14.4× advantage**. TTFT is **5,522 ms / 2,967 tok/s**
   — the chunked path uses `dot_product` (required for EP_AS_CONTEXT compatibility) and
-  processes 4 serial 4096-token chunks. Five code fixes were required across `kvcache.py`,
+  processes 4 serial 4096-token chunks. This is the standard 5b configuration.
+  Five code fixes were required across `kvcache.py`,
   `attention_op.py`, and `maxtext_utils.py`; see [env_restore guide](mimo_v2_flash_env_restore.md).
 
 ---
