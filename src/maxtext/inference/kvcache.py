@@ -528,10 +528,12 @@ class KVCache(BaseCache):
     assert not self.kv_quant, "Not support kv_quant now."
     if decoder_segment_ids is not None:
       _, segment_id_seq_len = decoder_segment_ids.shape
-      assert self.key_seq_len == segment_id_seq_len, f"{self.key_seq_len=}, {segment_id_seq_len=} should match."
+      # key_seq_len is a placeholder (=1) set at init time for cache shape tracing;
+      # compare against the actual runtime key sequence length instead.
+      assert key.shape[1] == segment_id_seq_len, f"key seq len {key.shape[1]} != segment_id_seq_len {segment_id_seq_len}"
 
     assert key.dtype == value.dtype, "Key and Value Dtypes should match."
-    assert self.key_seq_len == self.value_seq_len, f"{self.key_seq_len=}, {self.value_seq_len=} should match."
+    assert key.shape[1] == value.shape[1], f"key seq len {key.shape[1]} != value seq len {value.shape[1]}"
 
     next_pos = 0
     if previous_chunk is not None:
