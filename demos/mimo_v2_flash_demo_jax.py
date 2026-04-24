@@ -159,6 +159,9 @@ def build_decode_command(
     ici_tensor_parallelism: int = 4,
     ici_expert_parallelism: int = 8,
     scan_layers: bool = False,
+    use_chunked_prefill: bool = False,
+    prefill_chunk_size: int = 4096,
+    expert_shard_attention_option: str = "context",
 ) -> list[str]:
     """Build the shell command for maxtext.inference.decode.
 
@@ -192,6 +195,7 @@ def build_decode_command(
         # Use dot_product attention to avoid splash attention block-size alignment
         # requirements (splash requires max_target_length % q_block_size == 0).
         "attention=dot_product",
+        f"expert_shard_attention_option={expert_shard_attention_option}",
         # Checkpoint format: zarr3 + OCDBT (produced by convert_checkpoint_to_ocdbt.py)
         "checkpoint_storage_use_ocdbt=true",
         "checkpoint_storage_use_zarr3=true",
@@ -212,6 +216,9 @@ def build_decode_command(
     # checkpointing (shape mismatch with the default param_scan_axis=1).
     if scan_layers:
         cmd.append("async_checkpointing=false")
+    if use_chunked_prefill:
+        cmd.append("use_chunked_prefill=true")
+        cmd.append(f"prefill_chunk_size={prefill_chunk_size}")
     return cmd
 
 
@@ -226,6 +233,9 @@ def run_inference(
     ici_tensor_parallelism: int = 4,
     ici_expert_parallelism: int = 8,
     scan_layers: bool = False,
+    use_chunked_prefill: bool = False,
+    prefill_chunk_size: int = 4096,
+    expert_shard_attention_option: str = "context",
 ) -> tuple[str, float | None, bool]:
     """Execute MaxText inference and return (generated_text, tok_per_s, eos_fired).
 
@@ -247,6 +257,9 @@ def run_inference(
         ici_tensor_parallelism=ici_tensor_parallelism,
         ici_expert_parallelism=ici_expert_parallelism,
         scan_layers=scan_layers,
+        use_chunked_prefill=use_chunked_prefill,
+        prefill_chunk_size=prefill_chunk_size,
+        expert_shard_attention_option=expert_shard_attention_option,
     )
     if verbose:
         print("Running command:")
@@ -477,6 +490,20 @@ def main():
              "stacked checkpoint (mimo-v2-flash-4phase-stacked). "
              "Sets async_checkpointing=false automatically.",
     )
+    parser.add_argument(
+        "--use_chunked_prefill",
+        action="store_true",
+        default=False,
+        help="Split the prefill prompt into chunks of --prefill_chunk_size tokens, "
+             "each processed with dot_product attention. Required for 16K prefill at pdb>=2 "
+             "(flash prefill OOMs). Implies expert_shard_attention_option=context.",
+    )
+    parser.add_argument(
+        "--prefill_chunk_size",
+        type=int,
+        default=4096,
+        help="Chunk size (tokens) used when --use_chunked_prefill is set. Default 4096.",
+    )
     args = parser.parse_args()
 
     if args.print_arch:
@@ -490,7 +517,8 @@ def main():
     print_architecture_summary()
     print(f"\nPrompt:\n{args.prompt}\n")
     scan_label = "scan_layers=true (stacked ckpt)" if args.scan_layers else "scan_layers=false (dense)"
-    print(f"Mode: {scan_label}")
+    chunked_label = f"chunked prefill (chunk={args.prefill_chunk_size})" if args.use_chunked_prefill else "full prefill"
+    print(f"Mode: {scan_label}, {chunked_label}")
     print("-" * 60)
 
     output, tok_per_s, eos_fired = run_inference(
@@ -504,6 +532,8 @@ def main():
         ici_tensor_parallelism=args.ici_tensor_parallelism,
         ici_expert_parallelism=args.ici_expert_parallelism,
         scan_layers=args.scan_layers,
+        use_chunked_prefill=args.use_chunked_prefill,
+        prefill_chunk_size=args.prefill_chunk_size,
     )
     print("-" * 60)
     if tok_per_s is not None:
