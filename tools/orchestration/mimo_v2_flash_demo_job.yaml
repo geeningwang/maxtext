@@ -1,0 +1,56 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: mimo-v2-flash-demo-v7x
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: mimo-v2-flash-demo-v7x
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        cloud.google.com/gke-nodepool: jingnw-flex-tpu7
+        cloud.google.com/gke-tpu-accelerator: tpu7x
+        cloud.google.com/gke-tpu-topology: 2x2x1
+      tolerations:
+      - key: google.com/tpu
+        operator: Equal
+        value: present
+        effect: NoSchedule
+      containers:
+      - name: mimo-demo
+        image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.8.1-rev1
+        command:
+        - bash
+        - -lc
+        - |
+          set -euo pipefail
+          export PATH="/opt/venv/bin:${PATH}"
+          export PYTHONUNBUFFERED=1
+          WORKDIR=/workspace
+          rm -rf "${WORKDIR}"
+          git clone https://github.com/geeningwang/maxtext.git "${WORKDIR}"
+          cd "${WORKDIR}"
+          git checkout tpu-v7x-porting
+          /opt/venv/bin/python -m pip install -e ".[tpu]"
+          install_maxtext_tpu_github_deps
+          /opt/venv/bin/python -m pip install transformers safetensors huggingface_hub
+          /opt/venv/bin/python demos/mimo_v2_flash_demo_jax.py \
+            --checkpoint_path gs://jingnw-mimo-v2-flash-us-east5/mimo-v2-flash-fixed-ocdbt/checkpoints/0/items \
+            --tokenizer_path XiaomiMiMo/MiMo-V2-Flash \
+            --max_new_tokens 128 \
+            --enable_single_controller \
+            --verbose
+        ports:
+        - containerPort: 8431
+        resources:
+          requests:
+            cpu: "10"
+            memory: 64Gi
+            google.com/tpu: "4"
+          limits:
+            cpu: "10"
+            memory: 64Gi
+            google.com/tpu: "4"

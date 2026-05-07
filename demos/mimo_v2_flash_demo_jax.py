@@ -197,6 +197,7 @@ def build_decode_command(
     use_chunked_prefill: bool = False,
     prefill_chunk_size: int = 4096,
     expert_shard_attention_option: str = "context",
+    enable_single_controller: bool = False,
 ) -> list[str]:
     """Build the shell command for maxtext.inference.decode.
 
@@ -234,6 +235,7 @@ def build_decode_command(
         # Checkpoint format: zarr3 + OCDBT (produced by convert_checkpoint_to_ocdbt.py)
         "checkpoint_storage_use_ocdbt=true",
         "checkpoint_storage_use_zarr3=true",
+        f"enable_single_controller={'true' if enable_single_controller else 'false'}",
         # Apply the tokenizer chat template so the model produces a single
         # assistant turn ending with <|im_end|> (EOS), rather than open-ended
         # text completion.  decode.py will call apply_chat_template() when this
@@ -271,6 +273,7 @@ def run_inference(
     use_chunked_prefill: bool = False,
     prefill_chunk_size: int = 4096,
     expert_shard_attention_option: str = "context",
+    enable_single_controller: bool = False,
 ) -> tuple[str, float | None, bool]:
     """Execute MaxText inference and return (generated_text, tok_per_s, eos_fired).
 
@@ -295,6 +298,7 @@ def run_inference(
         use_chunked_prefill=use_chunked_prefill,
         prefill_chunk_size=prefill_chunk_size,
         expert_shard_attention_option=expert_shard_attention_option,
+        enable_single_controller=enable_single_controller,
     )
     if verbose:
         print("Running command:")
@@ -540,6 +544,12 @@ def main():
         default=4096,
         help="Chunk size (tokens) used when --use_chunked_prefill is set. Default 4096.",
     )
+    parser.add_argument(
+        "--enable_single_controller",
+        action="store_true",
+        default=False,
+        help="Pass enable_single_controller=true through to MaxText decode. Useful for single-host TPU runs on GKE where JAX's Kubernetes auto-bootstrap is not needed.",
+    )
     args = parser.parse_args()
 
     if args.print_arch:
@@ -576,6 +586,7 @@ def main():
         scan_layers=args.scan_layers,
         use_chunked_prefill=args.use_chunked_prefill,
         prefill_chunk_size=args.prefill_chunk_size,
+        enable_single_controller=args.enable_single_controller,
     )
     print("-" * 60)
     if tok_per_s is not None:
