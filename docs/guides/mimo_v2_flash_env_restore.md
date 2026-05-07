@@ -1,5 +1,11 @@
 # MiMo-V2-Flash Environment Restore And TPU Benchmark
 
+> **Scope note (2026-05-07):** This guide is the legacy restore path for the
+> deleted TPU v6e VM/slice environment (`jingnw-tpu-op` + `jingnw-node`). The
+> active TPU v7x port now targets GKE cluster `jingnw-tpu7-cluster` with node
+> pool `jingnw-flex-tpu7`. For the v7x migration status and verified smoke-test
+> path, see [docs/guides/tpu_v7x_porting_plan.md](tpu_v7x_porting_plan.md).
+
 This guide recreates the MiMo-V2-Flash environment on the `MiMo-V2-Flash`
 branch, including:
 

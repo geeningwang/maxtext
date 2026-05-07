@@ -147,6 +147,41 @@ DEFAULT_PREFILL_LENGTH = 512
 DEFAULT_MAX_NEW_TOKENS = 512
 
 
+def resolve_parallelism(
+    ici_tensor_parallelism: int | None,
+    ici_expert_parallelism: int | None,
+) -> tuple[int, int, int]:
+    """Resolve a valid TP/EP pair for the current device count.
+
+    MiMo-V2-Flash has only 4 global-attention KV heads, so tensor parallelism
+    must divide 4 and should not exceed 4. When no explicit values are passed,
+    default to TP=4 when possible and use the remaining devices for EP.
+    """
+    if (ici_tensor_parallelism is None) != (ici_expert_parallelism is None):
+        raise ValueError(
+            "Pass both --ici_tensor_parallelism and --ici_expert_parallelism, or neither."
+        )
+
+    try:
+        import jax  # pylint: disable=import-outside-toplevel
+        device_count = jax.device_count()
+    except Exception:  # pylint: disable=broad-except
+        device_count = 1
+
+    if ici_tensor_parallelism is not None and ici_expert_parallelism is not None:
+        return ici_tensor_parallelism, ici_expert_parallelism, device_count
+
+    tensor_parallelism = min(4, max(1, device_count))
+    if 4 % tensor_parallelism != 0:
+        tensor_parallelism = 1
+    if device_count % tensor_parallelism != 0:
+        raise ValueError(
+            f"Auto-parallelism could not factor {device_count} devices into a valid TP/EP pair."
+        )
+    expert_parallelism = max(1, device_count // tensor_parallelism)
+    return tensor_parallelism, expert_parallelism, device_count
+
+
 def build_decode_command(
     checkpoint_path: str,
     tokenizer_path: str,
@@ -464,17 +499,18 @@ def main():
     parser.add_argument(
         "--ici_tensor_parallelism",
         type=int,
-        default=4,
-        help="ICI tensor-parallel degree. Must evenly divide the number of KV heads (4 for "
-             "global-attention layers). Default 4 works on v6e-32 combined with "
-             "ici_expert_parallelism=8 (4×8=32 chips).",
+           default=None,
+           help="ICI tensor-parallel degree. Must evenly divide the number of KV heads (4 for "
+               "global-attention layers). Pass together with --ici_expert_parallelism, or omit "
+               "both to auto-resolve from the current device count.",
     )
     parser.add_argument(
         "--ici_expert_parallelism",
         type=int,
-        default=8,
-        help="ICI expert-parallel degree. 256 experts / 8 = 32 experts per chip. "
-             "Combined with ici_tensor_parallelism=4 gives 4×8=32 chips total on v6e-32.",
+           default=None,
+           help="ICI expert-parallel degree. Pass together with --ici_tensor_parallelism, or omit "
+               "both to auto-resolve from the current device count (for example TP=4, EP=2 on "
+               "an 8-device tpu7x-4 host).",
     )
     parser.add_argument(
         "--print_arch",
@@ -514,11 +550,17 @@ def main():
         ok = dry_run(args.checkpoint_path, args.tokenizer_path)
         sys.exit(0 if ok else 1)
 
+    ici_tensor_parallelism, ici_expert_parallelism, device_count = resolve_parallelism(
+        args.ici_tensor_parallelism,
+        args.ici_expert_parallelism,
+    )
+
     print_architecture_summary()
     print(f"\nPrompt:\n{args.prompt}\n")
     scan_label = "scan_layers=true (stacked ckpt)" if args.scan_layers else "scan_layers=false (dense)"
     chunked_label = f"chunked prefill (chunk={args.prefill_chunk_size})" if args.use_chunked_prefill else "full prefill"
     print(f"Mode: {scan_label}, {chunked_label}")
+    print(f"Parallelism: TP={ici_tensor_parallelism}, EP={ici_expert_parallelism} on {device_count} devices")
     print("-" * 60)
 
     output, tok_per_s, eos_fired = run_inference(
@@ -529,8 +571,8 @@ def main():
         max_new_tokens=args.max_new_tokens,
         dtype=args.dtype,
         verbose=args.verbose,
-        ici_tensor_parallelism=args.ici_tensor_parallelism,
-        ici_expert_parallelism=args.ici_expert_parallelism,
+        ici_tensor_parallelism=ici_tensor_parallelism,
+        ici_expert_parallelism=ici_expert_parallelism,
         scan_layers=args.scan_layers,
         use_chunked_prefill=args.use_chunked_prefill,
         prefill_chunk_size=args.prefill_chunk_size,

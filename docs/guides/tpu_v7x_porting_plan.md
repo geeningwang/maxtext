@@ -6,6 +6,31 @@
 
 ---
 
+## Execution Status
+
+Verified on 2026-05-07 from the recreated `jingnw-tpu-op` VM:
+
+- Installed missing GKE client packages: `kubectl` and
+   `google-cloud-sdk-gke-gcloud-auth-plugin`.
+- Fetched cluster credentials for `jingnw-tpu7-cluster` and validated live
+   access with `kubectl`.
+- Submitted [tools/orchestration/tpu7x_jax_smoke_test.yaml](../../tools/orchestration/tpu7x_jax_smoke_test.yaml),
+   which triggered flex-start scale-up on `jingnw-flex-tpu7` and ran on a TPU
+   node successfully.
+- Verified runtime on the TPU pod:
+   - `JAX_VERSION 0.8.1`
+   - `JAXLIB_VERSION 0.8.1`
+   - `LOCAL_DEVICE_COUNT 8`
+   - `DEVICE_COUNT 8`
+- Verified the JAX AI image `us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.8.1-rev1`
+   works on v7x, but it must be invoked with `/opt/venv/bin/python` because the
+   default `/usr/local/bin/python3` does not have `jax` on `PATH`.
+- Corrected MiMo-V2-Flash parallelism assumption for v7x: on an 8-device
+   `tpu7x-standard-4t` host, the valid default is `TP=4, EP=2`, not `TP=8,
+   EP=1`, because MiMo has only 4 global-attention KV heads.
+
+---
+
 ## 0. Context
 
 The previous environment used a **TPU v6e-32 slice** (`jingnw-node`, `us-east5-b`)
@@ -41,6 +66,8 @@ provides `tpu7x-standard-4t` nodes (4 chips per node, 192 GiB HBM per chip,
 `kubectl` commands work.
 
 ```bash
+sudo apt-get update
+sudo apt-get install -y kubectl google-cloud-sdk-gke-gcloud-auth-plugin
 gcloud container clusters get-credentials jingnw-tpu7-cluster \
   --zone us-central1-c \
   --project tpu-launchpad-playground
@@ -127,10 +154,14 @@ appropriate sharding:
 
 | Dimension        | v6e-32 (32 devices)           | tpu7x-4 (8 devices)                 |
 |------------------|-------------------------------|-------------------------------------|
-| Tensor parallel  | TP=8                          | TP=8 (fits on 8 devices)            |
-| Expert parallel  | EP=4                          | EP=1 (only 8 devices available)     |
+| Tensor parallel  | TP=4                          | TP=4                                |
+| Expert parallel  | EP=8                          | EP=2                                |
 | Data parallel    | DP=1                          | DP=1                                |
-| Mesh shape       | (dp=1, fsdp=1, tp=8, ep=4)    | (dp=1, fsdp=1, tp=8, ep=1)          |
+| Mesh shape       | (dp=1, fsdp=1, tp=4, ep=8)    | (dp=1, fsdp=1, tp=4, ep=2)          |
+
+> **Correction from initial draft:** MiMo-V2-Flash has only 4 global KV heads,
+> so tensor parallelism must not exceed 4. The live demo code now auto-resolves
+> to `TP=4, EP=2` on an 8-device `tpu7x-standard-4t` host.
 
 > **Note:** 192 GiB HBM per v7x chip × 4 chips = 768 GiB per node, vs
 > ~32 GiB × 32 chips = ~1 TiB on v6e-32.  At 4-chip scale, loading the full
@@ -159,25 +190,20 @@ appropriate sharding:
 **Action items:**
 1. Submit a minimal xpk or kubectl job:
    ```bash
-   # via xpk (if installed):
-   python3 xpk/xpk.py workload create \
-     --cluster jingnw-tpu7-cluster \
-     --zone us-central1-c \
-     --project tpu-launchpad-playground \
-     --workload jax-device-test \
-     --tpu-type tpu7x-4 \
-     --num-slices 1 \
-     --docker-image gcr.io/tpu-launchpad-playground/maxtext-tpu:v7x-20260507 \
-     --command "python3 -c \"import jax; print(jax.devices())\""
-
-   # or via kubectl directly:
-   kubectl run jax-test --image=gcr.io/tpu-launchpad-playground/maxtext-tpu:v7x-20260507 \
-     --restart=Never --rm -it \
-     --overrides='{"spec":{"nodeSelector":{"cloud.google.com/gke-tpu-accelerator":"tpu-v7x-8"}}}' \
-     -- python3 -c "import jax; print(jax.devices())"
+   kubectl apply -f tools/orchestration/tpu7x_jax_smoke_test.yaml
+   kubectl wait --for=condition=complete job/tpu7x-jax-smoke-test --timeout=20m
+   kubectl logs job/tpu7x-jax-smoke-test
    ```
-2. Expected output: 8 devices of type `TFRT_TPU_0` through `TFRT_TPU_7`
-   (or similar v7x device descriptors).
+2. Use the verified scheduling contract from the live run:
+   - `cloud.google.com/gke-nodepool=jingnw-flex-tpu7`
+   - `cloud.google.com/gke-tpu-accelerator=tpu7x`
+   - `cloud.google.com/gke-tpu-topology=2x2x1`
+   - `google.com/tpu: 4`
+   - toleration: `google.com/tpu=present:NoSchedule`
+3. Expected output: 8 devices, for example:
+   - `LOCAL_DEVICE_COUNT 8`
+   - `DEVICE_COUNT 8`
+   - `DEVICES ['TPU_0(... )', ..., 'TPU_7(... )']`
 
 ---
 
@@ -336,9 +362,8 @@ Task 1 (cluster creds)
 1. **libtpu version for v7x:** Which minimum libtpu release supports
    `tpu7x-standard-4t`?  Needs verification against the libtpu release notes or
    `gs://libtpu-builds/`.
-2. **TPU resource name in GKE:** Is the Kubernetes resource limit
-   `google.com/tpu: 4` or `google.com/tpu: 8` for a `tpu7x-standard-4t` node?
-   (Depends on whether GKE exposes the resource per chip or per core.)
+2. **Resolved:** the Kubernetes TPU resource for `tpu7x-standard-4t` is
+   `google.com/tpu: 4`, while JAX reports 8 devices on the host.
 3. **DWS node scale-up latency:** Flex-start nodes may take 2–10 minutes to
    provision.  Does the job need an init-container retry loop?
 4. **Model fit on 4 chips:** At FP8-converted BF16, MiMo-V2-Flash is ~155 GB.
