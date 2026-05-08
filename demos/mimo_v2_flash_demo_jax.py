@@ -162,14 +162,18 @@ def resolve_parallelism(
             "Pass both --ici_tensor_parallelism and --ici_expert_parallelism, or neither."
         )
 
+    # If both are explicitly provided, return immediately without initialising JAX
+    # in the parent process (which would acquire the libtpu lockfile and block
+    # the MaxText subprocess from initialising its own TPU backend).
+    if ici_tensor_parallelism is not None and ici_expert_parallelism is not None:
+        device_count = ici_tensor_parallelism * ici_expert_parallelism
+        return ici_tensor_parallelism, ici_expert_parallelism, device_count
+
     try:
         import jax  # pylint: disable=import-outside-toplevel
         device_count = jax.device_count()
     except Exception:  # pylint: disable=broad-except
         device_count = 1
-
-    if ici_tensor_parallelism is not None and ici_expert_parallelism is not None:
-        return ici_tensor_parallelism, ici_expert_parallelism, device_count
 
     tensor_parallelism = min(4, max(1, device_count))
     if 4 % tensor_parallelism != 0:

@@ -40,6 +40,8 @@ spec:
           /opt/venv/bin/python demos/mimo_v2_flash_demo_jax.py \
             --checkpoint_path gs://jingnw-mimo-v2-flash-us-east5/mimo-v2-flash-fixed-ocdbt/checkpoints/0/items \
             --tokenizer_path XiaomiMiMo/MiMo-V2-Flash \
+            --ici_tensor_parallelism 4 \
+            --ici_expert_parallelism 2 \
             --max_new_tokens 128 \
             --enable_single_controller \
             --verbose
