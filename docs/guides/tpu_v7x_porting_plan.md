@@ -8,7 +8,24 @@
 
 ## Execution Status
 
-Verified on 2026-05-07 from the recreated `jingnw-tpu-op` VM:
+### 2026-05-08 — Task 5 (smoke test) and Task 6 (inference pipeline) complete
+
+**Chip presence report** (`tpu7x-chip-info` job — completed):
+- 8× TPU7x devices, each with **94.7 GiB usable HBM** (192 GiB physical / 2 TensorCores per chip)
+- All 1 GiB per-device allocations passed (`ALL CHECKS PASSED`)
+
+**MiMo-V2-Flash first inference run** (`mimo-v2-flash-demo-v7x` job — completed):
+- Throughput: **1.5 tok/s** (BF16, dense checkpoint, full prefill, no FP8)
+- 128 tokens generated in 86.2s (avg 6ms/step after compile)
+- Output coherent and correct (math reasoning problem solved step-by-step)
+- Status: EOS not fired at 128 tokens — model hit `--max_new_tokens` limit mid-sentence (expected for short limit)
+
+**Bugs fixed during Task 6:**
+1. `coordinator_address should be defined` — JAX detects K8s env but `jax[k8s]` not installed; fixed by passing `enable_single_controller=true` to MaxText in both inference and dry-run paths.
+2. `libtpu_lockfile` conflict — `resolve_parallelism()` called `jax.device_count()` in the parent process, initialising libtpu before the MaxText subprocess; fixed by skipping JAX init when TP/EP are explicitly passed.
+3. Node eviction — flex-start DWS node was preempted during image pull on first attempt; resubmission succeeded immediately on the warm node.
+
+### 2026-05-07 — Initial setup
 
 - Installed missing GKE client packages: `kubectl` and
    `google-cloud-sdk-gke-gcloud-auth-plugin`.
@@ -182,35 +199,41 @@ appropriate sharding:
 
 ---
 
-### Task 5 — Smoke test: JAX device detection on v7x node
+### Task 5 — Smoke test: JAX device detection on v7x node ✅ COMPLETE
 
 **Goal:** Confirm that `jax.devices()` returns 8 TPU devices on a
 `tpu7x-standard-4t` node inside a GKE pod.
 
-**Action items:**
-1. Submit a minimal xpk or kubectl job:
-   ```bash
-   kubectl apply -f tools/orchestration/tpu7x_jax_smoke_test.yaml
-   kubectl wait --for=condition=complete job/tpu7x-jax-smoke-test --timeout=20m
-   kubectl logs job/tpu7x-jax-smoke-test
-   ```
-2. Use the verified scheduling contract from the live run:
-   - `cloud.google.com/gke-nodepool=jingnw-flex-tpu7`
-   - `cloud.google.com/gke-tpu-accelerator=tpu7x`
-   - `cloud.google.com/gke-tpu-topology=2x2x1`
-   - `google.com/tpu: 4`
-   - toleration: `google.com/tpu=present:NoSchedule`
-3. Expected output: 8 devices, for example:
-   - `LOCAL_DEVICE_COUNT 8`
-   - `DEVICE_COUNT 8`
-   - `DEVICES ['TPU_0(... )', ..., 'TPU_7(... )']`
+**Result (2026-05-07):** Verified. Two jobs confirmed correct hardware:
+- `tpu7x_jax_smoke_test.yaml` — `LOCAL_DEVICE_COUNT 8`, `DEVICE_COUNT 8`, JAX 0.8.1
+- `tpu7x_chip_info_job.yaml` — 8× TPU7x devices, 94.7 GiB HBM each, all 1 GiB allocations passed
+
+Verified scheduling contract:
+- `cloud.google.com/gke-nodepool=jingnw-flex-tpu7`
+- `cloud.google.com/gke-tpu-accelerator=tpu7x`
+- `cloud.google.com/gke-tpu-topology=2x2x1`
+- `google.com/tpu: 4`
+- toleration: `google.com/tpu=present:NoSchedule`
+- Must use `/opt/venv/bin/python` (not system Python)
 
 ---
 
-### Task 6 — Inference pipeline adaptation: GKE job submission
+### Task 6 — Inference pipeline adaptation: GKE job submission ✅ COMPLETE
 
 **Goal:** Replace the `gcloud tpu-vm ssh --worker=all` invocation pattern with
 a GKE job that runs the MiMo-V2-Flash demo / benchmark.
+
+**Result (2026-05-08):** End-to-end inference confirmed working.
+- Throughput: **1.5 tok/s** (BF16, dense, full prefill — unoptimised baseline)
+- Job: `tools/orchestration/mimo_v2_flash_demo_job.yaml`
+- Key flags: `--ici_tensor_parallelism 4 --ici_expert_parallelism 2 --enable_single_controller`
+- Checkpoint: `gs://jingnw-mimo-v2-flash-us-east5/mimo-v2-flash-fixed-ocdbt/checkpoints/0/items` (cross-region from us-east5, acceptable)
+- Bugs fixed: libtpu lockfile conflict (parent-process JAX init), K8s coordinator_address error
+
+**Expected next-step improvements:**
+- `scan_layers=true` (stacked checkpoint) → lower memory, faster per-step
+- FP8 native matmuls (Task 7)
+- GCS bucket in us-central1 (Task 8) to eliminate cross-region latency
 
 On v6e the inference entry point was:
 ```bash

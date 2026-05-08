@@ -1,0 +1,95 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: tpu7x-chip-info
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: tpu7x-chip-info
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        cloud.google.com/gke-nodepool: jingnw-flex-tpu7
+        cloud.google.com/gke-tpu-accelerator: tpu7x
+        cloud.google.com/gke-tpu-topology: 2x2x1
+      tolerations:
+      - key: google.com/tpu
+        operator: Equal
+        value: present
+        effect: NoSchedule
+      containers:
+      - name: chip-info
+        image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.8.1-rev1
+        command:
+        - bash
+        - -lc
+        - |
+          set -euo pipefail
+          /opt/venv/bin/python - <<'PY'
+          import jax
+          import jaxlib
+          import jax.numpy as jnp
+          import os
+
+          print("=" * 60)
+          print("TPU CHIP PRESENCE REPORT")
+          print("=" * 60)
+          print(f"JAX version          : {jax.__version__}")
+          print(f"JAXlib version       : {jaxlib.__version__}")
+          print(f"Local device count   : {jax.local_device_count()}")
+          print(f"Global device count  : {jax.device_count()}")
+          print()
+
+          devices = jax.devices()
+          print(f"{'Device':<30} {'Kind':<20} {'Platform'}")
+          print("-" * 60)
+          for d in devices:
+              print(f"{str(d):<30} {d.device_kind:<20} {d.platform}")
+
+          print()
+          print("=" * 60)
+          print("HBM MEMORY PER CHIP")
+          print("=" * 60)
+
+          # Use device memory stats to report HBM
+          for d in devices:
+              try:
+                  stats = d.memory_stats()
+                  bytes_limit = stats.get("bytes_limit", None)
+                  bytes_in_use = stats.get("bytes_in_use", 0)
+                  if bytes_limit is not None:
+                      total_gib = bytes_limit / (1024 ** 3)
+                      used_gib  = bytes_in_use / (1024 ** 3)
+                      free_gib  = (bytes_limit - bytes_in_use) / (1024 ** 3)
+                      print(f"{str(d)}: total={total_gib:.1f} GiB  used={used_gib:.1f} GiB  free={free_gib:.1f} GiB")
+                  else:
+                      print(f"{str(d)}: memory_stats available but bytes_limit not reported")
+              except Exception as e:
+                  print(f"{str(d)}: memory_stats unavailable ({e})")
+
+          print()
+          print("=" * 60)
+          print("ALLOCATION SMOKE TEST")
+          print("=" * 60)
+          # Allocate a 1 GiB array on each device to confirm HBM is writable
+          size = 1024 * 1024 * 256  # 256M float32 = 1 GiB
+          for d in devices:
+              arr = jax.device_put(jnp.ones(size, dtype=jnp.float32), d)
+              checksum = float(arr.sum())
+              del arr
+              print(f"{str(d)}: 1 GiB allocation OK (checksum={checksum:.0f})")
+
+          print()
+          print("ALL CHECKS PASSED")
+          PY
+        resources:
+          requests:
+            cpu: "10"
+            memory: 32Gi
+            google.com/tpu: "4"
+          limits:
+            cpu: "10"
+            memory: 32Gi
+            google.com/tpu: "4"
