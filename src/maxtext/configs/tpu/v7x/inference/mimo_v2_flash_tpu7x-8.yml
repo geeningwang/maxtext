@@ -1,0 +1,77 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# maxtext/configs/tpu/v7x/inference/mimo_v2_flash_tpu7x-8.yml
+#
+# MiMo-V2-Flash inference on tpu7x-standard-4t (4 chips, 8 JAX devices)
+#
+# Hardware:  4× TPU v7x chips, 2 TensorCores/chip → 8 JAX devices
+#            192 GiB HBM/chip × 4 = 768 GiB total; ~94.7 GiB usable per device
+# Mesh:      TP=4, EP=2, DP=1, FSDP=1
+# Precision: bfloat16 weights + bfloat16 KV cache (baseline)
+#
+# Usage:
+#   python -m maxtext.inference.decode \
+#     src/maxtext/configs/tpu/v7x/inference/mimo_v2_flash_tpu7x-8.yml \
+#     load_parameters_path=gs://jingnw-mimo-v2-flash-us-central1/mimo-v2-flash-fixed-ocdbt/checkpoints/0/items \
+#     tokenizer_path=XiaomiMiMo/MiMo-V2-Flash \
+#     run_name=mimo_v2_flash_tpu7x8_bf16
+
+base_config: "inference/inference.yml"
+
+# ── Model ──────────────────────────────────────────────────────────────────────
+model_name: "mimo_v2_flash"
+
+# Pull in shared MiMo-V2-Flash architectural params
+# (decoder_block, emb_dim, heads, MoE config, hybrid pattern, etc.)
+base_config: "models/mimo-v2-flash.yml"
+
+# ── Parallelism ────────────────────────────────────────────────────────────────
+# 8 JAX devices: TP=4 (max for 4 global KV heads), EP=2, DP=1
+ici_tensor_parallelism: 4
+ici_expert_parallelism: 2
+ici_data_parallelism: 1
+ici_fsdp_parallelism: 1
+
+# ── Inference settings ─────────────────────────────────────────────────────────
+enable_single_controller: true
+attention: "dot_product"
+enable_dropout: false
+logits_via_embedding: false
+scan_layers: false            # dense checkpoint; set true for stacked/scan ckpt
+
+# ── Precision ──────────────────────────────────────────────────────────────────
+dtype: "bfloat16"
+weight_dtype: "bfloat16"
+
+# ── Sequence lengths ───────────────────────────────────────────────────────────
+max_prefill_predict_length: 1024
+max_target_length: 1152       # prefill + decode window
+
+# ── Per-device batch size ──────────────────────────────────────────────────────
+per_device_batch_size: 1
+
+# ── Tokenizer ──────────────────────────────────────────────────────────────────
+tokenizer_type: "huggingface"
+tokenizer_path: "XiaomiMiMo/MiMo-V2-Flash"
+
+# ── MoE / expert settings ──────────────────────────────────────────────────────
+# MiMo uses dropless sigmoid routing; megablox/ragged_dot not yet validated on v7x
+sparse_matmul: false
+megablox: false
+capacity_factor: -1.0         # dropless
+
+# ── expert_shard_attention_option ─────────────────────────────────────────────
+# "context" = shard KV cache along sequence; safe default for single-node
+expert_shard_attention_option: "context"

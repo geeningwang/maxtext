@@ -1,13 +1,13 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: mimo-v2-flash-demo-v7x
+  name: mimo-v2-flash-int8-v7x
 spec:
   backoffLimit: 0
   template:
     metadata:
       labels:
-        app: mimo-v2-flash-demo-v7x
+        app: mimo-v2-flash-int8-v7x
     spec:
       restartPolicy: Never
       nodeSelector:
@@ -20,7 +20,7 @@ spec:
         value: present
         effect: NoSchedule
       containers:
-      - name: mimo-demo
+      - name: mimo-int8
         image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.8.1-rev1
         command:
         - bash
@@ -37,16 +37,22 @@ spec:
           /opt/venv/bin/python -m pip install -e ".[tpu]"
           install_maxtext_tpu_github_deps
           /opt/venv/bin/python -m pip install transformers safetensors huggingface_hub
+
+          echo "========================================"
+          echo "Task 7: FP8/INT8 quantization on v7x"
+          echo "========================================"
+
+          # Run with int8 dynamic range quantization
+          # This validates that quantized matmuls work correctly on TPU v7x
           /opt/venv/bin/python demos/mimo_v2_flash_demo_jax.py \
             --checkpoint_path gs://jingnw-mimo-v2-flash-us-central1/mimo-v2-flash-fixed-ocdbt/checkpoints/0/items \
             --tokenizer_path XiaomiMiMo/MiMo-V2-Flash \
             --ici_tensor_parallelism 4 \
             --ici_expert_parallelism 2 \
-            --max_new_tokens 128 \
+            --max_new_tokens 64 \
             --enable_single_controller \
+            --quantization int8 \
             --verbose
-        ports:
-        - containerPort: 8431
         resources:
           requests:
             cpu: "10"

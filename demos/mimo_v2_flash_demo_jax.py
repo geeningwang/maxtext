@@ -202,6 +202,7 @@ def build_decode_command(
     prefill_chunk_size: int = 4096,
     expert_shard_attention_option: str = "context",
     enable_single_controller: bool = False,
+    quantization: str = "",
 ) -> list[str]:
     """Build the shell command for maxtext.inference.decode.
 
@@ -260,6 +261,8 @@ def build_decode_command(
     if use_chunked_prefill:
         cmd.append("use_chunked_prefill=true")
         cmd.append(f"prefill_chunk_size={prefill_chunk_size}")
+    if quantization:
+        cmd.append(f"quantization={quantization}")
     return cmd
 
 
@@ -278,6 +281,7 @@ def run_inference(
     prefill_chunk_size: int = 4096,
     expert_shard_attention_option: str = "context",
     enable_single_controller: bool = False,
+    quantization: str = "",
 ) -> tuple[str, float | None, bool]:
     """Execute MaxText inference and return (generated_text, tok_per_s, eos_fired).
 
@@ -303,6 +307,7 @@ def run_inference(
         prefill_chunk_size=prefill_chunk_size,
         expert_shard_attention_option=expert_shard_attention_option,
         enable_single_controller=enable_single_controller,
+        quantization=quantization,
     )
     if verbose:
         print("Running command:")
@@ -556,6 +561,15 @@ def main():
         default=False,
         help="Pass enable_single_controller=true through to MaxText decode. Useful for single-host TPU runs on GKE where JAX's Kubernetes auto-bootstrap is not needed.",
     )
+    parser.add_argument(
+        "--quantization",
+        type=str,
+        default="",
+        choices=["", "int8", "intmp", "fp8_full"],
+        help="Weight quantization mode passed to MaxText: '' (none, bfloat16), 'int8' (dynamic "
+             "8-bit), 'intmp' (mixed-precision), 'fp8_full' (FP8 static scaling). "
+             "Default: '' (no quantization).",
+    )
     args = parser.parse_args()
 
     if args.print_arch:
@@ -576,6 +590,8 @@ def main():
     scan_label = "scan_layers=true (stacked ckpt)" if args.scan_layers else "scan_layers=false (dense)"
     chunked_label = f"chunked prefill (chunk={args.prefill_chunk_size})" if args.use_chunked_prefill else "full prefill"
     print(f"Mode: {scan_label}, {chunked_label}")
+    quant_label = f"quantization={args.quantization}" if args.quantization else "no quantization (bfloat16)"
+    print(f"Quantization: {quant_label}")
     print(f"Parallelism: TP={ici_tensor_parallelism}, EP={ici_expert_parallelism} on {device_count} devices")
     print("-" * 60)
 
@@ -593,10 +609,11 @@ def main():
         use_chunked_prefill=args.use_chunked_prefill,
         prefill_chunk_size=args.prefill_chunk_size,
         enable_single_controller=args.enable_single_controller,
+        quantization=args.quantization,
     )
     print("-" * 60)
     if tok_per_s is not None:
-        print(f"Throughput: {tok_per_s:.1f} tok/s  [{scan_label}]")
+        print(f"Throughput: {tok_per_s:.1f} tok/s  [{scan_label}, {quant_label}]")
     eos_status = "EOS fired (clean stop)" if eos_fired else "WARNING: EOS never fired — output likely garbled (model hit max_new_tokens limit)"
     print(f"Status:     {eos_status}")
     print(f"\nOutput:\n{output}")
