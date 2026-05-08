@@ -401,6 +401,8 @@ def dry_run(checkpoint_path: str, tokenizer_path: str):
             "max_prefill_predict_length=64",
             "max_target_length=128",
             "per_device_batch_size=1",
+            # Skip JAX distributed init in K8s environments that lack jax[k8s].
+            "enable_single_controller=true",
         ]
         cfg = pyconfig.initialize(argv)
         print(f"  decoder_block  : {cfg.decoder_block}")
