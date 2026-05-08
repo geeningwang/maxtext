@@ -1,0 +1,104 @@
+# FP8 Checkpoint Conversion Job
+# ==============================
+# Converts the HF FP8 safetensors checkpoint to a MaxText Orbax (zarr2)
+# checkpoint while preserving the FP8 quantization (--keep_fp8).
+#
+# The resulting checkpoint stores:
+#   - Weights as float8_e4m3fn (uint8 bits in zarr) at ~310 GB total
+#   - Scale tensors as float32 under "<weight_key>_scale_inv"
+# compared to ~620 GB for the BF16 version.
+#
+# Prerequisites (one-time setup)
+# --------------------------------
+# The default GKE node pool only has ~13 GiB RAM per node, which is
+# insufficient for streaming conversion (~50 GiB RAM per MoE layer peak).
+# Create a dedicated high-RAM CPU node pool first:
+#
+#   gcloud container node-pools create jingnw-cpu-highmem \
+#     --cluster jingnw-tpu7-cluster \
+#     --zone us-central1-c \
+#     --project tpu-launchpad-playground \
+#     --machine-type n2-highmem-16 \
+#     --num-nodes 1 \
+#     --disk-size 200 \
+#     --no-enable-autoupgrade
+#
+# n2-highmem-16 provides 16 vCPUs and 128 GiB RAM, comfortably above the
+# ~50 GiB peak required by --streaming_save mode.
+#
+# Usage
+# -----
+#   kubectl apply -f tools/orchestration/convert_fp8_checkpoint_job.yaml
+#   kubectl logs -f job/mimo-v2-flash-fp8-convert
+#
+# After the job completes, verify the output:
+#   gsutil ls gs://jingnw-mimo-v2-flash-us-central1/mimo-v2-flash-fp8-ocdbt/
+#
+# Inference with the FP8 checkpoint (future)
+# -------------------------------------------
+# Once MaxText's FP8 native-checkpoint loading path is available:
+#   --checkpoint_path gs://jingnw-mimo-v2-flash-us-central1/mimo-v2-flash-fp8-ocdbt/checkpoints/0/items
+#   MaxText flags: quantization=fp8_full checkpoint_is_quantized=true
+#
+# Cleanup
+#   kubectl delete job mimo-v2-flash-fp8-convert
+#   gcloud container node-pools delete jingnw-cpu-highmem \
+#     --cluster jingnw-tpu7-cluster --zone us-central1-c --project tpu-launchpad-playground
+
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: mimo-v2-flash-fp8-convert
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: mimo-v2-flash-fp8-convert
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        cloud.google.com/gke-nodepool: jingnw-cpu-highmem
+      containers:
+      - name: fp8-convert
+        image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.8.1-rev1
+        command:
+        - bash
+        - -lc
+        - |
+          set -euo pipefail
+          export PATH="/opt/venv/bin:${PATH}"
+          export PYTHONUNBUFFERED=1
+          # JAX on CPU only — no TPU needed for conversion.
+          export JAX_PLATFORMS=cpu
+
+          WORKDIR=/workspace
+          rm -rf "${WORKDIR}"
+          git clone https://github.com/geeningwang/maxtext.git "${WORKDIR}"
+          cd "${WORKDIR}"
+          git checkout tpu-v7x-porting
+
+          # Install conversion dependencies (zarr, numcodecs, safetensors, ml_dtypes).
+          /opt/venv/bin/python -m pip install -e "." --quiet
+          /opt/venv/bin/python -m pip install safetensors numcodecs zarr ml_dtypes --quiet
+
+          echo "[convert] Starting FP8 checkpoint conversion (streaming_save + keep_fp8)..."
+          echo "[convert] Source : gs://jingnw-mimo-v2-flash-us-east5/hf-model/"
+          echo "[convert] Output : gs://jingnw-mimo-v2-flash-us-central1/mimo-v2-flash-fp8-ocdbt/"
+
+          /opt/venv/bin/python \
+            src/maxtext/checkpoint_conversion/standalone_scripts/convert_mimo_v2_flash.py \
+            --base_model_path gs://jingnw-mimo-v2-flash-us-east5/hf-model/ \
+            --maxtext_model_path gs://jingnw-mimo-v2-flash-us-central1/mimo-v2-flash-fp8-ocdbt/ \
+            --streaming_save \
+            --keep_fp8
+
+          echo "[convert] Done. Listing output checkpoint:"
+          gsutil ls gs://jingnw-mimo-v2-flash-us-central1/mimo-v2-flash-fp8-ocdbt/
+        resources:
+          requests:
+            cpu: "12"
+            memory: 128Gi
+          limits:
+            cpu: "14"
+            memory: 128Gi
