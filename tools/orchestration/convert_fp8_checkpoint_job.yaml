@@ -62,6 +62,8 @@ spec:
       containers:
       - name: fp8-convert
         image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.8.1-rev1
+        securityContext:
+          privileged: true
         command:
         - bash
         - -lc
@@ -72,33 +74,63 @@ spec:
           # JAX on CPU only — no TPU needed for conversion.
           export JAX_PLATFORMS=cpu
 
+          # ---- Install gcsfuse to access GCS buckets as local filesystems ----
+          echo "[setup] Installing gcsfuse..."
+          apt-get update -q -y
+          apt-get install -y -q curl gnupg fuse
+          curl -s https://packages.cloud.google.com/apt/doc/apt-key.gpg \
+            | gpg --dearmor -o /usr/share/keyrings/cloud.google.asc
+          echo "deb [signed-by=/usr/share/keyrings/cloud.google.asc] https://packages.cloud.google.com/apt gcsfuse-bookworm main" \
+            > /etc/apt/sources.list.d/gcsfuse.list
+          apt-get update -q -y && apt-get install -y -q gcsfuse
+          echo "[setup] gcsfuse installed."
+
+          # ---- Mount source bucket (HF FP8 model, read-only) ----
+          mkdir -p /mnt/hf-model
+          gcsfuse --implicit-dirs --only-dir hf-model \
+            jingnw-mimo-v2-flash-us-east5 /mnt/hf-model
+          echo "[setup] Mounted gs://jingnw-mimo-v2-flash-us-east5/hf-model/ at /mnt/hf-model"
+          ls /mnt/hf-model/*.safetensors 2>/dev/null | wc -l | xargs -I{} echo "[setup] {} safetensors shards visible"
+
+          # ---- Mount output bucket ----
+          mkdir -p /mnt/output
+          gcsfuse --implicit-dirs \
+            jingnw-mimo-v2-flash-us-central1 /mnt/output
+          echo "[setup] Mounted gs://jingnw-mimo-v2-flash-us-central1/ at /mnt/output"
+          # Test write access via GCS API (gsutil) before committing to gcsfuse writes
+          echo "gcsfuse_write_test" | gsutil cp - gs://jingnw-mimo-v2-flash-us-central1/_write_test.txt \
+            && gsutil rm gs://jingnw-mimo-v2-flash-us-central1/_write_test.txt \
+            && echo "[setup] GCS write access OK" \
+            || { echo "[setup] ERROR: no write access to jingnw-mimo-v2-flash-us-central1"; exit 1; }
+          # No explicit mkdir needed — the conversion script creates directories itself
+
+          # ---- Clone repo and install deps ----
           WORKDIR=/workspace
           rm -rf "${WORKDIR}"
           git clone https://github.com/geeningwang/maxtext.git "${WORKDIR}"
           cd "${WORKDIR}"
           git checkout tpu-v7x-porting
 
-          # Install conversion dependencies (zarr, numcodecs, safetensors, ml_dtypes).
           /opt/venv/bin/python -m pip install -e "." --quiet
-          /opt/venv/bin/python -m pip install safetensors numcodecs zarr ml_dtypes --quiet
+          /opt/venv/bin/python -m pip install "safetensors" "numcodecs" "zarr>=2,<3" "ml_dtypes" --quiet
 
           echo "[convert] Starting FP8 checkpoint conversion (streaming_save + keep_fp8)..."
-          echo "[convert] Source : gs://jingnw-mimo-v2-flash-us-east5/hf-model/"
-          echo "[convert] Output : gs://jingnw-mimo-v2-flash-us-central1/mimo-v2-flash-fp8-ocdbt/"
+          echo "[convert] Source : /mnt/hf-model  (gs://jingnw-mimo-v2-flash-us-east5/hf-model/)"
+          echo "[convert] Output : /mnt/output/mimo-v2-flash-fp8-ocdbt  (gs://jingnw-mimo-v2-flash-us-central1/mimo-v2-flash-fp8-ocdbt/)"
 
           /opt/venv/bin/python \
             src/maxtext/checkpoint_conversion/standalone_scripts/convert_mimo_v2_flash.py \
-            --base_model_path gs://jingnw-mimo-v2-flash-us-east5/hf-model/ \
-            --maxtext_model_path gs://jingnw-mimo-v2-flash-us-central1/mimo-v2-flash-fp8-ocdbt/ \
+            --base_model_path /mnt/hf-model \
+            --maxtext_model_path /mnt/output/mimo-v2-flash-fp8-ocdbt \
             --streaming_save \
             --keep_fp8
 
           echo "[convert] Done. Listing output checkpoint:"
-          gsutil ls gs://jingnw-mimo-v2-flash-us-central1/mimo-v2-flash-fp8-ocdbt/
+          ls /mnt/output/mimo-v2-flash-fp8-ocdbt/
         resources:
           requests:
             cpu: "12"
-            memory: 128Gi
+            memory: 110Gi
           limits:
             cpu: "14"
-            memory: 128Gi
+            memory: 110Gi

@@ -49,16 +49,17 @@ spec:
             --tokenizer_path XiaomiMiMo/MiMo-V2-Flash \
             --ici_tensor_parallelism 4 \
             --ici_expert_parallelism 2 \
-            --max_new_tokens 64 \
+            --max_prefill 128 \
+            --max_new_tokens 32 \
             --enable_single_controller \
             --quantization int8 \
             --verbose
         resources:
           requests:
             cpu: "10"
-            memory: 64Gi
+            memory: 128Gi
             google.com/tpu: "4"
           limits:
             cpu: "10"
-            memory: 64Gi
+            memory: 128Gi
             google.com/tpu: "4"
