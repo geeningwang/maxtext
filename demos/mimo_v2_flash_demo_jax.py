@@ -203,6 +203,8 @@ def build_decode_command(
     expert_shard_attention_option: str = "context",
     enable_single_controller: bool = False,
     quantization: str = "",
+    checkpoint_is_quantized: bool = False,
+    checkpoint_use_ocdbt: bool = True,
 ) -> list[str]:
     """Build the shell command for maxtext.inference.decode.
 
@@ -237,9 +239,9 @@ def build_decode_command(
         # requirements (splash requires max_target_length % q_block_size == 0).
         "attention=dot_product",
         f"expert_shard_attention_option={expert_shard_attention_option}",
-        # Checkpoint format: zarr3 + OCDBT (produced by convert_checkpoint_to_ocdbt.py)
-        "checkpoint_storage_use_ocdbt=true",
-        "checkpoint_storage_use_zarr3=true",
+        # Checkpoint format flags: OCDBT+zarr3 for standard checkpoints, zarr2 for FP8.
+        f"checkpoint_storage_use_ocdbt={'true' if checkpoint_use_ocdbt else 'false'}",
+        f"checkpoint_storage_use_zarr3={'true' if checkpoint_use_ocdbt else 'false'}",
         f"enable_single_controller={'true' if enable_single_controller else 'false'}",
         # Apply the tokenizer chat template so the model produces a single
         # assistant turn ending with <|im_end|> (EOS), rather than open-ended
@@ -263,6 +265,8 @@ def build_decode_command(
         cmd.append(f"prefill_chunk_size={prefill_chunk_size}")
     if quantization:
         cmd.append(f"quantization={quantization}")
+    if checkpoint_is_quantized:
+        cmd.append("checkpoint_is_quantized=true")
     return cmd
 
 
@@ -282,6 +286,8 @@ def run_inference(
     expert_shard_attention_option: str = "context",
     enable_single_controller: bool = False,
     quantization: str = "",
+    checkpoint_is_quantized: bool = False,
+    checkpoint_use_ocdbt: bool = True,
 ) -> tuple[str, float | None, bool]:
     """Execute MaxText inference and return (generated_text, tok_per_s, eos_fired).
 
@@ -308,6 +314,8 @@ def run_inference(
         expert_shard_attention_option=expert_shard_attention_option,
         enable_single_controller=enable_single_controller,
         quantization=quantization,
+        checkpoint_is_quantized=checkpoint_is_quantized,
+        checkpoint_use_ocdbt=checkpoint_use_ocdbt,
     )
     if verbose:
         print("Running command:")
@@ -570,6 +578,22 @@ def main():
              "8-bit), 'intmp' (mixed-precision), 'fp8_full' (FP8 static scaling). "
              "Default: '' (no quantization).",
     )
+    parser.add_argument(
+        "--checkpoint_is_quantized",
+        action="store_true",
+        default=False,
+        help="Pass checkpoint_is_quantized=true to MaxText. Use when the checkpoint already "
+             "contains quantized weights (e.g. FP8 native checkpoint from --keep_fp8 "
+             "conversion). Skips on-the-fly quantize_params() forward pass (avoids HBM OOM).",
+    )
+    parser.add_argument(
+        "--checkpoint_use_ocdbt",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use OCDBT+zarr3 checkpoint format (default True for standard OCDBT checkpoints). "
+             "Pass --no-checkpoint_use_ocdbt for plain zarr2 checkpoints (e.g. FP8 native "
+             "checkpoints produced by convert_mimo_v2_flash.py --keep_fp8).",
+    )
     args = parser.parse_args()
 
     if args.print_arch:
@@ -591,6 +615,8 @@ def main():
     chunked_label = f"chunked prefill (chunk={args.prefill_chunk_size})" if args.use_chunked_prefill else "full prefill"
     print(f"Mode: {scan_label}, {chunked_label}")
     quant_label = f"quantization={args.quantization}" if args.quantization else "no quantization (bfloat16)"
+    if args.checkpoint_is_quantized:
+        quant_label += " (checkpoint_is_quantized)"
     print(f"Quantization: {quant_label}")
     print(f"Parallelism: TP={ici_tensor_parallelism}, EP={ici_expert_parallelism} on {device_count} devices")
     print("-" * 60)
@@ -610,6 +636,8 @@ def main():
         prefill_chunk_size=args.prefill_chunk_size,
         enable_single_controller=args.enable_single_controller,
         quantization=args.quantization,
+        checkpoint_is_quantized=args.checkpoint_is_quantized,
+        checkpoint_use_ocdbt=args.checkpoint_use_ocdbt,
     )
     print("-" * 60)
     if tok_per_s is not None:
