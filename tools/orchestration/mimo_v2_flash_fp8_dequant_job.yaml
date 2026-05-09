@@ -1,0 +1,43 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: mimo-v2-flash-fp8-dequant
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: mimo-v2-flash-fp8-dequant
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        cloud.google.com/gke-nodepool: jingnw-cpu-highmem
+      containers:
+      - name: mimo-fp8-dequant
+        image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.8.1-rev1
+        command:
+        - bash
+        - -lc
+        - |
+          set -euo pipefail
+          export PATH="/opt/venv/bin:${PATH}"
+          export PYTHONUNBUFFERED=1
+          WORKDIR=/workspace
+          rm -rf "${WORKDIR}"
+          git clone https://github.com/geeningwang/maxtext.git "${WORKDIR}"
+          cd "${WORKDIR}"
+          git checkout tpu-v7x-porting
+          # Install zarr + gcsfs + ml_dtypes (likely already present in JAX image)
+          /opt/venv/bin/python -m pip install --quiet zarr gcsfs ml_dtypes
+          # Run dequantization: FP8 zarr2 → BF16 zarr2
+          /opt/venv/bin/python \
+            src/maxtext/checkpoint_conversion/standalone_scripts/dequant_fp8_zarr2.py \
+            --src_path gs://jingnw-mimo-v2-flash-us-central1/mimo-v2-flash-fp8-ocdbt/0/items \
+            --dst_path gs://jingnw-mimo-v2-flash-us-central1/mimo-v2-flash-bf16-zarr2/0/items
+        resources:
+          requests:
+            cpu: "12"
+            memory: 100Gi
+          limits:
+            cpu: "12"
+            memory: 100Gi
