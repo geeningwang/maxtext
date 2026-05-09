@@ -35,7 +35,6 @@ import time
 import ml_dtypes
 import numpy as np
 import zarr
-import zarr.storage
 import gcsfs
 
 _BF16 = ml_dtypes.bfloat16
@@ -137,10 +136,8 @@ def dequant_fp8_checkpoint(src_path: str, dst_path: str) -> None:
   if len(kernel_to_scale) > 6:
     print(f"  … and {len(kernel_to_scale) - 6} more pairs", flush=True)
 
-  # --- Open zarr stores ---
+  # --- Open GCS filesystem ---
   fs = gcsfs.GCSFileSystem()
-  src_store = zarr.storage.FSStore(src_path, fs=fs, mode="r", key_separator="/")
-  dst_store = zarr.storage.FSStore(dst_path, fs=fs, mode="w", key_separator="/")
 
   # --- Process arrays ---
   t0 = time.monotonic()
@@ -160,13 +157,13 @@ def dequant_fp8_checkpoint(src_path: str, dst_path: str) -> None:
       n_skipped += 1
       continue
 
-    # Load source array
-    src_arr = zarr.open_array(src_store, path=name, mode="r")
+    # Load source array (open each array by its full GCS URL)
+    src_arr = zarr.open_array(fs.get_mapper(f"{src_path}/{name}"), mode="r")
     data = src_arr[:]  # numpy array
 
     if name in kernel_to_scale:
       scale_name = kernel_to_scale[name]
-      scale_arr = zarr.open_array(src_store, path=scale_name, mode="r")
+      scale_arr = zarr.open_array(fs.get_mapper(f"{src_path}/{scale_name}"), mode="r")
       scale = scale_arr[:]
       print(
           f"  dtype={data.dtype} shape={data.shape} "
@@ -181,8 +178,7 @@ def dequant_fp8_checkpoint(src_path: str, dst_path: str) -> None:
 
     # Write to destination (preserve chunk layout from source)
     dst_arr = zarr.open_array(
-        dst_store,
-        path=name,
+        fs.get_mapper(f"{dst_path}/{name}"),
         mode="w",
         shape=data.shape,
         dtype=data.dtype,
