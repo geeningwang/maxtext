@@ -27,8 +27,8 @@ spec:
           git clone https://github.com/geeningwang/maxtext.git "${WORKDIR}"
           cd "${WORKDIR}"
           git checkout tpu-v7x-porting
-          # Install zarr + gcsfs + ml_dtypes (likely already present in JAX image)
-          /opt/venv/bin/python -m pip install --quiet zarr gcsfs ml_dtypes
+          # Install zarr v2 (container ships zarr v3 which can't read zarr2 bf16 dtype)
+          /opt/venv/bin/python -m pip install --quiet "zarr<3" gcsfs ml_dtypes
           # Run dequantization: FP8 zarr2 → BF16 zarr2
           /opt/venv/bin/python \
             src/maxtext/checkpoint_conversion/standalone_scripts/dequant_fp8_zarr2.py \
