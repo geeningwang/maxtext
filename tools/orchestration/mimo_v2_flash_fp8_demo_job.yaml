@@ -38,14 +38,13 @@ spec:
           install_maxtext_tpu_github_deps
           /opt/venv/bin/python -m pip install transformers safetensors huggingface_hub
           /opt/venv/bin/python demos/mimo_v2_flash_demo_jax.py \
-            --checkpoint_path gs://jingnw-mimo-v2-flash-us-central1/mimo-v2-flash-fixed-ocdbt/checkpoints/0/items \
+            --checkpoint_path gs://jingnw-mimo-v2-flash-us-central1/mimo-v2-flash-fp8-ocdbt/0/items \
             --tokenizer_path XiaomiMiMo/MiMo-V2-Flash \
             --ici_tensor_parallelism 4 \
             --ici_expert_parallelism 2 \
             --max_new_tokens 32 \
             --enable_single_controller \
-            --quantization fp8_full \
-            --use_qwix_quantization \
+            --no-checkpoint_use_ocdbt \
             --verbose
         ports:
         - containerPort: 8431
