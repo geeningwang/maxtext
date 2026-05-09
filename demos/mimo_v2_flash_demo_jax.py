@@ -205,6 +205,7 @@ def build_decode_command(
     quantization: str = "",
     checkpoint_is_quantized: bool = False,
     checkpoint_use_ocdbt: bool = True,
+    use_qwix_quantization: bool = False,
 ) -> list[str]:
     """Build the shell command for maxtext.inference.decode.
 
@@ -265,6 +266,8 @@ def build_decode_command(
         cmd.append(f"prefill_chunk_size={prefill_chunk_size}")
     if quantization:
         cmd.append(f"quantization={quantization}")
+    if use_qwix_quantization:
+        cmd.append("use_qwix_quantization=true")
     if checkpoint_is_quantized:
         cmd.append("checkpoint_is_quantized=true")
     return cmd
@@ -288,6 +291,7 @@ def run_inference(
     quantization: str = "",
     checkpoint_is_quantized: bool = False,
     checkpoint_use_ocdbt: bool = True,
+    use_qwix_quantization: bool = False,
 ) -> tuple[str, float | None, bool]:
     """Execute MaxText inference and return (generated_text, tok_per_s, eos_fired).
 
@@ -316,6 +320,7 @@ def run_inference(
         quantization=quantization,
         checkpoint_is_quantized=checkpoint_is_quantized,
         checkpoint_use_ocdbt=checkpoint_use_ocdbt,
+        use_qwix_quantization=use_qwix_quantization,
     )
     if verbose:
         print("Running command:")
@@ -595,6 +600,13 @@ def main():
              "Pass --no-checkpoint_use_ocdbt for plain zarr2 checkpoints (e.g. FP8 native "
              "checkpoints produced by convert_mimo_v2_flash.py --keep_fp8).",
     )
+    parser.add_argument(
+        "--use_qwix_quantization",
+        action="store_true",
+        default=False,
+        help="Pass use_qwix_quantization=true to MaxText. Required for fp8_full quantization "
+             "mode which uses the qwix quantization provider.",
+    )
     args = parser.parse_args()
 
     if args.print_arch:
@@ -639,6 +651,7 @@ def main():
         quantization=args.quantization,
         checkpoint_is_quantized=args.checkpoint_is_quantized,
         checkpoint_use_ocdbt=args.checkpoint_use_ocdbt,
+        use_qwix_quantization=args.use_qwix_quantization,
     )
     print("-" * 60)
     if tok_per_s is not None:

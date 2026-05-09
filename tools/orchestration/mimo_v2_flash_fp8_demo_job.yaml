@@ -44,7 +44,8 @@ spec:
             --ici_expert_parallelism 2 \
             --max_new_tokens 32 \
             --enable_single_controller \
-            --quantization aqt_fp8_full \
+            --quantization fp8_full \
+            --use_qwix_quantization \
             --verbose
         ports:
         - containerPort: 8431
