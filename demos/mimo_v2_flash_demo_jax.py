@@ -578,10 +578,10 @@ def main():
         "--quantization",
         type=str,
         default="",
-        choices=["", "int8", "intmp", "aqt_fp8", "aqt_fp8_full"],
-        help="Weight quantization mode passed to MaxText: '' (none, bfloat16), 'int8' (dynamic "
-             "8-bit), 'intmp' (mixed-precision), 'aqt_fp8' (AQT FP8 fwd-only), "
-             "'aqt_fp8_full' (AQT FP8 fwd+bwd). "
+        choices=["", "int8", "intmp", "aqt_fp8", "aqt_fp8_full", "fp8_full", "fp8", "nanoo_fp8"],
+        help="Weight quantization mode passed to MaxText. '' = bfloat16 (no quant). "
+             "'fp8_full' = qwix FP8 (use with --use_qwix_quantization). "
+             "'int8' = AQT dynamic 8-bit. 'aqt_fp8_full' = AQT FP8. "
              "Default: '' (no quantization).",
     )
     parser.add_argument(
