@@ -85,7 +85,7 @@ import jax.numpy as jnp
 import qwix
 from qwix._src.providers.ptq import WithAux
 
-from flax.linen import spmd as nn_partitioning
+from flax.linen import partitioning as nn_partitioning
 
 from maxtext.common.common_types import MODEL_MODE_PREFILL
 from maxtext.configs import pyconfig
