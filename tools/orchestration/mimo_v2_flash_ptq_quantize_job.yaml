@@ -36,7 +36,7 @@ spec:
           /opt/venv/bin/python \
             -m maxtext.checkpoint_conversion.standalone_scripts.quantize_params_ptq \
             src/maxtext/configs/base.yml \
-            src/maxtext/configs/models/mimo-v2-flash.yml \
+            model_name=mimo-v2-flash \
             run_name=mimo_ptq_quantize \
             load_parameters_path=gs://jingnw-mimo-v2-flash-us-central1/mimo-v2-flash-fixed-ocdbt/checkpoints/0/items \
             save_quantized_params_path=gs://jingnw-mimo-v2-flash-us-central1/mimo-v2-flash-fp8-ptq/0/items \
