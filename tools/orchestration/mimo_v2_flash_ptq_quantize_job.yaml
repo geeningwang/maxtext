@@ -3,6 +3,12 @@ kind: Job
 metadata:
   name: mimo-v2-flash-ptq-quantize
 spec:
+  # 2-worker indexed job targeting the 2x2x2 multi-host TPU slice (8 chips, 16 JAX devices).
+  # Each worker runs on one tpu7x-standard-4t node (4 chips / 8 JAX devices).
+  # Memory per device: 412 GB BF16 / 16 devices = 25.75 GB < 47 GiB HBM.
+  completions: 2
+  parallelism: 2
+  completionMode: Indexed
   backoffLimit: 0
   template:
     metadata:
@@ -11,9 +17,9 @@ spec:
     spec:
       restartPolicy: Never
       nodeSelector:
-        cloud.google.com/gke-nodepool: jingnw-flex-tpu7
+        cloud.google.com/gke-nodepool: jingnw-flex-tpu7-8ch
         cloud.google.com/gke-tpu-accelerator: tpu7x
-        cloud.google.com/gke-tpu-topology: 2x2x1
+        cloud.google.com/gke-tpu-topology: 2x2x2
       tolerations:
       - key: google.com/tpu
         operator: Equal
@@ -37,9 +43,9 @@ spec:
           /opt/venv/bin/python -m pip install -e ".[tpu]"
           install_maxtext_tpu_github_deps
           /opt/venv/bin/python -m pip install transformers safetensors huggingface_hub
-          # Run offline PTQ quantization on TPU with TP=4, EP=2 sharding.
-          # Each chip holds ~51 GB BF16 + ~26 GB FP8 = ~77 GB peak, fits in 94.75 GiB HBM.
-          # MoE expert weights (gmm/ragged_dot) remain in BF16; attention layers -> FP8.
+          # 2-host multi-controller run: pyconfig calls jax.distributed.initialize() which
+          # auto-discovers coordinator across the 2x2x2 slice via PJRT TPU metadata.
+          # TP=8, EP=2 spreads the 412 GB BF16 model across all 16 JAX devices.
           /opt/venv/bin/python \
             -m maxtext.checkpoint_conversion.standalone_scripts.quantize_params_ptq \
             src/maxtext/configs/base.yml \
@@ -50,12 +56,11 @@ spec:
             use_qwix_quantization=true \
             quantization=fp8_full \
             checkpoint_is_quantized=false \
-            ici_tensor_parallelism=4 \
+            ici_tensor_parallelism=8 \
             ici_expert_parallelism=2 \
             max_target_length=128 \
             per_device_batch_size=1 \
             attention=dot_product \
-            enable_single_controller=true \
             checkpoint_storage_use_ocdbt=true \
             checkpoint_storage_use_zarr3=false \
             async_checkpointing=false
