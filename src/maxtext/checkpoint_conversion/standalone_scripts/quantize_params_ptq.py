@@ -109,8 +109,8 @@ def main(argv: Sequence[str]) -> None:
   rng = jax.random.PRNGKey(0)
   rng, rng_bf16, rng_ptq = jax.random.split(rng, 3)
 
-  devices = max_utils.create_device_mesh(config)
-  mesh = max_utils.create_device_mesh_from_devices(devices, config)
+  devices_array = maxtext_utils.create_device_mesh(config=config)
+  mesh = jax.sharding.Mesh(devices_array, config.mesh_axes)
 
   # ------------------------------------------------------------------
   # Step 1: Build two models — BF16 (for loading) and PTQ (for shapes).
