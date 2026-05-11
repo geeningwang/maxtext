@@ -83,6 +83,9 @@ from absl import app
 import jax
 import jax.numpy as jnp
 import qwix
+from qwix._src.qarray import WithAux
+
+from flax.linen import spmd as nn_partitioning
 
 from maxtext.common.common_types import MODEL_MODE_PREFILL
 from maxtext.configs import pyconfig
@@ -107,7 +110,7 @@ def main(argv: Sequence[str]) -> None:
   max_logging.log(f"  PTQ output path:  {config.save_quantized_params_path}")
 
   rng = jax.random.PRNGKey(0)
-  rng, rng_bf16, rng_ptq = jax.random.split(rng, 3)
+  rng, rng_bf16 = jax.random.split(rng, 2)
 
   devices_array = maxtext_utils.create_device_mesh(config=config)
   mesh = jax.sharding.Mesh(devices_array, config.mesh_axes)
@@ -139,19 +142,37 @@ def main(argv: Sequence[str]) -> None:
 
   # ------------------------------------------------------------------
   # Step 3: Get abstract PTQ params (WithAux[QArray] at quantized positions).
+  #
+  # IMPORTANT: we bypass get_abstract_state() here because its second
+  # jax.jit(…, out_shardings=…).eval_shape() pass strips the qwix WithAux
+  # pytree nodes, replacing them with plain ShapeDtypeStruct leaves.
+  # Instead we call jax.eval_shape(ptq_model.init, …) directly, which
+  # preserves the WithAux(LogicallyPartitioned(abstract_QArray), how)
+  # structure. We then unbox the LogicallyPartitioned wrappers (SPMD
+  # annotations from MaxText) while keeping the WithAux nodes intact.
   # ------------------------------------------------------------------
   max_logging.log("Computing abstract PTQ parameter shapes via eval_shape...")
-  abstract_ptq_state, _, _ = maxtext_utils.get_abstract_state(
-      ptq_model, None, config, rng_ptq, mesh, is_training=False
-  )
-  abstract_ptq_weights = abstract_ptq_state.params["params"]
+  input_shape = (config.micro_batch_size_to_train_on, config.max_target_length)
+  rng_init = jax.random.PRNGKey(1)
+  rng_params, rng_dropout, rng_aqt = jax.random.split(rng_init, 3)
+  with jax.set_mesh(mesh), nn_partitioning.axis_rules(config.logical_axis_rules):
+    abstract_ptq_vars = jax.eval_shape(
+        ptq_model.init,
+        {"params": rng_params, "dropout": rng_dropout, "aqt": rng_aqt},
+        jnp.ones(input_shape, dtype=jnp.int32),
+        jnp.ones(input_shape, dtype=jnp.int32),
+    )
+  # Unbox LogicallyPartitioned wrappers inside WithAux but keep WithAux nodes.
+  abstract_ptq_weights_boxed = abstract_ptq_vars["params"]["params"]
+  abstract_ptq_weights = max_utils.unbox_logicallypartioned(abstract_ptq_weights_boxed)
   max_logging.log("Abstract PTQ shapes computed.")
 
-  # Count how many weights will be quantized.
-  flat_abstract = jax.tree_util.tree_leaves_with_path(abstract_ptq_weights)
+  # Count WithAux nodes (is_leaf stops traversal at WithAux, so they appear as leaves).
   num_quantized = sum(
-      1 for _, v in jax.tree_util.tree_leaves_with_path(abstract_ptq_weights)
-      if _is_with_aux(v)
+      1 for v in jax.tree_util.tree_leaves(
+          abstract_ptq_weights, is_leaf=lambda x: isinstance(x, WithAux)
+      )
+      if isinstance(v, WithAux)
   )
   max_logging.log(f"Weights to be FP8-quantized: {num_quantized}")
 
@@ -203,11 +224,6 @@ def _validate_config(config):
   assert not config.checkpoint_is_quantized, (
       "checkpoint_is_quantized must be false (we are converting FROM a BF16 checkpoint)."
   )
-
-
-def _is_with_aux(x):
-  """Check if x is a qwix WithAux object (a quantized weight placeholder)."""
-  return hasattr(x, "how") and hasattr(x, "array")
 
 
 if __name__ == "__main__":
