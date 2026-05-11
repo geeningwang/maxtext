@@ -83,7 +83,7 @@ from absl import app
 import jax
 import jax.numpy as jnp
 import qwix
-from qwix._src.qarray import WithAux
+from qwix._src.providers.ptq import WithAux
 
 from flax.linen import spmd as nn_partitioning
 
