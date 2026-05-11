@@ -26,7 +26,7 @@ spec:
           rm -rf "${WORKDIR}"
           git clone https://github.com/geeningwang/maxtext.git "${WORKDIR}"
           cd "${WORKDIR}"
-          git checkout tpu-v7x-porting
+          git checkout MiMo-V2-Flash
           /opt/venv/bin/python -m pip install -e ".[tpu]"
           install_maxtext_tpu_github_deps
           /opt/venv/bin/python -m pip install transformers safetensors huggingface_hub
