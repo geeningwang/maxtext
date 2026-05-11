@@ -163,7 +163,8 @@ def main(argv: Sequence[str]) -> None:
         jnp.ones(input_shape, dtype=jnp.int32),
     )
   # Unbox LogicallyPartitioned wrappers inside WithAux but keep WithAux nodes.
-  abstract_ptq_weights_boxed = abstract_ptq_vars["params"]["params"]
+  # model.init returns {"params": {decoder: ...}}; bf16_weights = state.params["params"].
+  abstract_ptq_weights_boxed = abstract_ptq_vars["params"]
   abstract_ptq_weights = max_utils.unbox_logicallypartioned(abstract_ptq_weights_boxed)
   max_logging.log("Abstract PTQ shapes computed.")
 
