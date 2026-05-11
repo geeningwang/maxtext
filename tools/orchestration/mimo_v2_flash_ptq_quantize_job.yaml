@@ -11,7 +11,14 @@ spec:
     spec:
       restartPolicy: Never
       nodeSelector:
-        cloud.google.com/gke-nodepool: jingnw-cpu-highmem
+        cloud.google.com/gke-nodepool: jingnw-flex-tpu7
+        cloud.google.com/gke-tpu-accelerator: tpu7x
+        cloud.google.com/gke-tpu-topology: 2x2x1
+      tolerations:
+      - key: google.com/tpu
+        operator: Equal
+        value: present
+        effect: NoSchedule
       containers:
       - name: mimo-ptq-quantize
         image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.8.1-rev1
@@ -30,9 +37,9 @@ spec:
           /opt/venv/bin/python -m pip install -e ".[tpu]"
           install_maxtext_tpu_github_deps
           /opt/venv/bin/python -m pip install transformers safetensors huggingface_hub
-          # Run offline PTQ quantization: BF16 OCDBT checkpoint -> FP8 zarr2 checkpoint
-          # This uses qwix.quantize_params to convert attention weights to float8_e4m3fn.
-          # MoE expert weights (processed via gmm/ragged_dot) remain in BF16.
+          # Run offline PTQ quantization on TPU with TP=4, EP=2 sharding.
+          # Each chip holds ~51 GB BF16 + ~26 GB FP8 = ~77 GB peak, fits in 94.75 GiB HBM.
+          # MoE expert weights (gmm/ragged_dot) remain in BF16; attention layers -> FP8.
           /opt/venv/bin/python \
             -m maxtext.checkpoint_conversion.standalone_scripts.quantize_params_ptq \
             src/maxtext/configs/base.yml \
@@ -43,8 +50,8 @@ spec:
             use_qwix_quantization=true \
             quantization=fp8_full \
             checkpoint_is_quantized=false \
-            ici_tensor_parallelism=1 \
-            ici_expert_parallelism=1 \
+            ici_tensor_parallelism=4 \
+            ici_expert_parallelism=2 \
             max_target_length=128 \
             per_device_batch_size=1 \
             attention=dot_product \
@@ -54,8 +61,10 @@ spec:
             async_checkpointing=false
         resources:
           requests:
-            cpu: "12"
-            memory: 100Gi
+            cpu: "10"
+            memory: 64Gi
+            google.com/tpu: "4"
           limits:
-            cpu: "12"
-            memory: 100Gi
+            cpu: "10"
+            memory: 64Gi
+            google.com/tpu: "4"
