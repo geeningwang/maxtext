@@ -162,6 +162,10 @@ def build_decode_command(
     use_chunked_prefill: bool = False,
     prefill_chunk_size: int = 4096,
     expert_shard_attention_option: str = "context",
+    use_qwix_quantization: bool = False,
+    quantization: str = "",
+    checkpoint_is_quantized: bool = False,
+    checkpoint_storage_use_zarr3: bool = True,
 ) -> list[str]:
     """Build the shell command for maxtext.inference.decode.
 
@@ -198,7 +202,7 @@ def build_decode_command(
         f"expert_shard_attention_option={expert_shard_attention_option}",
         # Checkpoint format: zarr3 + OCDBT (produced by convert_checkpoint_to_ocdbt.py)
         "checkpoint_storage_use_ocdbt=true",
-        "checkpoint_storage_use_zarr3=true",
+        f"checkpoint_storage_use_zarr3={'true' if checkpoint_storage_use_zarr3 else 'false'}",
         # Apply the tokenizer chat template so the model produces a single
         # assistant turn ending with <|im_end|> (EOS), rather than open-ended
         # text completion.  decode.py will call apply_chat_template() when this
@@ -219,6 +223,12 @@ def build_decode_command(
     if use_chunked_prefill:
         cmd.append("use_chunked_prefill=true")
         cmd.append(f"prefill_chunk_size={prefill_chunk_size}")
+    if use_qwix_quantization:
+        cmd.append("use_qwix_quantization=true")
+        if quantization:
+            cmd.append(f"quantization={quantization}")
+        if checkpoint_is_quantized:
+            cmd.append("checkpoint_is_quantized=true")
     return cmd
 
 
@@ -236,6 +246,10 @@ def run_inference(
     use_chunked_prefill: bool = False,
     prefill_chunk_size: int = 4096,
     expert_shard_attention_option: str = "context",
+    use_qwix_quantization: bool = False,
+    quantization: str = "",
+    checkpoint_is_quantized: bool = False,
+    checkpoint_storage_use_zarr3: bool = True,
 ) -> tuple[str, float | None, bool]:
     """Execute MaxText inference and return (generated_text, tok_per_s, eos_fired).
 
@@ -260,6 +274,10 @@ def run_inference(
         use_chunked_prefill=use_chunked_prefill,
         prefill_chunk_size=prefill_chunk_size,
         expert_shard_attention_option=expert_shard_attention_option,
+        use_qwix_quantization=use_qwix_quantization,
+        quantization=quantization,
+        checkpoint_is_quantized=checkpoint_is_quantized,
+        checkpoint_storage_use_zarr3=checkpoint_storage_use_zarr3,
     )
     if verbose:
         print("Running command:")
@@ -504,6 +522,26 @@ def main():
         default=4096,
         help="Chunk size (tokens) used when --use_chunked_prefill is set. Default 4096.",
     )
+    parser.add_argument(
+        "--use_qwix_quantization",
+        action="store_true",
+        default=False,
+        help="Enable qwix quantization (PtqProvider). Use with --quantization and "
+             "--checkpoint_is_quantized for pre-quantized FP8 checkpoints.",
+    )
+    parser.add_argument(
+        "--quantization",
+        type=str,
+        default="",
+        help="Quantization scheme, e.g. 'fp8_full'. Only used when --use_qwix_quantization is set.",
+    )
+    parser.add_argument(
+        "--checkpoint_is_quantized",
+        action="store_true",
+        default=False,
+        help="Indicates the checkpoint contains pre-quantized (FP8) weights. "
+             "Use with --use_qwix_quantization. Disables zarr3 (FP8 checkpoint uses zarr2).",
+    )
     args = parser.parse_args()
 
     if args.print_arch:
@@ -534,6 +572,10 @@ def main():
         scan_layers=args.scan_layers,
         use_chunked_prefill=args.use_chunked_prefill,
         prefill_chunk_size=args.prefill_chunk_size,
+        use_qwix_quantization=args.use_qwix_quantization,
+        quantization=args.quantization,
+        checkpoint_is_quantized=args.checkpoint_is_quantized,
+        checkpoint_storage_use_zarr3=not args.checkpoint_is_quantized,
     )
     print("-" * 60)
     if tok_per_s is not None:

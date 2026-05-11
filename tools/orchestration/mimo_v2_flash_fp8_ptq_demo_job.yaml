@@ -1,0 +1,63 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: mimo-v2-flash-fp8-ptq-demo-v7x
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: mimo-v2-flash-fp8-ptq-demo-v7x
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        cloud.google.com/gke-nodepool: jingnw-flex-tpu7
+        cloud.google.com/gke-tpu-accelerator: tpu7x
+        cloud.google.com/gke-tpu-topology: 2x2x1
+      tolerations:
+      - key: google.com/tpu
+        operator: Equal
+        value: present
+        effect: NoSchedule
+      containers:
+      - name: mimo-fp8-ptq-demo
+        image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.8.1-rev1
+        command:
+        - bash
+        - -lc
+        - |
+          set -euo pipefail
+          export PATH="/opt/venv/bin:${PATH}"
+          export PYTHONUNBUFFERED=1
+          WORKDIR=/workspace
+          rm -rf "${WORKDIR}"
+          git clone https://github.com/geeningwang/maxtext.git "${WORKDIR}"
+          cd "${WORKDIR}"
+          git checkout tpu-v7x-porting
+          /opt/venv/bin/python -m pip install -e ".[tpu]"
+          install_maxtext_tpu_github_deps
+          /opt/venv/bin/python -m pip install transformers safetensors huggingface_hub
+          # Run inference with PTQ FP8 checkpoint (pre-quantized weights via qwix PtqProvider).
+          # Weights are stored as float8_e4m3fn; PtqProvider intercepts dot_general ops.
+          # Expected HBM usage: ~40 GB/chip (vs ~72 GB/chip for BF16).
+          /opt/venv/bin/python demos/mimo_v2_flash_demo_jax.py \
+            --checkpoint_path gs://jingnw-mimo-v2-flash-us-central1/mimo-v2-flash-fp8-ptq/0/items \
+            --tokenizer_path XiaomiMiMo/MiMo-V2-Flash \
+            --ici_tensor_parallelism 4 \
+            --ici_expert_parallelism 2 \
+            --max_new_tokens 128 \
+            --use_qwix_quantization \
+            --quantization fp8_full \
+            --checkpoint_is_quantized \
+            --verbose
+        ports:
+        - containerPort: 8431
+        resources:
+          requests:
+            cpu: "10"
+            memory: 64Gi
+            google.com/tpu: "4"
+          limits:
+            cpu: "10"
+            memory: 64Gi
+            google.com/tpu: "4"

@@ -108,7 +108,10 @@ def create_model(config, mesh, model_mode: str = MODEL_MODE_TRAIN, rngs: nnx.Rng
   # Model definition
   quant = quantizations.configure_quantization(config)
   model = get_transformer_model(config, mesh, quant, model_mode=model_mode, rngs=rngs)
-  model = quantizations.maybe_quantize_model(model, config)
+  # Use PtqProvider when loading a pre-quantized qwix checkpoint, so that the
+  # model expects WithAux[QArray] parameters at quantized weight positions.
+  ptq = config.use_qwix_quantization and config.checkpoint_is_quantized
+  model = quantizations.maybe_quantize_model(model, config, ptq=ptq)
   return model
 
 

@@ -724,10 +724,33 @@ def get_qt_provider(config):
   return None
 
 
-def maybe_quantize_model(model, config):
-  """Quantize the model if quantization is enabled."""
+def get_ptq_provider(config):
+  """Get PtqProvider for pre-quantized checkpoint inference (fp8_full only).
+
+  PtqProvider uses pre-quantized weights stored in a checkpoint as
+  WithAux[QArray] pytree structures, enabling inference without dynamic
+  quantization overhead.
+  """
+  match config.quantization:
+    case "fp8_full":
+      return qwix.PtqProvider([get_fp8_full_qwix_rule(config)])
+  return None
+
+
+def maybe_quantize_model(model, config, ptq: bool = False):
+  """Quantize the model if quantization is enabled.
+
+  Args:
+    model: The Flax Linen model to quantize.
+    config: MaxText config object.
+    ptq: If True, use PtqProvider for pre-quantized checkpoint inference.
+         If False (default), use QtProvider for dynamic quantization training.
+  """
   if config.use_qwix_quantization:
-    quantization_provider = get_qt_provider(config)
+    if ptq:
+      quantization_provider = get_ptq_provider(config)
+    else:
+      quantization_provider = get_qt_provider(config)
     if quantization_provider:
       model = qwix.quantize_model(model, quantization_provider)
   return model
