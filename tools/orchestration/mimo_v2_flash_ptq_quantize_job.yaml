@@ -1,3 +1,16 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: mimo-ptq-headless
+spec:
+  clusterIP: None
+  selector:
+    job-name: mimo-v2-flash-ptq-quantize
+  ports:
+  - name: jax
+    port: 8471
+    targetPort: 8471
+---
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -15,6 +28,8 @@ spec:
       labels:
         app: mimo-v2-flash-ptq-quantize
     spec:
+      # subdomain enables stable DNS: <job-name>-<index>.mimo-ptq-headless.default.svc.cluster.local
+      subdomain: mimo-ptq-headless
       restartPolicy: Never
       nodeSelector:
         cloud.google.com/gke-nodepool: jingnw-flex-tpu7-8ch
@@ -43,8 +58,27 @@ spec:
           /opt/venv/bin/python -m pip install -e ".[tpu]"
           install_maxtext_tpu_github_deps
           /opt/venv/bin/python -m pip install transformers safetensors huggingface_hub
+
+          # Override TPU worker addresses: GKE may inject 'localhost' for single-host.
+          # The headless service + subdomain gives stable DNS for each indexed pod.
+          JOB="mimo-v2-flash-ptq-quantize"
+          SVC="mimo-ptq-headless"
+          W0="${JOB}-0.${SVC}"
+          W1="${JOB}-1.${SVC}"
+          # Wait for both workers to be DNS-resolvable before starting JAX.
+          for w in "$W0" "$W1"; do
+            echo "[$HOSTNAME] Waiting for $w to resolve..."
+            for i in $(seq 1 120); do
+              getent hosts "$w" &>/dev/null && { echo "[$HOSTNAME] $w is resolvable."; break; } || true
+              sleep 5
+            done
+          done
+          export TPU_WORKER_HOSTNAMES="${W0},${W1}"
+          export TPU_PROCESS_ADDRESSES="${W0}:8471,${W1}:8471"
+          echo "[$HOSTNAME] TPU_WORKER_ID=${TPU_WORKER_ID}, TPU_WORKER_HOSTNAMES=${TPU_WORKER_HOSTNAMES}"
+
           # 2-host multi-controller run: pyconfig calls jax.distributed.initialize() which
-          # auto-discovers coordinator across the 2x2x2 slice via PJRT TPU metadata.
+          # auto-discovers coordinator via PJRT TPU metadata once worker addresses are set.
           # TP=8, EP=2 spreads the 412 GB BF16 model across all 16 JAX devices.
           /opt/venv/bin/python \
             -m maxtext.checkpoint_conversion.standalone_scripts.quantize_params_ptq \
