@@ -84,7 +84,7 @@ import jax
 import jax.numpy as jnp
 import qwix
 
-from maxtext.common.common_types import MODEL_MODE_INFERENCE
+from maxtext.common.common_types import MODEL_MODE_PREFILL
 from maxtext.configs import pyconfig
 from maxtext.common import checkpointing
 from maxtext.layers import quantizations
@@ -118,13 +118,13 @@ def main(argv: Sequence[str]) -> None:
   max_logging.log("Building BF16 model (for checkpoint loading)...")
   quant = quantizations.configure_quantization(config)
   bf16_model = model_creation_utils.get_transformer_model(
-      config, mesh, quant, model_mode=MODEL_MODE_INFERENCE
+      config, mesh, quant, model_mode=MODEL_MODE_PREFILL
   )
   # No qwix wrapping for bf16_model — just vanilla Linen.
 
   max_logging.log("Building PTQ model (for abstract parameter shapes)...")
   ptq_model = model_creation_utils.get_transformer_model(
-      config, mesh, quant, model_mode=MODEL_MODE_INFERENCE
+      config, mesh, quant, model_mode=MODEL_MODE_PREFILL
   )
   ptq_model = quantizations.maybe_quantize_model(ptq_model, config, ptq=True)
 
