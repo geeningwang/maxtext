@@ -79,7 +79,8 @@ spec:
 
           # 2-host multi-controller run: pyconfig calls jax.distributed.initialize() which
           # auto-discovers coordinator via PJRT TPU metadata once worker addresses are set.
-          # TP=8, EP=2 spreads the 412 GB BF16 model across all 16 JAX devices.
+          # TP=4, EP=4 spreads the 412 GB BF16 model across all 16 JAX devices.
+          # num_kv_heads=4 must be divisible by TP; EP=4 works with 128 routed experts.
           /opt/venv/bin/python \
             -m maxtext.checkpoint_conversion.standalone_scripts.quantize_params_ptq \
             src/maxtext/configs/base.yml \
@@ -90,8 +91,8 @@ spec:
             use_qwix_quantization=true \
             quantization=fp8_full \
             checkpoint_is_quantized=false \
-            ici_tensor_parallelism=8 \
-            ici_expert_parallelism=2 \
+            ici_tensor_parallelism=4 \
+            ici_expert_parallelism=4 \
             max_target_length=128 \
             per_device_batch_size=1 \
             attention=dot_product \
