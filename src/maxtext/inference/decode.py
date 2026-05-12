@@ -87,7 +87,7 @@ def _batch_first_result_token(first_tokens: list[Any], batch_size: int):
   return result_tokens
 
 
-def _probe_hbm(label: str) -> None:
+def _probe_hbm(label: str, detail: bool = False) -> None:
   """Print per-device HBM memory stats for diagnostics. No logic change."""
   host = socket.gethostname()
   for d in jax.local_devices():
@@ -103,6 +103,36 @@ def _probe_hbm(label: str) -> None:
       )
     except Exception as e:  # pylint: disable=broad-except
       print(f"[HBM] {label:<36s} host={host} dev={d.id} memory_stats N/A: {e}", flush=True)
+    if detail:
+      _probe_hbm_arrays(label, d, host)
+
+
+def _probe_hbm_arrays(label: str, d, host: str) -> None:
+  """Enumerate live JAX arrays on device d, grouped by dtype — shows weights vs KV cache vs buffers."""
+  from collections import defaultdict  # pylint: disable=import-outside-toplevel
+  dtype_count: dict[str, int] = defaultdict(int)
+  dtype_bytes: dict[str, int] = defaultdict(int)
+  try:
+    live = jax.live_arrays(d)
+    for arr in live:
+      key = str(arr.dtype)
+      dtype_count[key] += 1
+      dtype_bytes[key] += int(arr.size) * arr.dtype.itemsize
+    total_live = sum(dtype_bytes.values())
+    print(
+        f"[HBM-DETAIL] {label:<36s} host={host} dev={d.id}"
+        f" live_arrays={len(live)} total={total_live / 2**30:.3f}GB",
+        flush=True,
+    )
+    for dtype_name, nbytes in sorted(dtype_bytes.items(), key=lambda x: -x[1]):
+      pct = 100.0 * nbytes / total_live if total_live else 0.0
+      print(
+          f"[HBM-DETAIL]   {dtype_name:22s} {nbytes / 2**30:7.3f}GB"
+          f"  n={dtype_count[dtype_name]:5d}  ({pct:.1f}%)",
+          flush=True,
+      )
+  except Exception as e:  # pylint: disable=broad-except
+    print(f"[HBM-DETAIL] {label:<36s} host={host} dev={d.id} live_arrays N/A: {e}", flush=True)
 
 
 def main(argv: Sequence[str]) -> None:
@@ -113,14 +143,14 @@ def main(argv: Sequence[str]) -> None:
   _validate_config(config)
   jax.config.update("jax_use_shardy_partitioner", config.shardy)
   max_utils.print_system_information()
-  _probe_hbm("init")
+  _probe_hbm("init", detail=True)
 
   engine = maxengine.MaxEngine(config)
   rng = jax.random.PRNGKey(1234)
   rng, rng_load_params = jax.random.split(rng)
   _t_load = time.perf_counter()
   params = engine.load_params(rng_load_params)
-  _probe_hbm("after_load_params")
+  _probe_hbm("after_load_params", detail=True)
   print(f"[TIME] load_params                       host={socket.gethostname()} elapsed={time.perf_counter()-_t_load:.1f}s", flush=True)
   prof = profiler.Profiler(config)
 
@@ -266,7 +296,7 @@ def main(argv: Sequence[str]) -> None:
         )
     prefill_result_list.append(prefill_result)
     first_token_list.append(first_token)
-  _probe_hbm("after_prefill")
+  _probe_hbm("after_prefill", detail=True)
   print(f"[TIME] prefill                           host={socket.gethostname()} elapsed={(time.perf_counter()-_t_prefill)*1000:.0f}ms", flush=True)
 
   # Insert
@@ -274,7 +304,7 @@ def main(argv: Sequence[str]) -> None:
   decode_state = engine.init_decode_state(rng_init_decode)
   for i in range(_NUM_STREAMS):
     decode_state = engine.insert(prefill_result_list[i], decode_state, slot=i)
-  _probe_hbm("after_insert")
+  _probe_hbm("after_insert", detail=True)
 
   # Generate
   prof_deactivated = False
@@ -291,7 +321,7 @@ def main(argv: Sequence[str]) -> None:
       _step_ms = (time.perf_counter() - _t_step) * 1000
     print(f"[TIME] generate_step_{i:04d}              host={socket.gethostname()} step_ms={_step_ms:.1f}", flush=True)
     if i == steps[0] or (i - steps[0]) % 50 == 0:
-      _probe_hbm(f"generate_step_{i:04d}")
+      _probe_hbm(f"generate_step_{i:04d}", detail=(i == steps[0]))
 
     # Automatically deactivate profiler after profiler_steps steps
     if i > config.max_prefill_predict_length + config.profiler_steps:
