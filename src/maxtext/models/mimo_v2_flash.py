@@ -60,6 +60,7 @@ from maxtext.layers.quantizations import AqtQuantization as Quant
 from maxtext.layers.linears import MlpBlock
 from maxtext.layers.attentions import Attention, AttentionType
 from maxtext.utils import max_utils
+from maxtext.kernels.fp8_dequant_matmul import fp8_moe_matmul
 
 
 
@@ -289,20 +290,43 @@ class MiMoV2FlashSparseMoeBlock(nnx.Module):
     dispatch_weights = dispatch_weights.at[tok_idx, top_k_indices].add(
         top_k_weights.astype(jnp.float32)
     )
+    tokens_fp = tokens.astype(cfg.dtype)
     if getattr(cfg, "mimo_fp8_weight_mode", "") == "block_wise_fp8":
-      wi_0 = _block_dequant_fp8(self.wi_0[...], self.wi_0_scale_inv[...])
-      wi_1 = _block_dequant_fp8(self.wi_1[...], self.wi_1_scale_inv[...])
-      wo   = _block_dequant_fp8(self.wo[...],   self.wo_scale_inv[...])
+      # Phase B: Pallas kernel fuses dequant + matmul — FP8 weight never
+      # materialised as BF16 in HBM.  Falls back to Phase A (_block_dequant_fp8)
+      # when T is too large for VMEM (prefill) or on platforms without Pallas TPU.
+      _VMEM_T_LIMIT = 512  # max T for Pallas kernel VMEM scratch safety
+      if T <= _VMEM_T_LIMIT:
+        gate_logits = fp8_moe_matmul(
+            tokens_fp, self.wi_0[...], self.wi_0_scale_inv[...],
+        )                                                   # (E, T, I)
+        gate_act = jax.nn.silu(gate_logits)
+        up = fp8_moe_matmul(
+            tokens_fp, self.wi_1[...], self.wi_1_scale_inv[...],
+        )                                                   # (E, T, I)
+        down = fp8_moe_matmul(
+            gate_act * up, self.wo[...], self.wo_scale_inv[...],
+            tokens_batched=True,
+        )                                                   # (E, T, H)
+      else:
+        # Phase A fallback for large-T prefill.
+        wi_0 = _block_dequant_fp8(self.wi_0[...], self.wi_0_scale_inv[...])
+        wi_1 = _block_dequant_fp8(self.wi_1[...], self.wi_1_scale_inv[...])
+        wo   = _block_dequant_fp8(self.wo[...],   self.wo_scale_inv[...])
+        gate_act = jax.nn.silu(
+            jnp.einsum("th,ehi->eti", tokens_fp, wi_0, precision=lax.Precision.DEFAULT)
+        )
+        up = jnp.einsum("th,ehi->eti", tokens_fp, wi_1, precision=lax.Precision.DEFAULT)
+        down = jnp.einsum("eti,eih->eth", gate_act * up, wo, precision=lax.Precision.DEFAULT)
     else:
       wi_0 = self.wi_0[...].astype(cfg.dtype)
       wi_1 = self.wi_1[...].astype(cfg.dtype)
       wo   = self.wo[...].astype(cfg.dtype)
-    tokens_fp = tokens.astype(cfg.dtype)
-    gate_act = jax.nn.silu(
-        jnp.einsum("th,ehi->eti", tokens_fp, wi_0, precision=lax.Precision.DEFAULT)
-    )
-    up = jnp.einsum("th,ehi->eti", tokens_fp, wi_1, precision=lax.Precision.DEFAULT)
-    down = jnp.einsum("eti,eih->eth", gate_act * up, wo, precision=lax.Precision.DEFAULT)
+      gate_act = jax.nn.silu(
+          jnp.einsum("th,ehi->eti", tokens_fp, wi_0, precision=lax.Precision.DEFAULT)
+      )
+      up = jnp.einsum("th,ehi->eti", tokens_fp, wi_1, precision=lax.Precision.DEFAULT)
+      down = jnp.einsum("eti,eih->eth", gate_act * up, wo, precision=lax.Precision.DEFAULT)
     output = jnp.einsum(
         "te,eth->th", dispatch_weights.astype(cfg.dtype), down,
         precision=lax.Precision.DEFAULT,
