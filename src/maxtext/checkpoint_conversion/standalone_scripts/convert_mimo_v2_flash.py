@@ -56,10 +56,12 @@ Streaming (--tmpdir <path>): processes one decoder layer at a time and writes
 """
 
 import argparse
+import contextlib
 import gc
 import os
 import pathlib
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -89,6 +91,56 @@ try:
             setattr(np, _fp8_name, getattr(ml_dtypes, _fp8_name))
 except ImportError:
     _BF16 = None  # fall back to float32 in _MemmapStore
+
+
+# ---------------------------------------------------------------------------
+# GCS path helpers — transparent on-demand shard download
+# ---------------------------------------------------------------------------
+
+def _is_gcs(path: str) -> bool:
+    return str(path).startswith("gs://")
+
+
+def _gcs_ls_safetensors(gcs_dir: str) -> list[str]:
+    """List all *.safetensors GCS URIs under gcs_dir using gsutil."""
+    result = subprocess.run(
+        ["gsutil", "ls", f"{gcs_dir.rstrip('/')}/*.safetensors"],
+        capture_output=True, text=True, check=True,
+    )
+    return sorted(line.strip() for line in result.stdout.splitlines() if line.strip())
+
+
+@contextlib.contextmanager
+def _local_shard(shard_path: pathlib.Path):
+    """Context manager: yield a local path for shard_path.
+
+    For local paths, yields the path unchanged.
+    For GCS paths (gs://...), downloads the shard to a temporary file,
+    yields the local path, then deletes the temp file on exit.  Peak disk
+    usage is therefore bounded to the size of a single shard (~5–15 GB).
+    """
+    path_str = str(shard_path)
+    if not _is_gcs(path_str):
+        yield shard_path
+        return
+
+    # Download GCS shard to a temp file.
+    suffix = pathlib.Path(path_str.split("/")[-1]).suffix or ".safetensors"
+    tmp_fd, tmp_path = tempfile.mkstemp(suffix=suffix, prefix="mimo_shard_")
+    os.close(tmp_fd)
+    try:
+        print(f"[convert] gsutil cp {path_str} → {tmp_path}", flush=True)
+        subprocess.run(
+            ["gsutil", "-q", "cp", path_str, tmp_path],
+            check=True,
+        )
+        yield pathlib.Path(tmp_path)
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
 
 # ---------------------------------------------------------------------------
 # Model parameter dictionary
@@ -124,13 +176,15 @@ def _build_shard_index(shard_paths: list[pathlib.Path]) -> dict[str, pathlib.Pat
     """Map every weight key to the shard file that contains it.
 
     Opens each shard just long enough to read its key list — no tensor data is
-    loaded into RAM.
+    loaded into RAM.  For GCS paths, each shard is downloaded to a temp file,
+    indexed, then immediately deleted (peak disk = one shard at a time).
     """
     key_to_shard: dict[str, pathlib.Path] = {}
     for shard_path in tqdm(shard_paths, desc="Indexing shards"):
-        with safe_open(shard_path, framework="np") as f:
-            for key in f.keys():
-                key_to_shard[key] = shard_path
+        with _local_shard(shard_path) as local_path:
+            with safe_open(local_path, framework="np") as f:
+                for key in f.keys():
+                    key_to_shard[key] = shard_path  # keep original (GCS) path
     return key_to_shard
 
 
@@ -167,7 +221,7 @@ def _load_keys_batch(
             f"[convert] {label}  opening shard {idx+1}/{total_shards} ({shard_name}, {len(batch)} keys)  keys_so_far={keys_loaded}",
             flush=True,
         )
-        with safe_open(shard_path, framework="np") as f:
+        with _local_shard(shard_path) as local_path, safe_open(local_path, framework="np") as f:
             for ki, key in enumerate(batch):
                 raw = f.get_tensor(key)
                 if keep_fp8 and getattr(raw.dtype, "name", "").startswith("float8"):
@@ -380,9 +434,15 @@ def convert_hf_to_maxtext(
     # 1. Discover safetensors shards and build a key → shard index
     #    (no tensor data is loaded at this stage)
     # ------------------------------------------------------------------
-    shard_paths = sorted(pathlib.Path(base_model_path).glob("*.safetensors"))
-    if not shard_paths:
-        raise FileNotFoundError(f"No *.safetensors files found in: {base_model_path}")
+    if _is_gcs(base_model_path):
+        gcs_uris = _gcs_ls_safetensors(base_model_path)
+        if not gcs_uris:
+            raise FileNotFoundError(f"No *.safetensors files found in: {base_model_path}")
+        shard_paths = [pathlib.Path(u) for u in gcs_uris]
+    else:
+        shard_paths = sorted(pathlib.Path(base_model_path).glob("*.safetensors"))
+        if not shard_paths:
+            raise FileNotFoundError(f"No *.safetensors files found in: {base_model_path}")
     max_logging.log(f"Found {len(shard_paths)} safetensors shards")
     print(f"[convert] Found {len(shard_paths)} safetensors shards", flush=True)
 

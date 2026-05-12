@@ -38,7 +38,7 @@ spec:
           cd "${WORKDIR}"
           git checkout MiMo-V2-Flash
           /opt/venv/bin/python -m pip install -e ".[tpu]"
-          /opt/venv/bin/python -m pip install transformers safetensors huggingface_hub
+          /opt/venv/bin/python -m pip install transformers safetensors huggingface_hub "zarr<3" numcodecs
 
           # Convert HF safetensors to MaxText zarr2 checkpoint keeping
           # MoE expert weights as float8_e4m3fn (with separate scale_inv tensors).
