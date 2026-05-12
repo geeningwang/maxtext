@@ -85,12 +85,67 @@ lowers the matmuls to native FP8 MXU ops.
 
 ---
 
+## 4. qwix FP8 PTQ — HBM representation on TPU v7x
+
+The [PTQ pipeline](mimo_v2_flash_tpu_v7x_gke_env_restore.md) converts the BF16
+MaxText checkpoint to FP8 using qwix `PtqProvider` and saves the result to GCS
+as `gs://jingnw-mimo-v2-flash-us-central1/mimo-v2-flash-fp8-ptq/0/items`
+(441.79 GiB).
+
+**GCS checkpoint dtypes (in the saved checkpoint files):**
+
+| dtype | Contents |
+|---|---|
+| `float8_e4m3fn` | Quantized attention weight shards |
+| `float32` | Per-tensor FP8 scale factors |
+| `bfloat16` | MoE expert weights (not quantized), embeddings, layer norms |
+
+**HBM dtype breakdown at runtime (TPU v7x, measured 2026-05-12 via `addressable_shards`):**
+
+| dtype | HBM (per TensorCore) | Tensors | % |
+|---|---|---|---|
+| `bfloat16` | **71.928 GB** | 568 | ~100% |
+| `uint32` | < 0.001 GB | 3 | ~0% |
+| `float8_e4m3fn` | **0 GB** | 0 | 0% |
+
+**Finding:** No `float8_e4m3fn` tensors appear in `jax.live_arrays()` despite
+loading from an FP8 PTQ checkpoint.  All 568 tracked weight shards are BF16.
+
+### Interpretation
+
+The qwix `PtqProvider` likely **dequantizes FP8 attention weights → BF16 at
+checkpoint load time**, storing BF16 in HBM for inference.  Evidence:
+
+1. `jax.live_arrays()` + `addressable_shards` for dev=0 accounts for exactly
+   71.928 GB as BF16, matching `memory_stats().bytes_in_use` = 71.93 GB.
+   No "hidden" XLA FP8 allocation remains unaccounted.
+2. The FP8 checkpoint (441.79 GiB) is *larger* than the BF16 source (384.43 GiB)
+   because only attention layers are FP8 while MoE expert weights (the bulk)
+   stay BF16, and scale factors add per-tensor overhead.
+
+### Practical implication
+
+FP8 PTQ in this qwix configuration **saves GCS storage and checkpoint load
+transfer** but does **not reduce HBM usage during inference** relative to a
+pure BF16 model of the same architecture.  HBM on TPU v7x (72.31 GB per
+TensorCore at steady-state) is essentially the same as a BF16 deployment.
+
+For HBM reduction, approaches to explore include:
+- **INT8 KV cache** (see [opt3 plan](mimo_v2_flash_opt3_int8_kv_cache_plan.md))
+- **Expert sparsity / lazy loading** at MoE dispatch time
+- **qwix weight-only quantization** configured to keep FP8 in HBM (requires
+  checking qwix provider options for deferred dequantization)
+
+---
+
 ## Summary
 
 | | FP8 support |
 |---|---|
 | MiMo-V2-Flash weights (HF) | ✅ FP8 E4M3 block-wise (native format) |
+| MiMo-V2-Flash weights (qwix PTQ checkpoint) | ✅ FP8 in GCS; **BF16 in HBM** (dequantized at load) |
 | llama.cpp GGUF | ❌ must dequantize to BF16/Q8_0/etc. at conversion time |
 | TPU v6e | ✅ native FP8 MXU ops (E4M3 and E5M2) |
+| TPU v7x | ✅ native FP8 MXU ops (E4M3 and E5M2) |
 | TPU v5e | ❌ BF16/INT8 only |
 | AMD EPYC (avx512_bf16) | ❌ BF16/INT8 only; FP8 requires AMX (Intel Sapphire Rapids+) |

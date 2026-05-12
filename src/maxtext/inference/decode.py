@@ -108,20 +108,29 @@ def _probe_hbm(label: str, detail: bool = False) -> None:
 
 
 def _probe_hbm_arrays(label: str, d, host: str) -> None:
-  """Enumerate live JAX arrays on device d, grouped by dtype — shows weights vs KV cache vs buffers."""
+  """Enumerate live JAX arrays on device d via addressable_shards, grouped by dtype."""
   from collections import defaultdict  # pylint: disable=import-outside-toplevel
   dtype_count: dict[str, int] = defaultdict(int)
   dtype_bytes: dict[str, int] = defaultdict(int)
+  n_arrays = 0
   try:
-    live = jax.live_arrays(d)
-    for arr in live:
-      key = str(arr.dtype)
-      dtype_count[key] += 1
-      dtype_bytes[key] += int(arr.size) * arr.dtype.itemsize
+    all_live = jax.live_arrays()
+    for arr in all_live:
+      try:
+        # addressable_shards gives the actual physical shard on each local device.
+        # Works for both sharded and replicated global arrays.
+        for shard in arr.addressable_shards:
+          if shard.device == d:
+            n_arrays += 1
+            nbytes = int(shard.data.size) * arr.dtype.itemsize
+            dtype_bytes[str(arr.dtype)] += nbytes
+            dtype_count[str(arr.dtype)] += 1
+      except Exception:  # pylint: disable=broad-except
+        pass
     total_live = sum(dtype_bytes.values())
     print(
         f"[HBM-DETAIL] {label:<36s} host={host} dev={d.id}"
-        f" live_arrays={len(live)} total={total_live / 2**30:.3f}GB",
+        f" shards={n_arrays} total={total_live / 2**30:.3f}GB",
         flush=True,
     )
     for dtype_name, nbytes in sorted(dtype_bytes.items(), key=lambda x: -x[1]):
@@ -132,7 +141,7 @@ def _probe_hbm_arrays(label: str, d, host: str) -> None:
           flush=True,
       )
   except Exception as e:  # pylint: disable=broad-except
-    print(f"[HBM-DETAIL] {label:<36s} host={host} dev={d.id} live_arrays N/A: {e}", flush=True)
+    print(f"[HBM-DETAIL] {label:<36s} host={host} dev={d.id} failed: {type(e).__name__}: {e}", flush=True)
 
 
 def main(argv: Sequence[str]) -> None:

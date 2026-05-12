@@ -10,10 +10,11 @@ This document summarises all four validated inference configurations for
 
 | # | Stack | Hardware | Weight format | Status | Output quality |
 |---|---|---|---|---|---|
-| 1 | **MaxText + TPU** | TPU v6e / Ironwood v7 | BF16 (OCDBT checkpoint, FP8 dequantized via `weight_scale_inv`) | ✅ End-to-end generation validated; **4K/1K prefill+decode: TTFT 823 ms · 113.6 ms/step · 2,536 tok/s at batch=288** (v6e-32, 2026-04-24, `per_device_batch_size=9`, `attention=flash`); **16K/1K chunked prefill+decode: TTFT 5,522 ms · 71.1 ms/step · 1,349 tok/s at batch=96** (v6e-32, 2026-04-24, `use_chunked_prefill=true prefill_chunk_size=4096`, pdb=3) | Coherent ("420 km" train distance, 2026-04-22, EOS stop); thinking chain may exhaust default `max_new_tokens` before answer — use ≥ 4000 for reliable EOS |
+| 1 | **MaxText + TPU v6e** | TPU v6e-32 (1,024 GiB HBM total) | BF16 (OCDBT checkpoint, FP8 dequantized via `weight_scale_inv`) | ✅ End-to-end generation validated; **4K/1K prefill+decode: TTFT 823 ms · 113.6 ms/step · 2,536 tok/s at batch=288** (v6e-32, 2026-04-24, `per_device_batch_size=9`, `attention=flash`); **16K/1K chunked prefill+decode: TTFT 5,522 ms · 71.1 ms/step · 1,349 tok/s at batch=96** (v6e-32, 2026-04-24, `use_chunked_prefill=true prefill_chunk_size=4096`, pdb=3) | Coherent ("420 km" train distance, 2026-04-22, EOS stop); thinking chain may exhaust default `max_new_tokens` before answer — use ≥ 4000 for reliable EOS |
 | 2 | **HuggingFace Transformers (CPU)** | AMD EPYC 9B14, 180 vCPUs, 708 GB | BF16 (shard-by-shard FP8→BF16 dequant with `weight_scale_inv`) | ✅ Runs end-to-end | Coherent (`"2. But what if we consider it in a"`) |
 | 3 | **SGLang CPU engine** | AMD EPYC 9B14, 180 vCPUs, 708 GB | FP8→BF16 cast at load (quantization_config=null) | ✅ Runs, 5 patches needed | Garbled (`葭葭葭…`) — FP8 scale tensors stripped |
 | 4 | **llama.cpp (GGUF Q8_0)** | AMD EPYC 9B14, 180 vCPUs, 708 GB | Q8_0 on disk, int8+f32 accumulation in compute | ✅ Runs, no patches needed | Coherent (`"2. But what is 0+0?"`) |
+| 5 | **MaxText + GKE + TPU v7x (FP8 PTQ)** | TPU v7x 2×2×1 (4 chips, 8 JAX devices, 768 GiB HBM total) | FP8 E4M3 in GCS checkpoint; **BF16 in HBM** (dequantized by qwix at load) | ✅ End-to-end validated 2026-05-12; EOS fires cleanly; **2.8 tok/s** single-sequence (TP=4, EP=2) | Coherent (EOS stop at step 767) |
 
 **Key finding:** Setting 2 (HF) now produces coherent output using a shard-by-shard
 FP8→BF16 loader that applies `weight_scale_inv` block scales correctly.  Setting 3
@@ -21,6 +22,11 @@ FP8→BF16 loader that applies `weight_scale_inv` block scales correctly.  Setti
 skips the scale tensors.  Settings 2 and 4 both produce coherent output via
 different paths: HF uses accurate per-block FP8 dequantization; llama.cpp
 re-encodes FP8 to Q8_0 at conversion time.
+
+Setting 5 (MaxText + GKE + TPU v7x) adds a containerized GKE path with an FP8 PTQ
+checkpoint.  Despite the FP8 checkpoint format, qwix `PtqProvider` dequantizes
+weights to BF16 at load — runtime HBM is the same as a pure BF16 deployment
+(71.93 GB/TensorCore steady-state, 76.3% of 94.75 GiB capacity).
 
 ---
 
@@ -346,6 +352,82 @@ Coherent — Q8_0 re-encoding from FP8 source faithfully preserves model behavio
 
 ---
 
+## Setting 5 — MaxText on GKE + TPU v7x (FP8 PTQ)
+
+**Guide:** [mimo_v2_flash_tpu_v7x_gke_env_restore.md](mimo_v2_flash_tpu_v7x_gke_env_restore.md)
+
+### Hardware
+
+- GKE cluster: `jingnw-tpu7-cluster`, zone `us-central1-c`, project `tpu-launchpad-playground`
+- Node pool: `jingnw-flex-tpu7` — 2×2×1 topology, **4 chips = 8 JAX devices**
+- TPU v7x architecture: **2 TensorCores per chip**, 96 GiB HBM per TensorCore
+- Total HBM: 4 chips × 192 GiB = **768 GiB** (vs v6e-32 which has 32 chips × 32 GiB)
+- Provisioned on demand via DWS Flex Start (no persistent TPU VM)
+
+### Weights
+
+- Source: FP8 PTQ checkpoint (produced from BF16 MaxText checkpoint via qwix `PtqProvider`)
+- GCS: `gs://jingnw-mimo-v2-flash-us-central1/mimo-v2-flash-fp8-ptq/0/items` (441.79 GiB)
+- BF16 source: `gs://jingnw-mimo-v2-flash-us-central1/mimo-v2-flash-fixed-ocdbt/checkpoints/0/items` (384.43 GiB)
+
+### Weight format
+
+- **In GCS (checkpoint):** FP8 E4M3 (attention projection weights) + BF16 (MoE experts, embeddings, layer norms) + float32 (FP8 scale factors)
+- **In HBM at runtime:** **BF16 only** — qwix `PtqProvider` dequantizes FP8 → BF16 at checkpoint load time; no `float8_e4m3fn` tensors appear in JAX live arrays
+
+### Parallelism
+
+- `ici_tensor_parallelism=4`, `ici_expert_parallelism=2`
+- Constraint: `num_kv_heads=4` must be divisible by TP; TP=8 would OOM
+
+### Status
+
+End-to-end inference validated 2026-05-12 (job `mimo-v2-flash-fp8-ptq-demo-v10x`).
+EOS fires cleanly at step 767 for a math reasoning prompt.
+Checkpoint load time: **~271 s** (cold GCS, OCDBT).
+Single-sequence throughput: **2.8 tok/s** (`scan_layers=false`, TP=4, EP=2).
+
+### HBM profile (validated 2026-05-12, v10x run)
+
+| Stage | HBM per TensorCore | Delta |
+|---|---|---|
+| `init` | 0.00 GB | — |
+| `after_setup_decode_state` | **71.93 GB** | +71.93 GB (weights + KV cache pre-allocated together) |
+| `after_load_params` | 71.93 GB | 0 |
+| `after_prefill` | 72.02 GB | +0.09 GB |
+| `after_insert` | 72.17 GB | +0.15 GB |
+| `generate_step_0512` | **72.31 GB** | +0.14 GB |
+
+Peak: **72.31 GB = 76.3%** of 94.75 GiB TensorCore capacity.
+All 568 tracked weight shards are BF16 in HBM (no FP8 tensors despite FP8 checkpoint).
+
+### Performance
+
+| Metric | Value |
+|---|---|
+| Checkpoint load (OCDBT, cold GCS) | ~271 s |
+| HBM after load (per TensorCore) | 71.93 GB / 94.75 GiB (76.0%) |
+| HBM steady-state (per TensorCore) | 72.31 GB / 94.75 GiB (76.3%) |
+| Single-sequence throughput | **2.8 tok/s** (TP=4, EP=2, `scan_layers=false`) |
+| EOS stop | Yes (step 767 on math reasoning prompt) |
+
+### Key commands
+
+```bash
+# Submit inference job
+kubectl apply -f tools/orchestration/mimo_v2_flash_fp8_ptq_demo_job.yaml
+
+# Stream HBM and EOS events
+POD=$(kubectl get pods -l app=mimo-v2-flash-fp8-ptq-demo-v10x \
+      -o jsonpath='{.items[0].metadata.name}')
+kubectl logs -f "$POD" | grep -E "\[HBM\]|EOS token|generate_total|Throughput"
+```
+
+See [mimo_v2_flash_tpu_v7x_gke_env_restore.md](mimo_v2_flash_tpu_v7x_gke_env_restore.md)
+for the full kubectl setup and troubleshooting workflow.
+
+---
+
 ## Infrastructure Summary
 
 All three CPU settings share the same physical cluster (`jingnw-node` TPU VM):
@@ -356,5 +438,10 @@ All three CPU settings share the same physical cluster (`jingnw-node` TPU VM):
 | worker-1 | `10.202.0.151` | *(NFS tmpfs decommissioned 2026-04-04; HF weights now in GCS)* |
 | worker-2 | `10.202.0.29` | *(NFS tmpfs decommissioned 2026-04-04; GGUF re-encode not applicable — use GCS source)* |
 
-The TPU setting uses a separate `jingnw-node` TPU VM slice (v6e or Ironwood)
+The TPU v6e setting uses a separate `jingnw-node` TPU VM slice (v6e or Ironwood)
 with weights stored in GCS (`gs://jingnw-mimo-v2-flash-us-east5/`).
+
+The GKE + TPU v7x setting (Setting 5) uses a separate GKE cluster
+(`jingnw-tpu7-cluster`, `us-central1-c`) with DWS Flex Start on-demand node
+provisioning.  Weights are in `gs://jingnw-mimo-v2-flash-us-central1/`.
+See [mimo_v2_flash_tpu_v7x_gke_env_restore.md](mimo_v2_flash_tpu_v7x_gke_env_restore.md).

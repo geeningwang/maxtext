@@ -1,13 +1,13 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: mimo-v2-flash-fp8-ptq-demo-v7x
+  name: mimo-v2-flash-fp8-ptq-demo-v10x
 spec:
   backoffLimit: 0
   template:
     metadata:
       labels:
-        app: mimo-v2-flash-fp8-ptq-demo-v7x
+        app: mimo-v2-flash-fp8-ptq-demo-v10x
     spec:
       restartPolicy: Never
       nodeSelector:
@@ -34,6 +34,9 @@ spec:
           git clone https://github.com/geeningwang/maxtext.git "${WORKDIR}"
           cd "${WORKDIR}"
           git checkout MiMo-V2-Flash
+          # Overlay patched decode.py with per-dtype HBM live-array probe.
+          gsutil cp gs://jingnw-mimo-v2-flash-us-central1/patches/decode_hbm_detail.py \
+            "${WORKDIR}/src/maxtext/inference/decode.py"
           /opt/venv/bin/python -m pip install -e ".[tpu]"
           install_maxtext_tpu_github_deps
           /opt/venv/bin/python -m pip install transformers safetensors huggingface_hub

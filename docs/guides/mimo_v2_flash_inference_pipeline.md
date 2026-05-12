@@ -62,6 +62,10 @@ User prompt (str)
 
 MiMo-V2-Flash runtime depends on a converted MaxText checkpoint.
 
+Two checkpoint paths are supported: **BF16** (converted from HF safetensors)
+and **FP8 PTQ** (offline quantization via qwix, produced from the BF16
+checkpoint).  See Module 0b for the PTQ path.
+
 ### Source files
 
 - `src/MaxText/checkpoint_conversion/standalone_scripts/convert_mimo_v2_flash.py`
@@ -81,6 +85,56 @@ MiMo-V2-Flash runtime depends on a converted MaxText checkpoint.
 
 Do not skip FP8 block-scale dequantization. Casting raw FP8 bytes to BF16
 without applying `weight_scale_inv` produces invalid generations.
+
+---
+
+## Module 0b - FP8 PTQ Quantization Pipeline (Optional, One-Time)
+
+Converts the BF16 MaxText checkpoint to FP8 using qwix `PtqProvider`.
+Run this once; the FP8 checkpoint already exists in GCS for the current setup.
+
+### Source files
+
+- `src/MaxText/tools/quantize_params_ptq.py`
+- `tools/orchestration/mimo_v2_flash_ptq_quantize_job.yaml`
+
+### What happens
+
+1. Load BF16 MaxText checkpoint via Orbax.
+2. Initialize qwix `PtqProvider` with calibration config.
+3. Run one forward pass to collect activation statistics.
+4. Quantize attention projection weights to FP8 E4M3; MoE expert weights stay BF16.
+5. Save FP8 checkpoint to GCS via Orbax (OCDBT).
+
+### GCS paths (current environment)
+
+| Checkpoint | Path | Size |
+|---|---|---|
+| BF16 source (OCDBT) | `gs://jingnw-mimo-v2-flash-us-central1/mimo-v2-flash-fixed-ocdbt/checkpoints/0/items` | 384.43 GiB |
+| FP8 PTQ output | `gs://jingnw-mimo-v2-flash-us-central1/mimo-v2-flash-fp8-ptq/0/items` | 441.79 GiB |
+
+### Key parameters
+
+| Parameter | Value | Reason |
+|---|---|---|
+| `ici_tensor_parallelism` | 4 | `num_kv_heads=4` must be divisible by TP |
+| `ici_expert_parallelism` | 4 | 16 JAX devices across 2 hosts |
+| `async_checkpointing` | false | Required for correct multi-host OCDBT write |
+| Job RAM | 750 GiB | D2H copy of 568 quantized arrays during checkpoint save |
+
+### HBM representation
+
+Despite the FP8 checkpoint format, qwix `PtqProvider` **dequantizes FP8 → BF16 at
+load time** during inference. No `float8_e4m3fn` tensors appear in JAX live arrays.
+FP8 PTQ saves GCS transfer bytes but does not reduce runtime HBM vs BF16.
+See `docs/guides/mimo_v2_flash_fp8_dtypes.md` for full analysis.
+
+### Infrastructure
+
+- GKE cluster: `jingnw-tpu7-cluster`, zone `us-central1-c`
+- Node pool: `jingnw-flex-tpu7-8ch` (2×2×2, 8 chips per node, 16 JAX devices)
+- Docker image: `us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.8.1-rev1`
+- See `docs/guides/mimo_v2_flash_tpu_v7x_gke_env_restore.md` for full GKE workflow.
 
 ---
 
@@ -154,6 +208,26 @@ without applying `weight_scale_inv` produces invalid generations.
 
 When `use_chat_template=true`, decode uses tokenizer chat formatting and checks
 for EOS token each generate step. On EOS, loop exits early.
+
+### HBM stage measurements (TPU v7x, FP8 PTQ, validated 2026-05-12)
+
+`_probe_hbm` and `_probe_hbm_arrays` are called at key stages.
+`setup_decode_state` (inside `load_params`) pre-allocates weights + full KV cache
+together in a single Orbax call.
+
+| Stage | HBM per TensorCore | Delta | Notes |
+|---|---|---|---|
+| `init` | 0.00 GB | — | JAX runtime only |
+| `after_setup_decode_state` | **71.93 GB** | +71.93 GB | Weights + KV cache in one allocation |
+| `after_load_params` | 71.93 GB | 0 | `setup_decode_state` runs inside `load_params` |
+| `after_prefill` | 72.02 GB | +0.09 GB | KV cache filled + prefill result buffer |
+| `after_insert` | 72.17 GB | +0.15 GB | Decode slot population |
+| `generate_step_0512` | **72.31 GB** | +0.14 GB | Steady-state (RNG buffers) |
+
+Peak HBM: **72.31 GB / 94.75 GiB = 76.3%** per TensorCore.
+Checkpoint load time (`[TIME] load_params`): **~271 s** (cold GCS, OCDBT).
+
+See `docs/guides/mimo_v2_flash_hbm_probes.md` for full probe documentation.
 
 ---
 
@@ -367,3 +441,5 @@ Use this file as the canonical architecture baseline for inference bring-up.
 - `docs/guides/mimo_v2_flash_hf_vs_ocdbt_validation.md`
 - `docs/guides/mimo_v2_flash_fp8_dtypes.md`
 - `docs/guides/mimo_v2_flash_env_restore.md`
+- `docs/guides/mimo_v2_flash_tpu_v7x_gke_env_restore.md`
+- `docs/guides/mimo_v2_flash_hbm_probes.md`
