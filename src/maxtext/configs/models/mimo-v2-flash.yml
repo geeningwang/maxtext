@@ -78,6 +78,11 @@ mimo_hybrid_layer_pattern: [0,1,1,1,1,0,1,1,1,1,1,0,1,1,1,1,1,0,1,1,1,1,1,0,1,1,
 #   1 = sparse MoE (layers 1-47)
 mimo_moe_layer_freq: [0,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1]
 
+# FP8 weight mode for MoE expert weights.
+# "" (default): BF16 weights, no scale_inv params.
+# "block_wise_fp8": float8_e4m3fn weights + float32 scale_inv loaded from FP8 checkpoint.
+mimo_fp8_weight_mode: ""
+
 # Context length
 max_target_length: 8192        # Reduced for practical TPU use; model supports up to 262144
 max_prefill_predict_length: 8192

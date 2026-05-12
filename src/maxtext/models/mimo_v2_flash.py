@@ -163,6 +163,24 @@ class MiMoV2FlashMoEGate(nnx.Module):
     return top_k_indices, top_k_weights.astype(self.dtype)
 
 
+def _block_dequant_fp8(
+    kernel_fp8: Array,   # [E, In, Out] float8_e4m3fn
+    scale_inv: Array,    # [E, In//128, Out//128] float32
+    bm: int = 128,
+    bn: int = 128,
+) -> Array:
+    """Dequantize block-wise FP8 expert weights to BF16.
+
+    Applies the per-128×128-block scale_inv to convert FP8 E4M3FN weights
+    back to BF16.  Matches the HF block-wise FP8 quantization scheme used
+    by MiMo-V2-Flash: dequant[e, i, j] = fp8[e, i, j] * scale_inv[e, i//128, j//128].
+    """
+    E, In, Out = kernel_fp8.shape
+    blocks = kernel_fp8.reshape(E, In // bm, bm, Out // bn, bn)
+    scale = scale_inv[:, :, jnp.newaxis, :, jnp.newaxis]
+    return (blocks.astype(jnp.float32) * scale).astype(jnp.bfloat16).reshape(E, In, Out)
+
+
 # ---------------------------------------------------------------------------
 # MiMoV2FlashSparseMoeBlock
 # ---------------------------------------------------------------------------
@@ -229,6 +247,17 @@ class MiMoV2FlashSparseMoeBlock(nnx.Module):
         sharding=("exp", "mlp", "embed_no_exp"),
     )
 
+    if getattr(cfg, "mimo_fp8_weight_mode", "") == "block_wise_fp8":
+      # Per-block float32 scale_inv tensors for FP8 dequantization.
+      # Shape: [E, dim_in//128, dim_out//128]; EP shards on the "exp" axis.
+      scale_h = self.hidden_size // 128
+      scale_i = self.intermediate_size // 128
+      ones_wi = jnp.ones((self.num_experts, scale_h, scale_i), dtype=jnp.float32)
+      ones_wo = jnp.ones((self.num_experts, scale_i, scale_h), dtype=jnp.float32)
+      self.wi_0_scale_inv = nnx.Param(ones_wi, sharding=("exp", None, None))
+      self.wi_1_scale_inv = nnx.Param(ones_wi, sharding=("exp", None, None))
+      self.wo_scale_inv   = nnx.Param(ones_wo, sharding=("exp", None, None))
+
   def __call__(self, hidden_states: Array, deterministic: bool) -> Array:
     """Apply the MoE block.
 
@@ -260,9 +289,14 @@ class MiMoV2FlashSparseMoeBlock(nnx.Module):
     dispatch_weights = dispatch_weights.at[tok_idx, top_k_indices].add(
         top_k_weights.astype(jnp.float32)
     )
-    wi_0 = self.wi_0[...].astype(cfg.dtype)
-    wi_1 = self.wi_1[...].astype(cfg.dtype)
-    wo  = self.wo[...].astype(cfg.dtype)
+    if getattr(cfg, "mimo_fp8_weight_mode", "") == "block_wise_fp8":
+      wi_0 = _block_dequant_fp8(self.wi_0[...], self.wi_0_scale_inv[...])
+      wi_1 = _block_dequant_fp8(self.wi_1[...], self.wi_1_scale_inv[...])
+      wo   = _block_dequant_fp8(self.wo[...],   self.wo_scale_inv[...])
+    else:
+      wi_0 = self.wi_0[...].astype(cfg.dtype)
+      wi_1 = self.wi_1[...].astype(cfg.dtype)
+      wo   = self.wo[...].astype(cfg.dtype)
     tokens_fp = tokens.astype(cfg.dtype)
     gate_act = jax.nn.silu(
         jnp.einsum("th,ehi->eti", tokens_fp, wi_0, precision=lax.Precision.DEFAULT)

@@ -792,6 +792,16 @@ class Qwen3Next(BaseModel):
           "output in MiMo-V2-Flash (set to 0.707 = 1/sqrt(2))."
       ),
   )
+  mimo_fp8_weight_mode: str = Field(
+      "",
+      description=(
+          "FP8 weight mode for MiMo-V2-Flash MoE expert weights. "
+          "Empty string (default): weights are BF16, no scale_inv params. "
+          "'block_wise_fp8': weights are float8_e4m3fn, scale_inv tensors are "
+          "loaded from checkpoint as separate float32 params and applied at "
+          "runtime via block_dequant_fp8 before each MoE einsum."
+      ),
+  )
 
 
 class HardwareAndMesh(BaseModel):

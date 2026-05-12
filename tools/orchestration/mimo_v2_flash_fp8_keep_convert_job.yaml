@@ -1,0 +1,62 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: mimo-v2-flash-fp8-keep-convert
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: mimo-v2-flash-fp8-keep-convert
+    spec:
+      restartPolicy: Never
+      # NOTE: Conversion is CPU-only (JAX_PLATFORMS=cpu in the script).
+      # Uses the TPU nodepool for its high-memory nodes and GCS access;
+      # the TPU chips themselves are NOT used during conversion.
+      nodeSelector:
+        cloud.google.com/gke-nodepool: jingnw-flex-tpu7
+        cloud.google.com/gke-tpu-accelerator: tpu7x
+        cloud.google.com/gke-tpu-topology: 2x2x1
+      tolerations:
+      - key: google.com/tpu
+        operator: Equal
+        value: present
+        effect: NoSchedule
+      containers:
+      - name: mimo-fp8-keep-convert
+        image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.8.1-rev1
+        command:
+        - bash
+        - -lc
+        - |
+          set -euo pipefail
+          export PATH="/opt/venv/bin:${PATH}"
+          export PYTHONUNBUFFERED=1
+          WORKDIR=/workspace
+          rm -rf "${WORKDIR}"
+          git clone https://github.com/geeningwang/maxtext.git "${WORKDIR}"
+          cd "${WORKDIR}"
+          git checkout MiMo-V2-Flash
+          /opt/venv/bin/python -m pip install -e ".[tpu]"
+          /opt/venv/bin/python -m pip install transformers safetensors huggingface_hub
+
+          # Convert HF safetensors to MaxText zarr2 checkpoint keeping
+          # MoE expert weights as float8_e4m3fn (with separate scale_inv tensors).
+          # Peak RAM ~50 GB (one MoE layer at a time via --streaming_save).
+          # Output size: ~155 GB (FP8 experts + float32 scales + BF16 attention).
+          /opt/venv/bin/python \
+            -m maxtext.checkpoint_conversion.standalone_scripts.convert_mimo_v2_flash \
+            --base_model_path gs://jingnw-mimo-v2-flash-us-east5/hf-model \
+            --maxtext_model_path gs://jingnw-mimo-v2-flash-us-central1/mimo-v2-flash-fp8-keep \
+            --model_size mimo-v2-flash \
+            --streaming_save \
+            --keep_fp8
+        resources:
+          requests:
+            cpu: "10"
+            memory: 128Gi
+            google.com/tpu: "4"
+          limits:
+            cpu: "10"
+            memory: 128Gi
+            google.com/tpu: "4"

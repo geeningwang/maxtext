@@ -166,6 +166,7 @@ def build_decode_command(
     quantization: str = "",
     checkpoint_is_quantized: bool = False,
     checkpoint_storage_use_zarr3: bool = True,
+    mimo_fp8_weight_mode: str = "",
 ) -> list[str]:
     """Build the shell command for maxtext.inference.decode.
 
@@ -229,6 +230,8 @@ def build_decode_command(
             cmd.append(f"quantization={quantization}")
         if checkpoint_is_quantized:
             cmd.append("checkpoint_is_quantized=true")
+    if mimo_fp8_weight_mode:
+        cmd.append(f"mimo_fp8_weight_mode={mimo_fp8_weight_mode}")
     return cmd
 
 
@@ -250,6 +253,7 @@ def run_inference(
     quantization: str = "",
     checkpoint_is_quantized: bool = False,
     checkpoint_storage_use_zarr3: bool = True,
+    mimo_fp8_weight_mode: str = "",
 ) -> tuple[str, float | None, bool]:
     """Execute MaxText inference and return (generated_text, tok_per_s, eos_fired).
 
@@ -278,6 +282,7 @@ def run_inference(
         quantization=quantization,
         checkpoint_is_quantized=checkpoint_is_quantized,
         checkpoint_storage_use_zarr3=checkpoint_storage_use_zarr3,
+        mimo_fp8_weight_mode=mimo_fp8_weight_mode,
     )
     if verbose:
         print("Running command:")
@@ -542,6 +547,18 @@ def main():
         help="Indicates the checkpoint contains pre-quantized (FP8) weights. "
              "Use with --use_qwix_quantization. Disables zarr3 (FP8 checkpoint uses zarr2).",
     )
+    parser.add_argument(
+        "--mimo_fp8_weight_mode",
+        type=str,
+        default="",
+        help=(
+            "FP8 weight mode for MoE expert weights. "
+            "'' (default): BF16 weights from standard checkpoint. "
+            "'block_wise_fp8': expert weights are float8_e4m3fn in checkpoint with "
+            "separate scale_inv tensors; block_dequant_fp8 is applied before each MoE einsum. "
+            "Use with an --keep_fp8-converted checkpoint."
+        ),
+    )
     args = parser.parse_args()
 
     if args.print_arch:
@@ -576,6 +593,7 @@ def main():
         quantization=args.quantization,
         checkpoint_is_quantized=args.checkpoint_is_quantized,
         checkpoint_storage_use_zarr3=not args.checkpoint_is_quantized,
+        mimo_fp8_weight_mode=getattr(args, "mimo_fp8_weight_mode", ""),
     )
     print("-" * 60)
     if tok_per_s is not None:

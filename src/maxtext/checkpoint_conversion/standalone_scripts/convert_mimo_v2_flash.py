@@ -139,11 +139,17 @@ def _load_keys_batch(
     key_to_shard: dict[str, pathlib.Path],
     label: str = "",
     progress_every: int = 10,
+    keep_fp8: bool = False,
 ) -> dict[str, np.ndarray]:
     """Load a set of weight keys, opening each shard at most once.
 
-    Returns a dict of bfloat16 numpy arrays.  Keys that are not found in the
-    index are silently omitted.
+    When keep_fp8=False (default), returns bfloat16 numpy arrays (FP8 tensors
+    are upcasted to float32 then downcasted to bfloat16).
+
+    When keep_fp8=True, FP8 tensors (dtype starting with "float8") are kept in
+    their native ml_dtypes.float8_e4m3fn dtype; all other tensors are loaded as
+    bfloat16 as usual.  Use this for MoE expert weights when building a
+    block-wise FP8 checkpoint.
     """
     # Group requested keys by their shard file.
     shard_to_keys: dict[pathlib.Path, list[str]] = {}
@@ -163,10 +169,15 @@ def _load_keys_batch(
         )
         with safe_open(shard_path, framework="np") as f:
             for ki, key in enumerate(batch):
-                # .astype(float32) handles fp8/fp16/bf16 → float32 via ml_dtypes.
-                # Then astype(_BF16) downcasts to bf16 via ml_dtypes.
-                arr_f32 = f.get_tensor(key).astype(np.float32)
-                tensors[key] = arr_f32.astype(_BF16) if _BF16 is not None else arr_f32
+                raw = f.get_tensor(key)
+                if keep_fp8 and getattr(raw.dtype, "name", "").startswith("float8"):
+                    # Preserve native FP8 dtype (e.g. float8_e4m3fn) — no upcast.
+                    tensors[key] = raw
+                else:
+                    # .astype(float32) handles fp8/fp16/bf16 → float32 via ml_dtypes.
+                    # Then astype(_BF16) downcasts to bf16 via ml_dtypes.
+                    arr_f32 = raw.astype(np.float32)
+                    tensors[key] = arr_f32.astype(_BF16) if _BF16 is not None else arr_f32
                 keys_loaded += 1
                 if progress_every > 0 and (ki + 1) % progress_every == 0:
                     print(
@@ -319,6 +330,7 @@ def convert_hf_to_maxtext(
     on_layer_complete: "callable | None" = None,
     layer_range: "tuple[int, int] | None" = None,
     skip_global_weights: bool = False,
+    keep_fp8: bool = False,
 ) -> dict:
     """Load and convert HF safetensors weights to a nested MaxText dict.
 
@@ -341,6 +353,12 @@ def convert_hf_to_maxtext(
         skip_global_weights: If True, skip loading the globally-shared weights
             (embeddings, decoder norm, lm_head).  Used by non-zero ranks in
             distributed mode where rank 0 handles global weights.
+        keep_fp8: If True, MoE expert weights are stored as float8_e4m3fn in
+            the output checkpoint instead of being dequantized to bfloat16.
+            Their per-block scale_inv tensors are stored separately under
+            ``{mt}.mlp.wi_0_scale_inv`` etc. (float32).
+            Non-expert weights (attention projections, dense MLP) are still
+            dequantized to bfloat16 as normal.
 
     Returns:
         Nested dict of numpy arrays (or memmaps) ready for Orbax checkpoint save.
@@ -494,20 +512,60 @@ def convert_hf_to_maxtext(
                 f"{hf}.mlp.down_proj.weight_scale_inv",
             ]
 
-        lt = _load_keys_batch(
-            layer_keys, key_to_shard,
-            label=f"[layer {i:02d}/{num_layers-1}] load",
-            progress_every=5,
-        )
-        _t_loaded = time.monotonic()
-        max_logging.log(
-            f"[layer {i:02d}/{num_layers-1}] Loaded {len(lt)} tensors in {_t_loaded-_t0:.1f}s"
-        )
-        print(
-            f"[convert] [layer {i:02d}/{num_layers-1}] Loaded {len(lt)} tensors in {_t_loaded-_t0:.1f}s",
-            flush=True,
-        )
-        _apply_fp8_dequant(lt, label=f"[layer {i:02d}/{num_layers-1}] dequant", progress_every=64)
+        if keep_fp8 and is_moe:
+            # Split loading: expert weight tensors kept as FP8; everything else
+            # (attention, norms, gate, scale_inv) loaded normally and dequantized.
+            expert_weight_keys = []
+            other_layer_keys = []
+            for lk in layer_keys:
+                parts = lk.split(".")
+                # keys like: model.layers.{i}.mlp.experts.{j}.{proj}.weight
+                # (NOT weight_scale_inv)
+                if "experts" in parts and parts[-1] == "weight":
+                    expert_weight_keys.append(lk)
+                else:
+                    other_layer_keys.append(lk)
+
+            lt_fp8 = _load_keys_batch(
+                expert_weight_keys, key_to_shard,
+                label=f"[layer {i:02d}/{num_layers-1}] load-fp8",
+                progress_every=20,
+                keep_fp8=True,
+            )
+            lt_other = _load_keys_batch(
+                other_layer_keys, key_to_shard,
+                label=f"[layer {i:02d}/{num_layers-1}] load-other",
+                progress_every=5,
+            )
+            _t_loaded = time.monotonic()
+            max_logging.log(
+                f"[layer {i:02d}/{num_layers-1}] Loaded {len(lt_fp8)} FP8 + {len(lt_other)} other tensors in {_t_loaded-_t0:.1f}s"
+            )
+            print(
+                f"[convert] [layer {i:02d}/{num_layers-1}] Loaded {len(lt_fp8)} FP8 + {len(lt_other)} other tensors in {_t_loaded-_t0:.1f}s",
+                flush=True,
+            )
+            # Dequantize attention projections (and any remaining FP8 keys in lt_other).
+            _apply_fp8_dequant(lt_other, label=f"[layer {i:02d}/{num_layers-1}] dequant", progress_every=64)
+            # Merge into a single lt dict so the rest of the layer code is unchanged.
+            lt = {**lt_other, **lt_fp8}
+            del lt_fp8, lt_other
+        else:
+            lt = _load_keys_batch(
+                layer_keys, key_to_shard,
+                label=f"[layer {i:02d}/{num_layers-1}] load",
+                progress_every=5,
+            )
+            _t_loaded = time.monotonic()
+            max_logging.log(
+                f"[layer {i:02d}/{num_layers-1}] Loaded {len(lt)} tensors in {_t_loaded-_t0:.1f}s"
+            )
+            print(
+                f"[convert] [layer {i:02d}/{num_layers-1}] Loaded {len(lt)} tensors in {_t_loaded-_t0:.1f}s",
+                flush=True,
+            )
+            _apply_fp8_dequant(lt, label=f"[layer {i:02d}/{num_layers-1}] dequant", progress_every=64)
+
         max_logging.log(
             f"[layer {i:02d}/{num_layers-1}] Dequant done in {time.monotonic()-_t_loaded:.1f}s"
         )
@@ -577,34 +635,83 @@ def convert_hf_to_maxtext(
             # Allocated as float32 locally (no permanent RAM cost in streaming
             # mode: they are flushed to memmap and freed at the end of the loop
             # iteration).
-            wi_0_stack = np.zeros(
-                (num_experts, hidden_size, moe_intermediate_size), dtype=np.float32
-            )
-            wi_1_stack = np.zeros(
-                (num_experts, hidden_size, moe_intermediate_size), dtype=np.float32
-            )
-            wo_stack = np.zeros(
-                (num_experts, moe_intermediate_size, hidden_size), dtype=np.float32
-            )
+            if keep_fp8:
+                # float8_e4m3fn expert weights + float32 per-block scale_inv.
+                # HF scale shape per expert: (I//128, H//128); after .T → (H//128, I//128).
+                _fp8_dtype = ml_dtypes.float8_e4m3fn
+                wi_0_stack = np.zeros(
+                    (num_experts, hidden_size, moe_intermediate_size), dtype=_fp8_dtype
+                )
+                wi_1_stack = np.zeros(
+                    (num_experts, hidden_size, moe_intermediate_size), dtype=_fp8_dtype
+                )
+                wo_stack = np.zeros(
+                    (num_experts, moe_intermediate_size, hidden_size), dtype=_fp8_dtype
+                )
+                scale_h = hidden_size // 128
+                scale_i = moe_intermediate_size // 128
+                wi_0_scale = np.ones((num_experts, scale_h, scale_i), dtype=np.float32)
+                wi_1_scale = np.ones((num_experts, scale_h, scale_i), dtype=np.float32)
+                wo_scale = np.ones((num_experts, scale_i, scale_h), dtype=np.float32)
 
-            for j in range(num_experts):
-                gp = lt.get(f"{hf}.mlp.experts.{j}.gate_proj.weight")
-                up = lt.get(f"{hf}.mlp.experts.{j}.up_proj.weight")
-                dp = lt.get(f"{hf}.mlp.experts.{j}.down_proj.weight")
-                if gp is not None:
-                    wi_0_stack[j] = gp.T   # HF (I, H) → MaxText (H, I)
-                if up is not None:
-                    wi_1_stack[j] = up.T
-                if dp is not None:
-                    wo_stack[j] = dp.T     # HF (H, I) → MaxText (I, H)
+                for j in range(num_experts):
+                    gp = lt.get(f"{hf}.mlp.experts.{j}.gate_proj.weight")
+                    up = lt.get(f"{hf}.mlp.experts.{j}.up_proj.weight")
+                    dp = lt.get(f"{hf}.mlp.experts.{j}.down_proj.weight")
+                    gp_sc = lt.get(f"{hf}.mlp.experts.{j}.gate_proj.weight_scale_inv")
+                    up_sc = lt.get(f"{hf}.mlp.experts.{j}.up_proj.weight_scale_inv")
+                    dp_sc = lt.get(f"{hf}.mlp.experts.{j}.down_proj.weight_scale_inv")
+                    if gp is not None:
+                        wi_0_stack[j] = gp.T   # HF (I, H) → MaxText (H, I)
+                    if up is not None:
+                        wi_1_stack[j] = up.T
+                    if dp is not None:
+                        wo_stack[j] = dp.T     # HF (H, I) → MaxText (I, H)
+                    # Transpose scale to match transposed weight blocks.
+                    if gp_sc is not None:
+                        wi_0_scale[j] = gp_sc.T   # (I//128, H//128) → (H//128, I//128)
+                    if up_sc is not None:
+                        wi_1_scale[j] = up_sc.T
+                    if dp_sc is not None:
+                        wo_scale[j] = dp_sc.T     # (H//128, I//128) → (I//128, H//128)
 
-            flat[f"{mt}.mlp.wi_0"] = _put(f"{mt}.mlp.wi_0", wi_0_stack)
-            flat[f"{mt}.mlp.wi_1"] = _put(f"{mt}.mlp.wi_1", wi_1_stack)
-            flat[f"{mt}.mlp.wo"] = _put(f"{mt}.mlp.wo", wo_stack)
+                flat[f"{mt}.mlp.wi_0"] = _put(f"{mt}.mlp.wi_0", wi_0_stack)
+                flat[f"{mt}.mlp.wi_1"] = _put(f"{mt}.mlp.wi_1", wi_1_stack)
+                flat[f"{mt}.mlp.wo"] = _put(f"{mt}.mlp.wo", wo_stack)
+                flat[f"{mt}.mlp.wi_0_scale_inv"] = _put(f"{mt}.mlp.wi_0_scale_inv", wi_0_scale)
+                flat[f"{mt}.mlp.wi_1_scale_inv"] = _put(f"{mt}.mlp.wi_1_scale_inv", wi_1_scale)
+                flat[f"{mt}.mlp.wo_scale_inv"] = _put(f"{mt}.mlp.wo_scale_inv", wo_scale)
 
-            # Free the large float32 stacks immediately — in streaming mode
-            # the data is now safely on disk.
-            del wi_0_stack, wi_1_stack, wo_stack
+                del wi_0_stack, wi_1_stack, wo_stack, wi_0_scale, wi_1_scale, wo_scale
+            else:
+                wi_0_stack = np.zeros(
+                    (num_experts, hidden_size, moe_intermediate_size), dtype=np.float32
+                )
+                wi_1_stack = np.zeros(
+                    (num_experts, hidden_size, moe_intermediate_size), dtype=np.float32
+                )
+                wo_stack = np.zeros(
+                    (num_experts, moe_intermediate_size, hidden_size), dtype=np.float32
+                )
+
+                for j in range(num_experts):
+                    gp = lt.get(f"{hf}.mlp.experts.{j}.gate_proj.weight")
+                    up = lt.get(f"{hf}.mlp.experts.{j}.up_proj.weight")
+                    dp = lt.get(f"{hf}.mlp.experts.{j}.down_proj.weight")
+                    if gp is not None:
+                        wi_0_stack[j] = gp.T   # HF (I, H) → MaxText (H, I)
+                    if up is not None:
+                        wi_1_stack[j] = up.T
+                    if dp is not None:
+                        wo_stack[j] = dp.T     # HF (H, I) → MaxText (I, H)
+
+                flat[f"{mt}.mlp.wi_0"] = _put(f"{mt}.mlp.wi_0", wi_0_stack)
+                flat[f"{mt}.mlp.wi_1"] = _put(f"{mt}.mlp.wi_1", wi_1_stack)
+                flat[f"{mt}.mlp.wo"] = _put(f"{mt}.mlp.wo", wo_stack)
+
+                # Free the large float32 stacks immediately — in streaming mode
+                # the data is now safely on disk.
+                del wi_0_stack, wi_1_stack, wo_stack
         else:
             # Dense MLP — only layer 0 in the default config
             gp = lt.get(f"{hf}.mlp.gate_proj.weight")
@@ -693,9 +800,20 @@ def _write_one_zarr_array(
     zarr_name = f"params.params.{key}"
     zarr_path = items_dir / zarr_name
 
-    is_bf16 = getattr(arr.dtype, "name", "") == "bfloat16"
-    write_arr = arr.view(np.uint16) if is_bf16 else arr
-    write_dtype = np.uint16 if is_bf16 else arr.dtype
+    dtype_name = getattr(arr.dtype, "name", "")
+    is_bf16 = dtype_name == "bfloat16"
+    is_fp8 = dtype_name.startswith("float8")
+
+    if is_bf16:
+        write_arr = arr.view(np.uint16)
+        write_dtype = np.uint16
+    elif is_fp8:
+        # Store FP8 as uint8 bytes; annotate .zarray so TensorStore can decode.
+        write_arr = arr.view(np.uint8)
+        write_dtype = np.uint8
+    else:
+        write_arr = arr
+        write_dtype = arr.dtype
 
     z = zarr.open_array(
         str(zarr_path), mode="w",
@@ -717,6 +835,10 @@ def _write_one_zarr_array(
     if is_bf16:
         meta = json.loads(zarray_path.read_text())
         meta["dtype"] = "bfloat16"
+        zarray_path.write_text(json.dumps(meta))
+    elif is_fp8:
+        meta = json.loads(zarray_path.read_text())
+        meta["dtype"] = dtype_name  # e.g. "float8_e4m3fn"
         zarray_path.write_text(json.dumps(meta))
 
     key_parts = ["params", "params"] + key.split(".")
@@ -780,6 +902,7 @@ def convert_and_save_streaming(
     maxtext_model_path: str,
     params: dict,
     step: int = 0,
+    keep_fp8: bool = False,
 ) -> None:
     """Convert HF weights and write the zarr checkpoint in a single pass.
 
@@ -791,6 +914,9 @@ def convert_and_save_streaming(
 
     No ``--tmpdir`` is needed; all intermediates live in local RAM only for
     the duration of a single layer.
+
+    When keep_fp8=True, MoE expert weights are stored as float8_e4m3fn with
+    separate scale_inv tensors.  Use --keep_fp8 on the CLI to enable this.
     """
     import zarr  # pylint: disable=import-outside-toplevel
     import json  # pylint: disable=import-outside-toplevel
@@ -854,6 +980,7 @@ def convert_and_save_streaming(
         params,
         tmpdir=None,           # no tmpdir — arrays stay in RAM only transiently
         on_layer_complete=_on_layer_complete,
+        keep_fp8=keep_fp8,
     )
 
     # Write remaining global weights (returned in flat after layer loop).
@@ -983,6 +1110,10 @@ def main(args):
             "Use --tmpdir <path> or --streaming to enable low-RAM streaming mode."
         )
 
+    keep_fp8 = getattr(args, "keep_fp8", False)
+    if keep_fp8 and not args.streaming_save:
+        raise ValueError("--keep_fp8 requires --streaming_save (FP8 stacking is only implemented in the streaming-save path).")
+
     if args.streaming_save:
         # Streaming mode: convert + save one decoder layer at a time.
         # Peak RAM ≈ one MoE layer (~50 GB) regardless of total model size.
@@ -990,9 +1121,9 @@ def main(args):
         params = MODEL_PARAMS[args.model_size]
         max_logging.log(
             f"Streaming-save mode: converting and saving layer by layer "
-            f"(peak RAM ~50 GB). Output: {args.maxtext_model_path}"
+            f"(peak RAM ~50 GB, keep_fp8={keep_fp8}). Output: {args.maxtext_model_path}"
         )
-        convert_and_save_streaming(model_path, args.maxtext_model_path, params)
+        convert_and_save_streaming(model_path, args.maxtext_model_path, params, keep_fp8=keep_fp8)
         max_logging.log("Streaming conversion + save complete.")
     elif getattr(args, "resume_from_tmpdir", False):
         # Skip the ~53-min conversion phase and restore memmaps from disk.
@@ -1118,6 +1249,19 @@ if __name__ == "__main__":
             "regardless of total model size.  No --tmpdir is required in this mode.  "
             "Use this flag when the full model is too large to hold in RAM simultaneously "
             "(e.g. 309B MiMo-V2-Flash on a 708 GB host)."
+        ),
+    )
+    parser.add_argument(
+        "--keep_fp8",
+        action="store_true",
+        default=False,
+        help=(
+            "Keep MoE expert weights in float8_e4m3fn format in the output checkpoint "
+            "instead of dequantizing to bfloat16.  Per-block scale_inv tensors are stored "
+            "alongside as separate float32 arrays (e.g. mlp.wi_0_scale_inv).  "
+            "Non-expert weights (attention projections, dense MLP) are still dequantized to "
+            "bfloat16 as normal.  Requires --streaming_save.  "
+            "The resulting checkpoint is ~155 GB (FP8 experts) vs ~384 GB (BF16)."
         ),
     )
 
