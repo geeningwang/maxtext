@@ -45,7 +45,7 @@ spec:
             --tokenizer_path XiaomiMiMo/MiMo-V2-Flash \
             --ici_tensor_parallelism 4 \
             --ici_expert_parallelism 2 \
-            --max_new_tokens 128 \
+            --max_new_tokens 512 \
             --use_qwix_quantization \
             --quantization fp8_full \
             --checkpoint_is_quantized \
