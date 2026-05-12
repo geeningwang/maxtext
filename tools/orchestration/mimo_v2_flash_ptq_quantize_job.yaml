@@ -102,9 +102,9 @@ spec:
         resources:
           requests:
             cpu: "10"
-            memory: 512Gi
+            memory: 750Gi
             google.com/tpu: "4"
           limits:
             cpu: "10"
-            memory: 512Gi
+            memory: 750Gi
             google.com/tpu: "4"
