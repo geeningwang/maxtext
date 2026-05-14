@@ -1,0 +1,135 @@
+# MiMo-V2.5-Pro inference smoke-test job — GKE multi-host (2x2x2, 8 chips, 16 JAX devices)
+#
+# Cluster:   jingnw-tpu7-cluster  (us-central1-c)
+# Node pool: jingnw-flex-tpu7-8ch  (tpu7x-standard-4t, 2x2x2 topology, Flex Start)
+#            2 nodes × 4 chips each = 8 chips = 16 JAX devices
+#
+# Parallelism: TP=8, EP=2  (8×2=16 devices)
+# HBM budget:  ~71 GB weights / 80 GB usable per device  → ~9 GB XLA headroom
+#              scan_layers=true caps XLA temp buffer to 1 layer at a time
+#
+# Pre-requisites:
+#   1. Checkpoint converted to MaxText zarr2 format (Phase 4):
+#      gs://jingnw-mimo-v2-5-pro-us-central1/mimo-v2-5-pro-bf16-ocdbt/0/items
+#   2. Node pool jingnw-flex-tpu7-8ch available (autoscales from 0)
+#   3. Broken 16ch pool cleaned up (see env_restore.md pending cleanup section)
+#
+# Apply:
+#   kubectl apply -f tools/orchestration/mimo_v2_5_pro_inference_job.yaml
+#
+# Monitor:
+#   kubectl logs -f -l job-name=mimo-v25-pro-inference --prefix
+#
+# Clean up:
+#   kubectl delete job mimo-v25-pro-inference
+#   kubectl delete service mimo-v25-pro-inference
+
+# ---------------------------------------------------------------------------
+# Headless Service — gives pod-0 a stable DNS name for coordinator discovery.
+# Pod-0 is reachable at:
+#   mimo-v25-pro-inference-0.mimo-v25-pro-inference.<namespace>.svc.cluster.local
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: mimo-v25-pro-inference
+  namespace: default
+spec:
+  clusterIP: None   # headless: DNS returns pod IPs directly
+  selector:
+    job-name: mimo-v25-pro-inference
+
+---
+# ---------------------------------------------------------------------------
+# Indexed Job — 2 pods, one per TPU node (4 chips each).
+# completionMode: Indexed sets JOB_COMPLETION_INDEX=0 on worker-0 and =1 on worker-1.
+# Both pods must start simultaneously; JAX handles ICI coordination internally.
+# ---------------------------------------------------------------------------
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: mimo-v25-pro-inference
+  namespace: default
+spec:
+  completions: 2
+  parallelism: 2
+  completionMode: Indexed
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        job-name: mimo-v25-pro-inference
+    spec:
+      restartPolicy: Never
+      # subdomain + headless Service gives pod-0 a stable DNS hostname:
+      #   mimo-v25-pro-inference-0.mimo-v25-pro-inference.default.svc.cluster.local
+      subdomain: mimo-v25-pro-inference
+      nodeSelector:
+        cloud.google.com/gke-nodepool: jingnw-flex-tpu7-8ch
+        cloud.google.com/gke-tpu-accelerator: tpu7x
+        cloud.google.com/gke-tpu-topology: 2x2x2
+      tolerations:
+      - key: google.com/tpu
+        operator: Equal
+        value: present
+        effect: NoSchedule
+      containers:
+      - name: mimo-v25-pro-inference
+        image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.8.1-rev1
+        env:
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        - name: NODE_RANK
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.annotations['batch.kubernetes.io/job-completion-index']
+        # Worker-0 is the JAX coordinator; all workers connect to its address.
+        - name: JAX_COORDINATOR_ADDRESS
+          value: "mimo-v25-pro-inference-0.mimo-v25-pro-inference.default.svc.cluster.local:6006"
+        - name: JAX_COORDINATOR_PORT
+          value: "6006"
+        - name: NNODES
+          value: "2"
+        command:
+        - bash
+        - -lc
+        - |
+          set -euo pipefail
+          export PATH="/opt/venv/bin:${PATH}"
+
+          # Clone branch and install.
+          WORKDIR=/workspace
+          rm -rf "${WORKDIR}"
+          git clone https://github.com/geeningwang/maxtext.git "${WORKDIR}"
+          cd "${WORKDIR}"
+          git checkout MiMo-V2.5-Pro
+          /opt/venv/bin/python -m pip install -e ".[tpu]"
+          install_maxtext_tpu_github_deps
+          /opt/venv/bin/python -m pip install transformers safetensors huggingface_hub
+
+          echo "[mimo-v25-pro] NODE_RANK=${NODE_RANK}  JAX_COORDINATOR_ADDRESS=${JAX_COORDINATOR_ADDRESS}"
+          echo "[mimo-v25-pro] Starting inference smoke test..."
+
+          # Phase 6 smoke test: single-token decode at batch=1.
+          # scan_layers=true is critical — caps XLA temp buffer to 1 layer at a time,
+          # keeping within the ~9 GB XLA headroom on this 8-chip pool.
+          /opt/venv/bin/python demos/mimo_v2_flash_demo_jax.py \
+            --checkpoint_path gs://jingnw-mimo-v2-5-pro-us-central1/mimo-v2-5-pro-bf16-ocdbt/0/items \
+            --tokenizer_path XiaomiMiMo/MiMo-V2.5-Pro \
+            --ici_tensor_parallelism 8 \
+            --ici_expert_parallelism 2 \
+            --scan_layers \
+            --max_prefill 128 \
+            --max_new_tokens 32 \
+            --verbose \
+            --prompt "Hello, what is 1+1?"
+
+        resources:
+          requests:
+            cpu: "10"
+            memory: 512Gi
+            google.com/tpu: "4"   # 4 chips per node; 2 nodes = 8 chips total
+          limits:
+            cpu: "10"
+            memory: 512Gi
+            google.com/tpu: "4"
