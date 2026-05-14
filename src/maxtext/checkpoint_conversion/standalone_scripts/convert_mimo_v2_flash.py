@@ -158,6 +158,7 @@ MODEL_PARAMS = {
         "num_experts": 256,
         "moe_intermediate_size": 2048,
         "mlp_intermediate_size": 16384, # dense MLP (layer 0 only)
+        "attention_projection_layout": "split",  # separate q_proj/k_proj/v_proj
         # 0 = global attention, 1 = sliding-window (SWA)
         "hybrid_layer_pattern": [
             0,1,1,1,1, 0,1,1,1,1,1, 0,1,1,1,1,1, 0,1,1,1,1,1, 0,1,1,1,1,1,
@@ -165,6 +166,31 @@ MODEL_PARAMS = {
         ],
         # 0 = dense MLP, 1 = MoE
         "moe_layer_freq": [0] + [1] * 47,
+    },
+    "mimo-v2-5-pro": {
+        "num_hidden_layers": 70,
+        "num_attention_heads": 128,
+        "num_key_value_heads": 8,       # GA KV heads (unified with SWA; both 8)
+        "swa_num_key_value_heads": 8,   # SWA KV heads
+        "hidden_size": 6144,
+        "head_dim": 192,                # Q/K dim
+        "v_head_dim": 128,              # V dim
+        "num_experts": 384,
+        "moe_intermediate_size": 2048,
+        "mlp_intermediate_size": 16384, # dense MLP (layer 0 only)
+        # HF stores Q/K/V as a single fused tensor; converter splits on dim 0.
+        # Split offsets: [0, nq*dq], [nq*dq, nq*dq+nkv*dk], [nq*dq+nkv*dk, ...]
+        # = [0, 24576], [24576, 26112], [26112, 27136]
+        "attention_projection_layout": "fused_qkv",
+        # 0 = global attention, 1 = sliding-window (SWA)
+        # GA at positions: 0, 7, 15, 23, 31, 39, 47, 55, 62, 69
+        "hybrid_layer_pattern": [
+            0,1,1,1,1,1,1, 0,1,1,1,1,1,1,1, 0,1,1,1,1,1,1,1, 0,1,1,1,1,1,1,1,
+            0,1,1,1,1,1,1,1, 0,1,1,1,1,1,1,1, 0,1,1,1,1,1,1,1, 0,1,1,1,1,1,1,
+            0,1,1,1,1,1,1, 0
+        ],
+        # 0 = dense MLP (layer 0), 1 = MoE (layers 1-69)
+        "moe_layer_freq": [0] + [1] * 69,
     },
 }
 
@@ -429,6 +455,12 @@ def convert_hf_to_maxtext(
     mlp_intermediate_size = params["mlp_intermediate_size"]
     hybrid = params["hybrid_layer_pattern"]
     moe_freq = params["moe_layer_freq"]
+    projection_layout = params.get("attention_projection_layout", "split")
+    fused_qkv = projection_layout == "fused_qkv"
+    # Precompute fused QKV split offsets (only used when fused_qkv=True).
+    _q_end = num_heads * head_dim
+    _k_end = _q_end + num_kv_heads * head_dim
+    _v_end = _k_end + num_kv_heads * v_head_dim
 
     # ------------------------------------------------------------------
     # 1. Discover safetensors shards and build a key → shard index
@@ -535,13 +567,21 @@ def convert_hf_to_maxtext(
         # each shard exactly once for this layer.
         # weight_scale_inv mates are included so _apply_fp8_dequant can scale
         # raw FP8 values (converted to float32 via .float()) to correct BF16.
-        layer_keys: list[str] = [
-            f"{hf}.self_attn.q_proj.weight",
-            f"{hf}.self_attn.q_proj.weight_scale_inv",
-            f"{hf}.self_attn.k_proj.weight",
-            f"{hf}.self_attn.k_proj.weight_scale_inv",
-            f"{hf}.self_attn.v_proj.weight",
-            f"{hf}.self_attn.v_proj.weight_scale_inv",
+        if fused_qkv:
+            attn_proj_keys = [
+                f"{hf}.self_attn.qkv_proj.weight",
+                f"{hf}.self_attn.qkv_proj.weight_scale_inv",
+            ]
+        else:
+            attn_proj_keys = [
+                f"{hf}.self_attn.q_proj.weight",
+                f"{hf}.self_attn.q_proj.weight_scale_inv",
+                f"{hf}.self_attn.k_proj.weight",
+                f"{hf}.self_attn.k_proj.weight_scale_inv",
+                f"{hf}.self_attn.v_proj.weight",
+                f"{hf}.self_attn.v_proj.weight_scale_inv",
+            ]
+        layer_keys: list[str] = attn_proj_keys + [
             f"{hf}.self_attn.o_proj.weight",
             f"{hf}.self_attn.o_proj.weight_scale_inv",
             f"{hf}.self_attn.attention_sink_bias",
@@ -636,9 +676,19 @@ def convert_hf_to_maxtext(
         sys.stdout.flush(); sys.stderr.flush()
 
         # ----- Attention -----
-        q = lt.get(f"{hf}.self_attn.q_proj.weight")
-        k = lt.get(f"{hf}.self_attn.k_proj.weight")
-        v = lt.get(f"{hf}.self_attn.v_proj.weight")
+        if fused_qkv:
+            qkv = lt.get(f"{hf}.self_attn.qkv_proj.weight")
+            if qkv is not None:
+                # qkv shape: [q_size+k_size+v_size, hidden_size] — split on dim 0
+                q = qkv[:_q_end, :]
+                k = qkv[_q_end:_k_end, :]
+                v = qkv[_k_end:_v_end, :]
+            else:
+                q = k = v = None
+        else:
+            q = lt.get(f"{hf}.self_attn.q_proj.weight")
+            k = lt.get(f"{hf}.self_attn.k_proj.weight")
+            v = lt.get(f"{hf}.self_attn.v_proj.weight")
         o = lt.get(f"{hf}.self_attn.o_proj.weight")
         if q is not None:
             flat[f"{mt}.self_attn.query.kernel"] = _put(
@@ -1228,7 +1278,7 @@ if __name__ == "__main__":
         type=str,
         default="mimo-v2-flash",
         choices=list(MODEL_PARAMS.keys()),
-        help="Model size identifier. Currently only 'mimo-v2-flash' is supported.",
+        help="Model variant to convert: 'mimo-v2-flash' (309B) or 'mimo-v2-5-pro' (1.02T, fused_qkv).",
     )
     parser.add_argument(
         "--download_from_hub",
