@@ -1,0 +1,50 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(grep -v \"^commit\\\\|^Author\\\\|^Date\\\\|^Merge\\\\|^$\\\\|---\")",
+      "Bash(git checkout *)",
+      "Bash(grep -E \"\\\\.\\(yml|yaml|json\\)$\")",
+      "WebSearch",
+      "Bash(curl -sL \"https://huggingface.co/XiaomiMiMo/MiMo-V2.5-Pro/raw/main/config.json\")",
+      "Bash(curl -sL \"https://huggingface.co/XiaomiMiMo/MiMo-V2.5-Pro/raw/main/README.md\")",
+      "Bash(curl -sL \"https://huggingface.co/XiaomiMiMo/MiMo-V2.5-Pro/raw/main/generation_config.json\")",
+      "Bash(curl -sL \"https://huggingface.co/api/models/XiaomiMiMo/MiMo-V2.5-Pro\")",
+      "Bash(python3 -c \"import json,sys; d=json.load\\(sys.stdin\\); print\\('safetensors siblings:'\\); [print\\(' ',s['rfilename']\\) for s in d.get\\('siblings',[]\\) if 'safetensor' in s['rfilename'] or s['rfilename'] in \\('config.json','tokenizer_config.json','generation_config.json','modeling_mimo_v2.py','configuration_mimo_v2.py'\\)]\")",
+      "Bash(gsutil ls *)",
+      "Bash(python3 -c ' *)",
+      "Bash(gcloud config *)",
+      "Bash(curl -sL -A \"Mozilla/5.0\" \"https://huggingface.co/XiaomiMiMo/MiMo-V2.5-Pro/resolve/main/model.safetensors.index.json\")",
+      "Bash(gsutil du *)",
+      "Bash(kubectl get *)",
+      "Bash(gcloud container *)",
+      "Bash(gcloud compute *)",
+      "Bash(kubectl describe *)",
+      "Bash(grep -v \"^--$\")",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)",
+      "Bash(git push *)",
+      "Bash(python3 -c \"import huggingface_hub, google.cloud.storage, requests; print\\('deps ok'\\)\")",
+      "Bash(gsutil mb *)",
+      "Bash(pip install *)",
+      "Bash(python3 -m pip install huggingface_hub requests google-cloud-storage -q)",
+      "Bash(curl -sL --max-time 5 \"https://huggingface.co/XiaomiMiMo/MiMo-V2.5-Pro/resolve/main/config.json\")",
+      "Bash(# Check for virtualenv/conda/venv *)",
+      "Read(//opt/**)",
+      "Read(//usr/**)",
+      "Read(//home/jingnw_google_com/.local/bin/**)",
+      "Bash(curl -sL -A \"Mozilla/5.0\" \"https://huggingface.co/api/models/XiaomiMiMo/MiMo-V2.5-Pro\")",
+      "Bash(gsutil cp *)",
+      "Bash(nohup bash /home/jingnw_google_com/maxtext/tools/dev/upload_mimo_v25pro_hf_to_gcs.sh)",
+      "Bash(echo \"PID: $!\")",
+      "Bash(sleep 5 && tail -20 /tmp/mimo_v25pro_upload.log)",
+      "Read(//tmp/**)",
+      "Bash(awk '{print $1, $2, $11}')",
+      "Bash(awk '{print \"PID running:\", $2}')",
+      "Bash(nohup bash tools/dev/upload_mimo_v25pro_hf_to_gcs.sh \\\\ *)",
+      "Bash(git check-ignore *)"
+    ],
+    "additionalDirectories": [
+      "/tmp"
+    ]
+  }
+}
