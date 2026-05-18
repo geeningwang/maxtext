@@ -242,7 +242,7 @@ def _load_keys_batch(
     total_shards = len(shard_to_keys)
     keys_loaded = 0
     for idx, (shard_path, batch) in enumerate(shard_to_keys.items()):
-        shard_name = shard_path.name
+        shard_name = str(shard_path).rstrip("/").split("/")[-1]
         print(
             f"[convert] {label}  opening shard {idx+1}/{total_shards} ({shard_name}, {len(batch)} keys)  keys_so_far={keys_loaded}",
             flush=True,
@@ -470,7 +470,8 @@ def convert_hf_to_maxtext(
         gcs_uris = _gcs_ls_safetensors(base_model_path)
         if not gcs_uris:
             raise FileNotFoundError(f"No *.safetensors files found in: {base_model_path}")
-        shard_paths = [pathlib.Path(u) for u in gcs_uris]
+        # Keep as strings — pathlib.Path collapses gs:// → gs:/ which breaks _is_gcs().
+        shard_paths = gcs_uris
     else:
         shard_paths = sorted(pathlib.Path(base_model_path).glob("*.safetensors"))
         if not shard_paths:
