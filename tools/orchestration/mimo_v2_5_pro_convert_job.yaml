@@ -1,0 +1,58 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: mimo-v25-pro-convert-v5
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: mimo-v25-pro-convert-v5
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        cloud.google.com/gke-nodepool: jingnw-cpu-highmem
+      containers:
+      - name: mimo-v25-pro-convert
+        image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.8.1-rev1
+        command:
+        - bash
+        - -lc
+        - |
+          set -euo pipefail
+          export PATH="/opt/venv/bin:${PATH}"
+          export PYTHONUNBUFFERED=1
+
+          WORKDIR=/workspace
+          rm -rf "${WORKDIR}"
+          git clone https://github.com/geeningwang/maxtext.git "${WORKDIR}"
+          cd "${WORKDIR}"
+          git checkout MiMo-V2.5-Pro
+          echo "[convert] Branch: $(git log --oneline -1)"
+
+          /opt/venv/bin/python -m pip install -e ".[tpu]" -q
+          /opt/venv/bin/python -m pip install transformers safetensors huggingface_hub "zarr<3" numcodecs gcsfs -q
+
+          echo "[convert] Starting MiMo-V2.5-Pro HF→MaxText conversion (streaming-save mode)..."
+          echo "[convert] Input:  gs://jingnw-mimo-v2-5-pro-us-central1/hf-weights"
+          echo "[convert] Output: gs://jingnw-mimo-v2-5-pro-us-central1/mimo-v2-5-pro-bf16-ocdbt"
+
+          /opt/venv/bin/python \
+            -m maxtext.checkpoint_conversion.standalone_scripts.convert_mimo_v2_flash \
+            --base_model_path gs://jingnw-mimo-v2-5-pro-us-central1/hf-weights \
+            --maxtext_model_path gs://jingnw-mimo-v2-5-pro-us-central1/mimo-v2-5-pro-bf16-ocdbt \
+            --model_size mimo-v2-5-pro \
+            --streaming_save
+
+          echo "[convert] Done."
+
+        resources:
+          requests:
+            cpu: "14"
+            memory: 110Gi
+          limits:
+            cpu: "14"
+            memory: 110Gi
+        env:
+        - name: PYTHONUNBUFFERED
+          value: "1"

@@ -1,5 +1,6 @@
 {
   "permissions": {
+    "defaultMode": "bypassPermissions",
     "allow": [
       "Bash(grep -v \"^commit\\\\|^Author\\\\|^Date\\\\|^Merge\\\\|^$\\\\|---\")",
       "Bash(git checkout *)",
@@ -41,7 +42,19 @@
       "Bash(awk '{print $1, $2, $11}')",
       "Bash(awk '{print \"PID running:\", $2}')",
       "Bash(nohup bash tools/dev/upload_mimo_v25pro_hf_to_gcs.sh \\\\ *)",
-      "Bash(git check-ignore *)"
+      "Bash(git check-ignore *)",
+      "Bash(free -h && nproc && cat /proc/meminfo | grep MemTotal)",
+      "Read(//proc/**)",
+      "Bash(gcloud components *)",
+      "Bash(kubectl logs *)",
+      "Bash(kubectl apply *)",
+      "Read(//home/jingnw_google_com/**)",
+      "Read(//home/jingnw_google_com/.ssh/**)",
+      "Bash(gh auth *)",
+      "Bash(ssh -T git@github.com)",
+      "Bash(git ls-remote *)",
+      "Bash(sudo apt-get install -y google-cloud-cli-gke-gcloud-auth-plugin)",
+      "Bash(python3 -)"
     ],
     "additionalDirectories": [
       "/tmp"
