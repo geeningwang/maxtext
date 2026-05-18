@@ -301,8 +301,16 @@ def _apply_fp8_dequant(lt: dict, label: str = "", progress_every: int = 64) -> N
         s = lt.pop(scale_key).astype(np.float32)
         rows, cols = w.shape[-2], w.shape[-1]
         sr, sc = s.shape[-2], s.shape[-1]
-        bm, bn = rows // sr, cols // sc
-        s_exp = np.repeat(np.repeat(s, bm, axis=-2), bn, axis=-1)  # (rows, cols)
+        if rows % sr == 0 and cols % sc == 0:
+            bm, bn = rows // sr, cols // sc
+            s_exp = np.repeat(np.repeat(s, bm, axis=-2), bn, axis=-1)
+        else:
+            # Scale has alignment-padding rows (e.g. fused QKV: sr=216 for 27136 rows).
+            # Infer block size from the evenly-dividing dimension (cols is always exact).
+            bn = cols // sc  # e.g. 6144 // 48 = 128
+            bm = bn          # FP8 uses equal row/col block sizes (128×128)
+            s_exp = np.repeat(np.repeat(s, bm, axis=-2), bn, axis=-1)
+            s_exp = s_exp[..., :rows, :cols]  # trim padding
         result = w * s_exp
         lt[weight_key] = result.astype(_BF16) if _BF16 is not None else result
 
