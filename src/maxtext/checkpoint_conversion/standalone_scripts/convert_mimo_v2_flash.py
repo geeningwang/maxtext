@@ -214,6 +214,53 @@ def _index_gcs_shard(shard_uri: str, key_to_info: dict) -> None:
         }
 
 
+def _find_resume_layer(items_dir_str: str, num_layers: int) -> int:
+    """Return the index of the first layer not yet written under items_dir.
+
+    Probes for each layer's input_layernorm.scale zarr array (.zarray metadata
+    file), which is always the first array written per layer.  Returns
+    num_layers if all layers are already present (full resume or complete run).
+    """
+    for n in range(num_layers):
+        probe = _path_join(
+            items_dir_str,
+            f"params.params.decoder.layers.{n}.input_layernorm.scale",
+            ".zarray",
+        )
+        if not _path_exists(probe):
+            return n
+    return num_layers
+
+
+def _scan_existing_zarr_meta(items_dir_str: str) -> dict:
+    """Reconstruct tree_meta entries for zarr arrays already written to items_dir.
+
+    On resume, layers already in GCS must still appear in _METADATA so Orbax
+    can deserialise the checkpoint.  We list the direct children of items_dir
+    (each is a zarr array directory named ``params.params.<key_path>``) and
+    rebuild the key_metadata / value_metadata dicts from the names.
+    """
+    if not _is_gcs(items_dir_str):
+        return {}
+    import gcsfs  # pylint: disable=import-outside-toplevel
+    fs = gcsfs.GCSFileSystem()
+    try:
+        children = fs.ls(items_dir_str, detail=False)
+    except Exception:
+        return {}
+    result = {}
+    for child in children:
+        zarr_name = str(child).rstrip("/").split("/")[-1]
+        if not zarr_name.startswith("params.params."):
+            continue
+        key_parts = zarr_name.split(".")
+        result[str(tuple(key_parts))] = {
+            "key_metadata": [{"key": p, "key_type": 2} for p in key_parts],
+            "value_metadata": {"value_type": "np.ndarray", "skip_deserialize": False},
+        }
+    return result
+
+
 def _gcs_ls_safetensors(gcs_dir: str) -> list[str]:
     """List all *.safetensors GCS URIs under gcs_dir using gsutil."""
     result = subprocess.run(
@@ -1202,17 +1249,32 @@ def convert_and_save_streaming(
     import json  # pylint: disable=import-outside-toplevel
     import time  # pylint: disable=import-outside-toplevel
     import numcodecs  # pylint: disable=import-outside-toplevel
+    from concurrent.futures import ThreadPoolExecutor, as_completed  # pylint: disable=import-outside-toplevel
 
     # Use string paths throughout — pathlib.Path collapses gs:// → gs:/ (local path).
     root_str = maxtext_model_path.rstrip("/")
     step_dir_str = _path_join(root_str, str(step))
     items_dir_str = _path_join(step_dir_str, "items")
+
+    # ------------------------------------------------------------------
+    # Resume detection: find the first layer not yet written to GCS.
+    # If some layers are already present, skip re-downloading/converting
+    # them and reconstruct their tree_meta entries from GCS.
+    # ------------------------------------------------------------------
+    num_layers = params["num_hidden_layers"]
+    resume_layer = _find_resume_layer(items_dir_str, num_layers)
+    if resume_layer > 0:
+        max_logging.log(f"Resume: layers 0–{resume_layer - 1} already in GCS; starting from layer {resume_layer}.")
+        print(f"[convert] Resume: layers 0–{resume_layer - 1} already in GCS; starting from layer {resume_layer}.", flush=True)
+
     _makedirs(root_str)
-    try:
-        if _path_exists(step_dir_str):
-            _rmtree(step_dir_str)
-    except OSError as _e:
-        max_logging.log(f"Note: could not remove {step_dir_str} ({_e}); zarr will overwrite in place.")
+    if resume_layer == 0:
+        # Fresh start — wipe any partial output so we don't mix stale data.
+        try:
+            if _path_exists(step_dir_str):
+                _rmtree(step_dir_str)
+        except OSError as _e:
+            max_logging.log(f"Note: could not remove {step_dir_str} ({_e}); zarr will overwrite in place.")
     _makedirs(items_dir_str)
 
     init_ts = time.time_ns()
@@ -1226,36 +1288,53 @@ def convert_and_save_streaming(
     )
     z_step[()] = step
 
+    # Seed tree_meta with entries for layers already present on GCS.
     tree_meta: dict = {}
+    if resume_layer > 0:
+        tree_meta.update(_scan_existing_zarr_meta(items_dir_str))
+        max_logging.log(f"Reconstructed {len(tree_meta)} existing zarr entries from GCS.")
+        print(f"[convert] Reconstructed {len(tree_meta)} existing zarr entries from GCS.", flush=True)
+
     arrays_written = [0]  # mutable counter accessible inside callback
 
     def _on_layer_complete(layer_idx: int, layer_flat: dict) -> None:
-        """Callback: write layer_idx's arrays to zarr immediately."""
+        """Callback: write layer_idx's arrays to zarr in parallel, then free RAM."""
         _t_save = time.time()
         total_arrays = len(layer_flat)
-        for arr_idx, (key, arr) in enumerate(sorted(layer_flat.items())):
-            print(
-                f"[convert] saving layer {layer_idx} array {arr_idx+1}/{total_arrays}: {key}  shape={arr.shape}",
-                flush=True,
-            )
-            tree_meta.update(_write_one_zarr_array(items_dir_str, key, arr, compressor))
-            arrays_written[0] += 1
+        print(
+            f"[convert] saving layer {layer_idx} ({total_arrays} arrays, parallel)...",
+            flush=True,
+        )
+        # Write all arrays concurrently — each targets a distinct GCS object,
+        # so there is no contention.  numcodecs Zstd + GCS upload run in parallel
+        # across workers, cutting save time roughly by the number of large arrays.
+        layer_meta: dict = {}
+        n_workers = min(total_arrays, 8)
+        with ThreadPoolExecutor(max_workers=n_workers) as pool:
+            futs = {
+                pool.submit(_write_one_zarr_array, items_dir_str, key, arr, compressor): key
+                for key, arr in layer_flat.items()
+            }
+            for fut in as_completed(futs):
+                layer_meta.update(fut.result())
+                arrays_written[0] += 1
+        tree_meta.update(layer_meta)
         save_elapsed = time.time() - _t_save
         max_logging.log(
             f"  Streaming-saved layer {layer_idx} "
-            f"({len(layer_flat)} arrays, total so far: {arrays_written[0]}, "
+            f"({total_arrays} arrays, total so far: {arrays_written[0]}, "
             f"save_time={save_elapsed:.1f}s)"
         )
         print(
             f"[convert] Streaming-saved layer {layer_idx} "
-            f"({len(layer_flat)} arrays, total so far: {arrays_written[0]}, "
-            f"save_time={save_elapsed:.1f}s)",
+            f"({total_arrays} arrays, {save_elapsed:.1f}s)",
             flush=True,
         )
 
     # Run conversion; the callback writes + frees each decoder layer in turn.
     # Global weights (embeddings, norm, logits) are returned in `flat` after
-    # all layers are done.
+    # all layers are done.  Global weights are always re-generated (fast, ~30s)
+    # since they are written last and may be incomplete on a partial resume.
     shard_index_cache = _path_join(root_str, "shard_index.json")
     flat = convert_hf_to_maxtext(
         base_model_path,
@@ -1264,6 +1343,7 @@ def convert_and_save_streaming(
         on_layer_complete=_on_layer_complete,
         keep_fp8=keep_fp8,
         shard_index_cache=shard_index_cache,
+        layer_range=(resume_layer, num_layers) if resume_layer > 0 else None,
     )
 
     # Write remaining global weights (returned in flat after layer loop).

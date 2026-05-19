@@ -1,19 +1,19 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: mimo-v25-pro-convert-v8
+  name: mimo-v25-pro-convert-v9
 spec:
   backoffLimit: 0
   template:
     metadata:
       labels:
-        app: mimo-v25-pro-convert-v8
+        app: mimo-v25-pro-convert-v9
     spec:
       restartPolicy: Never
       nodeSelector:
         cloud.google.com/gke-nodepool: jingnw-cpu-highmem
       containers:
-      - name: mimo-v25-pro-convert
+      - name: mimo-v25-pro-convert-v9
         image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.8.1-rev1
         command:
         - bash
