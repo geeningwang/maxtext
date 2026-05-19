@@ -101,6 +101,58 @@ def _is_gcs(path: str) -> bool:
     return str(path).startswith("gs://")
 
 
+def _path_join(base: str, *parts: str) -> str:
+    """Join path components; safe for both local paths and GCS (gs://) URIs."""
+    result = str(base).rstrip("/")
+    for part in parts:
+        result = f"{result}/{str(part).lstrip('/')}"
+    return result
+
+
+def _makedirs(path: str) -> None:
+    """Create directory; no-op for GCS (objects create implicit hierarchy), mkdir for local."""
+    if not _is_gcs(path):
+        pathlib.Path(path).mkdir(parents=True, exist_ok=True)
+
+
+def _path_exists(path: str) -> bool:
+    """Return True if a file or GCS object/prefix exists."""
+    if _is_gcs(path):
+        import gcsfs  # pylint: disable=import-outside-toplevel
+        return gcsfs.GCSFileSystem().exists(path)
+    return pathlib.Path(path).exists()
+
+
+def _rmtree(path: str) -> None:
+    """Delete a directory tree (local) or GCS prefix recursively."""
+    if _is_gcs(path):
+        import gcsfs  # pylint: disable=import-outside-toplevel
+        gfs = gcsfs.GCSFileSystem()
+        if gfs.exists(path):
+            gfs.rm(path, recursive=True)
+    else:
+        shutil.rmtree(path)
+
+
+def _read_text(path: str) -> str:
+    """Read a UTF-8 text file; GCS-aware."""
+    if _is_gcs(path):
+        import gcsfs  # pylint: disable=import-outside-toplevel
+        with gcsfs.GCSFileSystem().open(path, "r") as _f:
+            return _f.read()
+    return pathlib.Path(path).read_text()
+
+
+def _write_text(path: str, content: str) -> None:
+    """Write a UTF-8 text file; GCS-aware."""
+    if _is_gcs(path):
+        import gcsfs  # pylint: disable=import-outside-toplevel
+        with gcsfs.GCSFileSystem().open(path, "w") as _f:
+            _f.write(content)
+    else:
+        pathlib.Path(path).write_text(content)
+
+
 def _gcs_ls_safetensors(gcs_dir: str) -> list[str]:
     """List all *.safetensors GCS URIs under gcs_dir using gsutil."""
     result = subprocess.run(
@@ -419,6 +471,7 @@ def convert_hf_to_maxtext(
     layer_range: "tuple[int, int] | None" = None,
     skip_global_weights: bool = False,
     keep_fp8: bool = False,
+    shard_index_cache: str | None = None,
 ) -> dict:
     """Load and convert HF safetensors weights to a nested MaxText dict.
 
@@ -487,9 +540,22 @@ def convert_hf_to_maxtext(
     max_logging.log(f"Found {len(shard_paths)} safetensors shards")
     print(f"[convert] Found {len(shard_paths)} safetensors shards", flush=True)
 
-    key_to_shard = _build_shard_index(shard_paths)
-    max_logging.log(f"Indexed {len(key_to_shard)} weight keys across {len(shard_paths)} shards")
-    print(f"[convert] Indexed {len(key_to_shard)} weight keys across {len(shard_paths)} shards", flush=True)
+    if shard_index_cache and _path_exists(shard_index_cache):
+        import json as _json  # pylint: disable=import-outside-toplevel
+        max_logging.log(f"Loading shard index from cache: {shard_index_cache}")
+        print(f"[convert] Loading shard index from cache: {shard_index_cache}", flush=True)
+        key_to_shard = _json.loads(_read_text(shard_index_cache))
+        max_logging.log(f"Loaded {len(key_to_shard)} weight keys from shard index cache")
+        print(f"[convert] Loaded {len(key_to_shard)} weight keys from shard index cache", flush=True)
+    else:
+        key_to_shard = _build_shard_index(shard_paths)
+        max_logging.log(f"Indexed {len(key_to_shard)} weight keys across {len(shard_paths)} shards")
+        print(f"[convert] Indexed {len(key_to_shard)} weight keys across {len(shard_paths)} shards", flush=True)
+        if shard_index_cache:
+            import json as _json  # pylint: disable=import-outside-toplevel
+            _write_text(shard_index_cache, _json.dumps({k: str(v) for k, v in key_to_shard.items()}))
+            max_logging.log(f"Shard index cached to: {shard_index_cache}")
+            print(f"[convert] Shard index cached to: {shard_index_cache}", flush=True)
     sys.stdout.flush(); sys.stderr.flush()
 
     # ------------------------------------------------------------------
@@ -902,7 +968,7 @@ def convert_hf_to_maxtext(
 # ---------------------------------------------------------------------------
 
 def _write_one_zarr_array(
-    items_dir: pathlib.Path,
+    items_dir: str,
     key: str,
     arr: np.ndarray,
     compressor,
@@ -911,13 +977,13 @@ def _write_one_zarr_array(
 
     Returns the tree_meta entry dict for this key.  Called by both
     ``_save_zarr_direct`` (batch mode) and ``convert_and_save_streaming``
-    (per-layer mode).
+    (per-layer mode).  items_dir may be a local path or a gs:// URI.
     """
     import zarr  # pylint: disable=import-outside-toplevel
     import json  # pylint: disable=import-outside-toplevel
 
     zarr_name = f"params.params.{key}"
-    zarr_path = items_dir / zarr_name
+    zarr_path = _path_join(items_dir, zarr_name)
 
     dtype_name = getattr(arr.dtype, "name", "")
     is_bf16 = dtype_name == "bfloat16"
@@ -934,8 +1000,9 @@ def _write_one_zarr_array(
         write_arr = arr
         write_dtype = arr.dtype
 
+    # zarr accepts gs:// strings natively via gcsfs/fsspec; pass as-is (no pathlib).
     z = zarr.open_array(
-        str(zarr_path), mode="w",
+        zarr_path, mode="w",
         shape=write_arr.shape,
         dtype=write_dtype,
         chunks=write_arr.shape,  # single chunk = single GCS object; avoids 2000+ tiny HTTP requests
@@ -945,20 +1012,20 @@ def _write_one_zarr_array(
     z[:] = write_arr
     del z
 
-    zarray_path = zarr_path / ".zarray"
-    _meta = json.loads(zarray_path.read_text())
+    zarray_path = _path_join(zarr_path, ".zarray")
+    _meta = json.loads(_read_text(zarray_path))
     if isinstance(_meta.get("compressor"), dict):
         _meta["compressor"].pop("checksum", None)
-        zarray_path.write_text(json.dumps(_meta))
+        _write_text(zarray_path, json.dumps(_meta))
 
     if is_bf16:
-        meta = json.loads(zarray_path.read_text())
+        meta = json.loads(_read_text(zarray_path))
         meta["dtype"] = "bfloat16"
-        zarray_path.write_text(json.dumps(meta))
+        _write_text(zarray_path, json.dumps(meta))
     elif is_fp8:
-        meta = json.loads(zarray_path.read_text())
+        meta = json.loads(_read_text(zarray_path))
         meta["dtype"] = dtype_name  # e.g. "float8_e4m3fn"
-        zarray_path.write_text(json.dumps(meta))
+        _write_text(zarray_path, json.dumps(meta))
 
     key_parts = ["params", "params"] + key.split(".")
     return {
@@ -970,8 +1037,8 @@ def _write_one_zarr_array(
 
 
 def _write_checkpoint_metadata(
-    step_dir: pathlib.Path,
-    items_dir: pathlib.Path,
+    step_dir: str,
+    items_dir: str,
     tree_meta: dict,
     init_ts: int,
     total: int,
@@ -997,8 +1064,8 @@ def _write_checkpoint_metadata(
         "store_array_data_equal_to_fill_value": True,
         "custom_metadata": None,
     }
-    (items_dir / "_METADATA").write_text(json.dumps(metadata))
-    (step_dir / "_CHECKPOINT_METADATA").write_text(json.dumps({
+    _write_text(_path_join(items_dir, "_METADATA"), json.dumps(metadata))
+    _write_text(_path_join(step_dir, "_CHECKPOINT_METADATA"), json.dumps({
         "item_handlers": {
             "items": "orbax.checkpoint._src.handlers.pytree_checkpoint_handler.PyTreeCheckpointHandler"
         },
@@ -1009,7 +1076,7 @@ def _write_checkpoint_metadata(
         "custom_metadata": {},
     }))
     # GCS checkpoints require commit_success.txt to be considered finalized by Orbax.
-    (items_dir / "commit_success.txt").write_text("")
+    _write_text(_path_join(items_dir, "commit_success.txt"), "")
     max_logging.log(
         f"Checkpoint saved at {step_dir} "
         f"({total} arrays, peak RAM bounded to largest single array)"
@@ -1042,22 +1109,23 @@ def convert_and_save_streaming(
     import time  # pylint: disable=import-outside-toplevel
     import numcodecs  # pylint: disable=import-outside-toplevel
 
-    root = pathlib.Path(maxtext_model_path)
-    root.mkdir(parents=True, exist_ok=True)
-    step_dir = root / str(step)
-    items_dir = step_dir / "items"
+    # Use string paths throughout — pathlib.Path collapses gs:// → gs:/ (local path).
+    root_str = maxtext_model_path.rstrip("/")
+    step_dir_str = _path_join(root_str, str(step))
+    items_dir_str = _path_join(step_dir_str, "items")
+    _makedirs(root_str)
     try:
-        if step_dir.exists():
-            shutil.rmtree(step_dir)
+        if _path_exists(step_dir_str):
+            _rmtree(step_dir_str)
     except OSError as _e:
-        # gcsfuse does not support rmdir; zarr mode="w" will overwrite existing files.
-        max_logging.log(f"Note: could not remove {step_dir} ({_e}); zarr will overwrite in place.")
-    items_dir.mkdir(parents=True, exist_ok=True)
+        max_logging.log(f"Note: could not remove {step_dir_str} ({_e}); zarr will overwrite in place.")
+    _makedirs(items_dir_str)
 
     init_ts = time.time_ns()
     compressor = numcodecs.Zstd(level=1)
+    # zarr accepts gs:// strings natively via gcsfs/fsspec — no str(pathlib.Path()) needed.
     z_step = zarr.open_array(
-        str(items_dir / "step"), mode="w",
+        _path_join(items_dir_str, "step"), mode="w",
         shape=(), dtype="<i8",
         compressor=compressor,
         dimension_separator=".",
@@ -1076,7 +1144,7 @@ def convert_and_save_streaming(
                 f"[convert] saving layer {layer_idx} array {arr_idx+1}/{total_arrays}: {key}  shape={arr.shape}",
                 flush=True,
             )
-            tree_meta.update(_write_one_zarr_array(items_dir, key, arr, compressor))
+            tree_meta.update(_write_one_zarr_array(items_dir_str, key, arr, compressor))
             arrays_written[0] += 1
         save_elapsed = time.time() - _t_save
         max_logging.log(
@@ -1094,24 +1162,26 @@ def convert_and_save_streaming(
     # Run conversion; the callback writes + frees each decoder layer in turn.
     # Global weights (embeddings, norm, logits) are returned in `flat` after
     # all layers are done.
+    shard_index_cache = _path_join(root_str, "shard_index.json")
     flat = convert_hf_to_maxtext(
         base_model_path,
         params,
         tmpdir=None,           # no tmpdir — arrays stay in RAM only transiently
         on_layer_complete=_on_layer_complete,
         keep_fp8=keep_fp8,
+        shard_index_cache=shard_index_cache,
     )
 
     # Write remaining global weights (returned in flat after layer loop).
     total_global = len(flat)
     max_logging.log(f"Writing {total_global} global weight arrays to checkpoint...")
     for key, arr in sorted(flat.items()):
-        tree_meta.update(_write_one_zarr_array(items_dir, key, arr, compressor))
+        tree_meta.update(_write_one_zarr_array(items_dir_str, key, arr, compressor))
         arrays_written[0] += 1
     del flat
     gc.collect()
 
-    _write_checkpoint_metadata(step_dir, items_dir, tree_meta, init_ts, arrays_written[0])
+    _write_checkpoint_metadata(step_dir_str, items_dir_str, tree_meta, init_ts, arrays_written[0])
 
 
 def _save_zarr_direct(
@@ -1135,27 +1205,27 @@ def _save_zarr_direct(
     import time  # pylint: disable=import-outside-toplevel
     import numcodecs  # pylint: disable=import-outside-toplevel
 
-    root = pathlib.Path(maxtext_model_path)
-    root.mkdir(parents=True, exist_ok=True)
-
-    step_dir = root / str(step)
-    items_dir = step_dir / "items"
+    # Use string paths throughout — pathlib.Path collapses gs:// → gs:/ (local path).
+    root_str = maxtext_model_path.rstrip("/")
+    step_dir_str = _path_join(root_str, str(step))
+    items_dir_str = _path_join(step_dir_str, "items")
+    _makedirs(root_str)
     try:
-        if step_dir.exists():
-            shutil.rmtree(step_dir)
+        if _path_exists(step_dir_str):
+            _rmtree(step_dir_str)
     except OSError as _e:
-        max_logging.log(f"Note: could not remove {step_dir} ({_e}); zarr will overwrite in place.")
-    items_dir.mkdir(parents=True, exist_ok=True)
+        max_logging.log(f"Note: could not remove {step_dir_str} ({_e}); zarr will overwrite in place.")
+    _makedirs(items_dir_str)
 
     init_ts = time.time_ns()
     # numcodecs.Zstd includes a "checksum" field that TensorStore rejects.
     # Build the compressor spec manually to match what TensorStore expects.
     compressor = numcodecs.Zstd(level=1)
-    _TS_COMPRESSOR = {"id": "zstd", "level": 1}  # no "checksum" field
 
     # Step scalar (same format as Orbax produces)
+    # zarr accepts gs:// strings natively via gcsfs/fsspec — no str(pathlib.Path()) needed.
     z_step = zarr.open_array(
-        str(items_dir / "step"), mode="w",
+        _path_join(items_dir_str, "step"), mode="w",
         shape=(), dtype="<i8",
         compressor=compressor,
         dimension_separator=".",
@@ -1166,11 +1236,11 @@ def _save_zarr_direct(
     total = len(flat_dict)
     tree_meta: dict = {}
     for i, (key, arr) in enumerate(flat_dict.items()):
-        tree_meta.update(_write_one_zarr_array(items_dir, key, arr, compressor))
+        tree_meta.update(_write_one_zarr_array(items_dir_str, key, arr, compressor))
         if (i + 1) % 50 == 0 or i + 1 == total:
             max_logging.log(f"  [{i + 1}/{total}] wrote {key}")
 
-    _write_checkpoint_metadata(step_dir, items_dir, tree_meta, init_ts, total)
+    _write_checkpoint_metadata(step_dir_str, items_dir_str, tree_meta, init_ts, total)
 
 
 # ---------------------------------------------------------------------------

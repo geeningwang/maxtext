@@ -1,13 +1,13 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: mimo-v25-pro-convert-v5
+  name: mimo-v25-pro-convert-v6
 spec:
   backoffLimit: 0
   template:
     metadata:
       labels:
-        app: mimo-v25-pro-convert-v5
+        app: mimo-v25-pro-convert-v6
     spec:
       restartPolicy: Never
       nodeSelector:
