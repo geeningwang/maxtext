@@ -2,7 +2,8 @@
 
 Model card: https://huggingface.co/XiaomiMiMo/MiMo-V2.5-Pro  
 Branch: `MiMo-V2.5-Pro`  
-Date: 2026-05-13
+Date: 2026-05-13  
+Last updated: 2026-05-19
 
 ---
 
@@ -41,15 +42,15 @@ Source: `config.json` and `model.safetensors.index.json` from HuggingFace (fetch
 
 | Field | Value | Implication |
 |---|---|---|
-| `attention_projection_layout` | `"fused_qkv"` | QKV weights stored as a single fused tensor per layer; checkpoint converter must split into q/k/v |
+| `attention_projection_layout` | `"fused_qkv"` | QKV weights stored as a single fused tensor per layer; checkpoint converter splits into q/k/v before OCDBT write |
 | `add_full_attention_sink_bias` | `false` | explicit (was implicit in V2-Flash config) |
 | `swa_v_head_dim` | 128 | now explicit in config (V2-Flash derived it implicitly) |
 | `swa_head_dim` | 192 | now explicit |
 | `swa_num_attention_heads` | 128 | now explicit |
 
-The most impactful change is **`attention_projection_layout: "fused_qkv"`**. In MiMo-V2-Flash the HF checkpoint stored separate `q_proj`, `k_proj`, `v_proj` weight tensors. In V2.5-Pro they are stored as a single fused `qkv_proj` tensor of shape `[hidden_size, (num_heads * head_dim_q) + (num_kv_heads * head_dim_k) + (num_kv_heads * v_head_dim)]`. The checkpoint converter needs a new split path before mapping to MaxText's separate Q/K/V parameter arrays.
+The most impactful change is **`attention_projection_layout: "fused_qkv"`**. In MiMo-V2-Flash the HF checkpoint stored separate `q_proj`, `k_proj`, `v_proj` weight tensors. In V2.5-Pro they are stored as a single fused `qkv_proj` tensor of shape `[hidden_size, (num_heads * head_dim_q) + (num_kv_heads * head_dim_k) + (num_kv_heads * v_head_dim)]`. The checkpoint converter splits at offsets `[0, nq·dq]`, `[nq·dq, nq·dq+nkv·dk]`, `[nq·dq+nkv·dk, ...]` before mapping to MaxText's separate Q/K/V arrays.
 
-**GA KV heads changed from 4 → 8**: MiMo-V2-Flash had asymmetric KV heads (4 for GA, 8 for SWA). V2.5-Pro uses 8 for both, simplifying the attention config.
+**GA KV heads changed from 4 → 8**: MiMo-V2-Flash had asymmetric KV heads (4 for GA, 8 for SWA). V2.5-Pro uses 8 for both, simplifying the attention config. No model code change was needed — the existing branching logic returns 8 for both paths given the V2.5-Pro config values.
 
 ---
 
@@ -77,7 +78,7 @@ MoE layer freq: layer 0 dense, layers 1–69 all sparse MoE (69 MoE layers).
 
 ---
 
-## HF weights → GCS
+## HF weights → GCS ✅
 
 **Total HF size:** 962.4 GiB (FP8, TP=8 pre-sharded, 34 safetensors files + 1 index)
 
@@ -88,40 +89,31 @@ Shard layout:
 
 Total weight tensors: 159,581.
 
-### Upload command
+---
 
-The existing streaming script requires no local disk:
+## MaxText checkpoint ✅
 
-```bash
-# Create bucket (one-time)
-gsutil mb -l us-central1 -p tpu-launchpad-playground gs://jingnw-mimo-v2-5-pro-us-central1
-
-# Stream HF → GCS (~962 GiB, resumable)
-python3 tools/dev/upload_mimo_hf_to_gcs.py \
-    --bucket jingnw-mimo-v2-5-pro-us-central1 \
-    --gcs_prefix hf-weights \
-    --repo_id XiaomiMiMo/MiMo-V2.5-Pro \
-    --skip_existing
-```
-
-Target path after upload: `gs://jingnw-mimo-v2-5-pro-us-central1/hf-weights/`
+**Location:** `gs://jingnw-mimo-v2-5-pro-us-central1/mimo-v2-5-pro-fp8-ocdbt/`  
+**Format:** Orbax zarr2, 1,038 arrays  
+**Precision:** FP8 E4M3FN expert weights + float32 per-block scale_inv; BF16 attention/embed weights  
+**Converted:** 2026-05-19, ~70 min using 4-node parallel job on `jingnw-cpu-highmem`
 
 ---
 
 ## What's reusable from MiMo-V2-Flash
 
 - `MiMoV2FlashSparseMoeBlock` — same MoE routing (sigmoid, noaux_tc, top-8, same intermediate size)
-- Phase A/B FP8 infrastructure — same block-wise FP8 E4M3 format, same `block_dequant_fp8` / `fp8_moe_matmul` kernel
+- Phase A/B FP8 infrastructure — same block-wise FP8 E4M3 format, same `_block_dequant_fp8` / `fp8_moe_matmul` kernel
 - Hybrid GA+SWA attention — same pattern structure, same SWA window=128, same partial RoPE factor=0.334
 - Tokenizer — identical (Qwen2 BPE, vocab 152,576)
 - `upload_mimo_hf_to_gcs.py` — works as-is, just different `--repo_id`
 
-## What needs new work
+## What was done for V2.5-Pro bringup (phases 1–4)
 
-1. **MaxText config** `mimo-v2-5-pro.yml` — updated dims (hidden=6144, 70 layers, 384 experts, 128 heads, GA KV heads=8), new hybrid layer pattern
-2. **Checkpoint converter** — handle `fused_qkv` weight layout: split `[H, Hq+Hk+Hv]` → separate q/k/v tensors before writing to MaxText OCDBT
-3. **Attention config** — GA KV heads unified to 8 (remove the asymmetric 4/8 special-casing in `mimo_v2_flash.py`)
-4. **Capacity planning** — 42B active params at BF16 ≈ 84 GB/device activation footprint; need to profile target TPU topology
+1. **MaxText config** `mimo-v2-5-pro.yml` ✅ — updated dims (hidden=6144, 70 layers, 384 experts, 128 heads, GA KV heads=8), new hybrid layer pattern, `mimo_fp8_weight_mode=block_wise_fp8`
+2. **Checkpoint converter** ✅ — handles `fused_qkv` weight layout: splits `[H, Hq+Hk+Hv]` → separate q/k/v tensors before writing to MaxText OCDBT; FP8 weights + scale_inv preserved
+3. **Model code** ✅ — no changes required; `mimo_v2_flash.py` was already fully generic over config parameters
+4. **Inference precision** ✅ — FP8 + dequant-before-matmul (`block_wise_fp8`): weights kept as FP8 in HBM, dequantized per-block to BF16 before each matmul
 
 ---
 

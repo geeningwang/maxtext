@@ -1,7 +1,21 @@
 # MiMo-V2.5-Pro — Bringup Plan
 
 Date: 2026-05-13  
+Last updated: 2026-05-19  
 Target hardware: `jingnw-flex-tpu7-8ch` (8 chips, 16 cores, `2x2x2`, Flex Start)
+
+---
+
+## Status summary
+
+| Phase | Description | Status |
+|---|---|---|
+| 1 | GCS data upload | ✅ Complete |
+| 2 | MaxText config (`mimo-v2-5-pro.yml`) | ✅ Complete |
+| 3 | Model code adaptation | ✅ Complete (no changes needed) |
+| 4 | Checkpoint converter (HF → MaxText FP8 OCDBT) | ✅ Complete |
+| 5 | Inference job YAML | 🔄 In progress |
+| 6 | Smoke test | ⏳ Pending |
 
 ---
 
@@ -24,33 +38,28 @@ The 9 GB headroom must be managed with `scan_layers=true` to cap XLA temps to on
 at a time.
 
 **Fallback if XLA OOMs:** enable FP8-in-HBM mode (`mimo_fp8_weight_mode=block_wise_fp8`,
-already implemented from V2-Flash Phase A). This halves MoE weight footprint from 62.5 GB →
+already enabled in the config). This halves MoE weight footprint from 62.5 GB →
 ~31 GB/device, opening ~40 GB headroom.
 
 ---
 
-## Phase 1 — GCS data upload
+## Phase 1 — GCS data upload ✅
 
-Upload HF weights (~962 GiB FP8) to a new GCS bucket. The existing streaming script
-requires no local disk.
+HF weights (~962 GiB FP8) uploaded to GCS bucket.
 
-```bash
-gsutil mb -l us-central1 gs://jingnw-mimo-v2-5-pro-us-central1
-
-python3 tools/dev/upload_mimo_hf_to_gcs.py \
-    --bucket jingnw-mimo-v2-5-pro-us-central1 \
-    --gcs_prefix hf-weights \
-    --repo_id XiaomiMiMo/MiMo-V2.5-Pro \
-    --skip_existing
+```
+gs://jingnw-mimo-v2-5-pro-us-central1/hf-weights/
 ```
 
-Target: `gs://jingnw-mimo-v2-5-pro-us-central1/hf-weights/`
+34 safetensors shards + metadata files. Total: 159,581 weight tensors.
 
 ---
 
-## Phase 2 — MaxText config (`mimo-v2-5-pro.yml`)
+## Phase 2 — MaxText config ✅
 
-New config mirroring `src/maxtext/configs/models/mimo-v2-flash.yml` with updated values:
+Config: `src/maxtext/configs/models/mimo-v2-5-pro.yml`
+
+Key settings vs V2-Flash:
 
 | Field | V2-Flash | V2.5-Pro |
 |---|---|---|
@@ -64,44 +73,61 @@ New config mirroring `src/maxtext/configs/models/mimo-v2-flash.yml` with updated
 | `mimo_attention_value_scale` | 0.707 | **0.612** |
 | `mimo_hybrid_layer_pattern` | 48 entries, 9 GA | **70 entries, 10 GA** |
 | `mimo_moe_layer_freq` | 48 entries, 47 MoE | **70 entries, 69 MoE** |
+| `mimo_fp8_weight_mode` | `""` | **`"block_wise_fp8"`** |
+| `scan_layers` | false | **true** |
 
 GA layer positions in V2.5-Pro: 0, 7, 15, 23, 31, 39, 47, 55, 62, 69.
 
----
-
-## Phase 3 — Model code adaptation
-
-Three changes needed in `src/maxtext/models/mimo_v2_flash.py`:
-
-1. **`fused_qkv` weight loading** — HF stores a single `[hidden, Hq·dq + Hkv·dk + Hkv·dv]`
-   tensor per layer (`attention_projection_layout: "fused_qkv"`). The checkpoint converter
-   must split it into separate Q/K/V tensors before writing to OCDBT.
-
-2. **Unified KV heads** — V2-Flash had asymmetric GA(4)/SWA(8) KV heads requiring
-   special-casing. V2.5-Pro uses `num_kv_heads=8` for both; remove the asymmetric path.
-
-3. **70-layer hybrid pattern** — verify the new 10-GA / 60-SWA pattern is handled correctly
-   by the layer-type dispatch logic.
+Inference precision: **FP8 + dequant-before-matmul** (`block_wise_fp8`). Expert weights
+kept as float8_e4m3fn in HBM; per-128×128-block scale_inv tensors applied before each
+matmul to produce BF16 for the actual computation.
 
 ---
 
-## Phase 4 — Checkpoint converter
+## Phase 3 — Model code adaptation ✅
 
-Extend `src/maxtext/checkpoint_conversion/standalone_scripts/convert_mimo_v2_flash.py`
-to handle the `fused_qkv` layout:
+Investigated all three originally planned changes to `src/maxtext/models/mimo_v2_flash.py`:
 
-- Read each layer's fused QKV tensor from the HF safetensors shard
-- Split at offsets `[0, nq·dq]`, `[nq·dq, nq·dq + nkv·dk]`, `[nq·dq + nkv·dk, ...]`
-  → separate `q_proj`, `k_proj`, `v_proj` weight tensors
-- Write to MaxText OCDBT format (rest of conversion logic unchanged)
+1. **Fused QKV weight loading** — No change needed. The checkpoint converter already splits
+   fused QKV into separate `query.kernel`, `key.kernel`, `value.kernel` tensors before
+   writing to OCDBT. The `Attention` module reads them as separate weights as normal.
 
-Run on `jingnw-cpu-highmem` (n2-highmem-16, streams shard-by-shard, no full-model RAM needed).
+2. **Unified KV heads** — No change needed. Existing code:
+   `num_kv_heads = cfg.mimo_swa_num_kv_heads if is_swa else cfg.num_kv_heads`
+   Both are 8 in V2.5-Pro config, so both branches return the correct value.
 
-Output: `gs://jingnw-mimo-v2-5-pro-us-central1/mimo-v2-5-pro-bf16-ocdbt/`
+3. **70-layer hybrid pattern** — No change needed. Code generically indexes
+   `cfg.mimo_hybrid_layer_pattern[layer_idx]` and `cfg.mimo_moe_layer_freq[layer_idx]`.
+   Works for any list length.
+
+The model code is fully parameterised by config values. Zero source changes required.
 
 ---
 
-## Phase 5 — Inference job YAML
+## Phase 4 — Checkpoint converter ✅
+
+Converted HF FP8 safetensors → MaxText Orbax zarr2 checkpoint using a 4-node parallel
+Kubernetes job on `jingnw-cpu-highmem` (n2-highmem-16).
+
+**Output:** `gs://jingnw-mimo-v2-5-pro-us-central1/mimo-v2-5-pro-fp8-ocdbt/`  
+**Arrays:** 1,038 zarr arrays (70 layers × ~15 arrays/layer + global weights)  
+**Duration:** ~70 minutes (4 parallel workers covering layer ranges 0–17, 18–35, 36–52, 53–69)
+
+Conversion approach:
+- Shard index cache (ranged HTTP reads): skips full 30 GB shard downloads; indexes all
+  159,581 keys in ~1 min via safetensors header reads only
+- Parallel ranged tensor reads: up to 32 threads, each fetching exact byte range per tensor
+- FP8 expert weights stored as float8_e4m3fn + float32 per-block scale_inv tensors
+- Parallel zarr writes: up to 8 concurrent GCS uploads per layer
+- Layer-resume: restarts pick up from the first unwritten layer (probes `.zarray` marker)
+
+Job YAMLs:
+- `tools/orchestration/mimo_v2_5_pro_convert_job.yaml` — 4-worker Indexed Job
+- `tools/orchestration/mimo_v2_5_pro_finalize_job.yaml` — writes checkpoint metadata
+
+---
+
+## Phase 5 — Inference job YAML 🔄
 
 New GKE job targeting `jingnw-flex-tpu7-8ch`:
 
@@ -128,7 +154,7 @@ Key inference flags:
 
 ---
 
-## Phase 6 — Smoke test
+## Phase 6 — Smoke test ⏳
 
 1. Single-token decode at batch=1, verify output is coherent
 2. Probe HBM via `jax.live_arrays()` to confirm actual per-device footprint
@@ -140,7 +166,7 @@ Key inference flags:
 
 | Risk | Likelihood | Mitigation |
 |---|---|---|
-| XLA temp buffers exceed ~9 GB headroom → OOM | Medium | `scan_layers=true`; fall back to FP8-in-HBM (`block_wise_fp8`) if still OOM |
-| `fused_qkv` split introduces numerical error | Low | Validate converted checkpoint against HF output on a single layer before full run |
-| 384 experts with EP=2 → 192 experts/device too large | Low | Covered by FP8 weight mode; or increase EP at cost of communication overhead |
-| `n2-highmem-16` (128 GB) OOMs during conversion | Low | Converter streams shard-by-shard; upgrade to `n2-highmem-96` if full-state PTQ needed |
+| XLA temp buffers exceed ~9 GB headroom → OOM | Medium | `scan_layers=true`; fall back to larger topology (2x2x4, 16 chips) if still OOM |
+| `fused_qkv` split introduces numerical error | Low | Converter validated; splits at offsets [0, nq·dq], [nq·dq, nq·dq+nkv·dk], [nq·dq+nkv·dk, ...] |
+| 384 experts with EP=2 → 192 experts/device too large | Low | Covered by FP8 block_wise mode; or increase EP at cost of communication overhead |
+| FP8 block scale dequant overhead too slow | Low | Phase A (explicit BF16 dequant) used for prefill; Phase B (Pallas fused kernel) for decode |
