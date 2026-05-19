@@ -273,6 +273,9 @@ def _copy_global_params(
         name = entry.split("/")[-1]
         if name.startswith("params.params.decoder.layers."):
             continue
+        # Skip checkpoint metadata files — the finalizer writes these fresh.
+        if name in ("_METADATA", "commit_success.txt"):
+            continue
         # Copy every object inside this zarr dir (or scalar dir).
         objects = fs.ls(entry, detail=False)
         for obj in objects:
