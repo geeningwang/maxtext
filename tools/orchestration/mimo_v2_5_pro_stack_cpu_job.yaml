@@ -1,0 +1,73 @@
+# CPU-based parallel checkpoint stacker — 4 workers in parallel.
+# Converts the flat per-layer zarr2 checkpoint written by the Phase 4 converter
+# into the 8-phase stacked layout needed by scan_layers=True.
+#
+# Worker assignment (by JOB_COMPLETION_INDEX):
+#   0: global params (embed, norm, lm_head, step) + Phase A (layer 0) + Phase B (layers 1-6)
+#   1: Phase C positions 0-3  (24 layers total, processed sequentially 6 at a time)
+#   2: Phase C positions 4-7  (24 layers total)
+#   3: Phase D (layer 55) + Phase E (56-61) + Phase F (62) + Phase G (63-68) + Phase H (69)
+#
+# Source:  gs://jingnw-mimo-v2-5-pro-us-central1/mimo-v2-5-pro-fp8-ocdbt/0/items
+# Dest:    gs://jingnw-mimo-v2-5-pro-us-central1/mimo-v2-5-pro-fp8-ocdbt-stacked-cpu/0/items
+#
+# After this Job completes, apply mimo_v2_5_pro_stack_cpu_finalize_job.yaml to
+# write the final checkpoint metadata (_METADATA, _CHECKPOINT_METADATA).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: mimo-v25-pro-stack-cpu-workers
+spec:
+  completionMode: Indexed
+  completions: 4
+  parallelism: 4
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: mimo-v25-pro-stack-cpu-workers
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        cloud.google.com/gke-nodepool: jingnw-cpu-highmem
+      containers:
+      - name: mimo-v25-pro-stack-cpu-worker
+        image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.8.1-rev1
+        command:
+        - bash
+        - -lc
+        - |
+          set -euo pipefail
+          export PATH="/opt/venv/bin:${PATH}"
+          export PYTHONUNBUFFERED=1
+
+          WORKDIR=/workspace
+          rm -rf "${WORKDIR}"
+          git clone https://github.com/geeningwang/maxtext.git "${WORKDIR}"
+          cd "${WORKDIR}"
+          git checkout MiMo-V2.5-Pro
+          echo "[stack-cpu] Branch: $(git log --oneline -1)"
+
+          /opt/venv/bin/python -m pip install -e ".[tpu]" -q
+          /opt/venv/bin/python -m pip install "zarr<3" numcodecs gcsfs -q
+
+          echo "[stack-cpu] Worker ${JOB_COMPLETION_INDEX}/3 starting..."
+          echo "[stack-cpu] Source: gs://jingnw-mimo-v2-5-pro-us-central1/mimo-v2-5-pro-fp8-ocdbt/0/items"
+          echo "[stack-cpu] Dest:   gs://jingnw-mimo-v2-5-pro-us-central1/mimo-v2-5-pro-fp8-ocdbt-stacked-cpu/0/items"
+
+          /opt/venv/bin/python \
+            -m maxtext.tools.mimo_v2_5_pro_stack_cpu \
+            --worker_index "${JOB_COMPLETION_INDEX}"
+
+          echo "[stack-cpu] Worker ${JOB_COMPLETION_INDEX} done."
+
+        resources:
+          requests:
+            cpu: "14"
+            memory: 110Gi
+          limits:
+            cpu: "14"
+            memory: 110Gi
+        env:
+        - name: PYTHONUNBUFFERED
+          value: "1"

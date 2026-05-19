@@ -1,0 +1,58 @@
+# Finalizer Job — run after mimo_v2_5_pro_stack_cpu_job.yaml (all 4 workers) completes.
+# Scans GCS for all zarr arrays written by the stacking workers, reconstructs
+# tree_metadata, and writes _METADATA + _CHECKPOINT_METADATA to finalize the
+# stacked checkpoint.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: mimo-v25-pro-stack-cpu-finalize
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: mimo-v25-pro-stack-cpu-finalize
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        cloud.google.com/gke-nodepool: jingnw-cpu-highmem
+      containers:
+      - name: mimo-v25-pro-stack-cpu-finalize
+        image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.8.1-rev1
+        command:
+        - bash
+        - -lc
+        - |
+          set -euo pipefail
+          export PATH="/opt/venv/bin:${PATH}"
+          export PYTHONUNBUFFERED=1
+
+          WORKDIR=/workspace
+          rm -rf "${WORKDIR}"
+          git clone https://github.com/geeningwang/maxtext.git "${WORKDIR}"
+          cd "${WORKDIR}"
+          git checkout MiMo-V2.5-Pro
+          echo "[stack-cpu-finalize] Branch: $(git log --oneline -1)"
+
+          /opt/venv/bin/python -m pip install -e ".[tpu]" -q
+          /opt/venv/bin/python -m pip install "zarr<3" numcodecs gcsfs -q
+
+          echo "[stack-cpu-finalize] Scanning GCS and writing checkpoint metadata..."
+          echo "[stack-cpu-finalize] Dest: gs://jingnw-mimo-v2-5-pro-us-central1/mimo-v2-5-pro-fp8-ocdbt-stacked-cpu"
+
+          /opt/venv/bin/python \
+            -m maxtext.tools.mimo_v2_5_pro_stack_cpu \
+            --finalize_only
+
+          echo "[stack-cpu-finalize] Done."
+
+        resources:
+          requests:
+            cpu: "2"
+            memory: 8Gi
+          limits:
+            cpu: "2"
+            memory: 8Gi
+        env:
+        - name: PYTHONUNBUFFERED
+          value: "1"
