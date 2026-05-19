@@ -122,7 +122,7 @@ spec:
             --ici_tensor_parallelism 8 \
             --ici_expert_parallelism 2 \
             --mimo_fp8_weight_mode block_wise_fp8 \
-            --max_prefill 128 \
+            --max_prefill 2048 \
             --jax_cache_dir gs://jingnw-mimo-v2-5-pro-us-central1/jax-compilation-cache \
             --max_new_tokens 32 \
             --verbose \
