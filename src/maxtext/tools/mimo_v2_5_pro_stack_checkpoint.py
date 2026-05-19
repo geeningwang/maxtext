@@ -59,6 +59,8 @@ After the tool completes, verify a couple of tensor shapes:
 
 import os
 import socket
+import threading
+import time
 from typing import Sequence
 
 import jax
@@ -130,6 +132,41 @@ def _probe_hbm(label: str) -> None:
             flush=True)
     except Exception as e:  # pylint: disable=broad-except
       print(f"[HBM] {label:<55s} N/A: {e}", flush=True)
+
+
+def _start_load_monitor(interval_s: int = 30):
+  """Background thread: log HBM fill every interval_s seconds during load_params.
+
+  Returns a threading.Event; call .set() to stop the monitor after load_params
+  returns.  HBM usage rising over time confirms that GCS→HBM streaming is
+  making progress.
+  """
+  stop = threading.Event()
+
+  def _loop():
+    elapsed = 0
+    while not stop.wait(interval_s):
+      elapsed += interval_s
+      total_used = sum(
+          d.memory_stats().get("bytes_in_use", 0)
+          for d in jax.local_devices()
+          if hasattr(d, "memory_stats")
+      ) / 2**30
+      total_limit = sum(
+          d.memory_stats().get("bytes_limit", 0)
+          for d in jax.local_devices()
+          if hasattr(d, "memory_stats")
+      ) / 2**30
+      max_logging.log(
+          f"[load_params progress t+{elapsed}s] "
+          f"host={socket.gethostname()} "
+          f"HBM used={total_used:.1f}GB / {total_limit:.1f}GB "
+          f"({100*total_used/max(total_limit,1):.1f}%)"
+      )
+
+  t = threading.Thread(target=_loop, daemon=True)
+  t.start()
+  return stop
 
 
 def _stack_donated(*pytrees):
@@ -267,12 +304,18 @@ def main(argv: Sequence[str]) -> None:
     )
 
   # 1. Load flat per-layer params (same path as a normal scan_layers=false run).
+  # A background monitor thread logs HBM fill every 30s so we can track GCS→HBM
+  # streaming progress during the otherwise-silent async Orbax restore phase.
   max_logging.log(
       f"Stack tool: loading flat params from {config.load_parameters_path} ...")
   engine = maxengine.MaxEngine(config)
   rng = jax.random.PRNGKey(0)
+  _monitor_stop = _start_load_monitor(interval_s=30)
+  t0 = time.time()
   params = engine.load_params(rng)
-  max_logging.log("Stack tool: flat params loaded successfully.")
+  _monitor_stop.set()
+  max_logging.log(
+      f"Stack tool: flat params loaded in {time.time()-t0:.1f}s.")
 
   # 2. Rearrange: stack Phase B, C, E, G; copy Phase A, D, F, H (singles).
   #
