@@ -6,7 +6,7 @@
 #
 # Parallelism: TP=8, EP=2  (8×2=16 devices)
 # HBM budget:  ~71 GB weights / 80 GB usable per device  → ~9 GB XLA headroom
-#              scan_layers=true caps XLA temp buffer to 1 layer at a time
+#              scan_layers=false: checkpoint is standard (non-stacked) layout
 #
 # Pre-requisites:
 #   1. Checkpoint converted to MaxText zarr2 format (Phase 4):
@@ -121,7 +121,6 @@ spec:
             --tokenizer_path XiaomiMiMo/MiMo-V2.5-Pro \
             --ici_tensor_parallelism 8 \
             --ici_expert_parallelism 2 \
-            --scan_layers \
             --mimo_fp8_weight_mode block_wise_fp8 \
             --max_prefill 128 \
             --max_new_tokens 32 \

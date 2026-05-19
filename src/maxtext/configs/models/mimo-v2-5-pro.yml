@@ -96,10 +96,10 @@ logits_via_embedding: false
 # Disable QK norm (MiMo does not use it)
 use_qk_norm: false
 
-# scan_layers=true is critical: caps XLA temp buffer to 1 layer at a time.
-# With ~71 GB/device weight footprint on 8ch (80 GB usable), this keeps
-# XLA temporaries within the ~9 GB headroom.
-scan_layers: true
+# scan_layers=false: checkpoint is in standard per-layer format (not stacked).
+# scan_layers=true requires a stacked checkpoint produced by a separate process;
+# the HF→MaxText converter writes standard layout, so scan must stay false.
+scan_layers: false
 
 # Tokenizer: HuggingFace Qwen2 tokenizer (same vocab as V2-Flash)
 tokenizer_path: "XiaomiMiMo/MiMo-V2.5-Pro"
