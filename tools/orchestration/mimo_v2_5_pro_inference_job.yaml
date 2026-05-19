@@ -111,22 +111,41 @@ spec:
           echo "[mimo-v25-pro] Starting inference smoke test..."
 
           # Phase 6 smoke test: single-token decode at batch=1.
-          # scan_layers=true is critical — caps XLA temp buffer to 1 layer at a time,
-          # keeping within the ~9 GB XLA headroom on this 8-chip pool.
-          # mimo_fp8_weight_mode=block_wise_fp8: expert weights kept as float8_e4m3fn
-          # in HBM, dequantized per 128×128 block to BF16 before each MoE matmul.
-          /opt/venv/bin/python demos/mimo_v2_flash_demo_jax.py \
-            --model_name mimo-v2-5-pro \
-            --checkpoint_path gs://jingnw-mimo-v2-5-pro-us-central1/mimo-v2-5-pro-fp8-ocdbt-stacked-cpu/0/items \
-            --tokenizer_path XiaomiMiMo/MiMo-V2.5-Pro \
-            --ici_tensor_parallelism 8 \
-            --ici_expert_parallelism 2 \
-            --mimo_fp8_weight_mode block_wise_fp8 \
-            --max_prefill 2048 \
-            --jax_cache_dir gs://jingnw-mimo-v2-5-pro-us-central1/jax-compilation-cache \
-            --max_new_tokens 32 \
-            --verbose \
-            --prompt "Hello, what is 1+1?"
+          # Call decode.py directly (not via demo wrapper) for full stderr visibility.
+          #
+          # Checkpoint format flags must match stacked checkpoint _METADATA:
+          #   use_ocdbt=false, use_zarr3=false  (zarr2, written by CPU stacker)
+          # scan_layers=true: stacked checkpoint layout (8-phase), XLA compiles 1 layer body.
+          # async_checkpointing=false: required with scan_layers=true (shape mismatch otherwise).
+          # mimo_fp8_weight_mode=block_wise_fp8: expert weights in float8_e4m3fn,
+          #   dequantized per 128×128 block to BF16 before each MoE matmul.
+          /opt/venv/bin/python -m maxtext.inference.decode \
+            src/maxtext/configs/base.yml \
+            model_name=mimo-v2-5-pro \
+            run_name=mimo_v2_5_pro_smoke_test \
+            "load_parameters_path=gs://jingnw-mimo-v2-5-pro-us-central1/mimo-v2-5-pro-fp8-ocdbt-stacked-cpu/0/items" \
+            tokenizer_path=XiaomiMiMo/MiMo-V2.5-Pro \
+            tokenizer_type=huggingface \
+            "prompt=Hello, what is 1+1?" \
+            max_prefill_predict_length=2048 \
+            max_target_length=2080 \
+            per_device_batch_size=1 \
+            dtype=bfloat16 \
+            weight_dtype=bfloat16 \
+            ici_tensor_parallelism=8 \
+            ici_expert_parallelism=2 \
+            scan_layers=true \
+            async_checkpointing=false \
+            attention=dot_product \
+            expert_shard_attention_option=context \
+            checkpoint_storage_use_ocdbt=false \
+            checkpoint_storage_use_zarr3=false \
+            mimo_fp8_weight_mode=block_wise_fp8 \
+            "jax_cache_dir=gs://jingnw-mimo-v2-5-pro-us-central1/jax-compilation-cache" \
+            use_chat_template=true \
+            decode_sampling_strategy=nucleus \
+            decode_sampling_nucleus_p=0.95 \
+            decode_sampling_temperature=0.6
 
         resources:
           requests:
