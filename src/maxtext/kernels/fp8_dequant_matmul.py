@@ -61,7 +61,7 @@ from jax.experimental.pallas import tpu as pltpu
 # ---------------------------------------------------------------------------
 
 def _fp8_moe_kernel_body(
-    tokens_ref,       # (T, tile_k)  bf16 — current K-chunk of tokens
+    tokens_ref,       # (T, tile_k) or (1, T, tile_k)  bf16 — current K-chunk of tokens
     weight_fp8_ref,   # (1, tile_k, tile_n)  float8_e4m3fn — weight tile
     scale_ref,        # (1, 1, 1)  float32 — per-block scale_inv scalar
     out_ref,          # (1, T, tile_n)  bf16 — output tile (written on last k)
@@ -69,6 +69,7 @@ def _fp8_moe_kernel_body(
     *,
     n_tiles: int,     # total number of N-output tiles (for K_tiles calc)
     k_tiles: int,     # total number of K-contraction tiles
+    tokens_batched: bool,  # True → tokens_ref is (1, T, tile_k); False → (T, tile_k)
 ):
     """Pallas kernel body for one (e, n_tile, k_tile) grid instance."""
     del n_tiles  # unused inside kernel body; passed for grid bookkeeping only
@@ -84,14 +85,19 @@ def _fp8_moe_kernel_body(
     scale = scale_ref[0, 0, 0]                              # () float32
     w_bf16 = (w_fp8.astype(jnp.float32) * scale).astype(jnp.bfloat16)
 
+    # For tokens_batched, the block spec is (1, T, tile_k) — strip the expert
+    # dim-0 (always size 1 in the block) so the dot sees (T, tile_k).
+    tokens_2d = tokens_ref[0, ...] if tokens_batched else tokens_ref[...]
+
     # Accumulate: (T, tile_k) @ (tile_k, tile_n) → (T, tile_n) float32.
     acc_ref[...] += jnp.dot(
-        tokens_ref[...],                                     # (T, tile_k) bf16
+        tokens_2d,                                           # (T, tile_k) bf16
         w_bf16,                                              # (tile_k, tile_n) bf16
         preferred_element_type=jnp.float32,
     )
 
     # Write output only on the final K tile (contraction complete).
+    # out_block uses explicit T (not None) so out_ref is always (1, T, tile_n).
     @pl.when(k_i == k_tiles - 1)
     def _store():
         out_ref[0, :, :] = acc_ref[...].astype(jnp.bfloat16)
@@ -163,20 +169,25 @@ def fp8_moe_matmul(
         return (e, 0, n_t)          # out[e, :, n_t*tile_n:(n_t+1)*tile_n]
 
     # Build block specs.
+    # Use explicit T (not None) so the block ref is always a concrete shape —
+    # Pallas collapses None-blocked dims of size 1 in jax 0.8, causing the
+    # out_ref to become 2D (1, tile_n) instead of 3D (1, T, tile_n) when T=1
+    # (decode step), breaking the `out_ref[0, :, :]` store in the kernel.
     if tokens_batched:
-        tok_block = pl.BlockSpec((1, None, tile_k), _tok_idx)
+        tok_block = pl.BlockSpec((1, T, tile_k), _tok_idx)
     else:
-        tok_block = pl.BlockSpec((None, tile_k), _tok_idx)
+        tok_block = pl.BlockSpec((T, tile_k), _tok_idx)
 
     wt_block = pl.BlockSpec((1, tile_k, tile_n), _wt_idx)
     sc_block = pl.BlockSpec((1, 1, 1), _sc_idx)
-    out_block = pl.BlockSpec((1, None, tile_n), _out_idx)
+    out_block = pl.BlockSpec((1, T, tile_n), _out_idx)
 
     # Capture static values in the kernel closure.
     kernel = functools.partial(
         _fp8_moe_kernel_body,
         n_tiles=n_tiles,
         k_tiles=k_tiles,
+        tokens_batched=tokens_batched,
     )
 
     out = pl.pallas_call(
