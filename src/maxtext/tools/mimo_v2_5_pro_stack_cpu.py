@@ -144,7 +144,10 @@ def _copy_single_zarr(
     objects = fs.ls(src_zarr, detail=False)
     for obj in objects:
         obj_name = obj.split("/")[-1]
-        fs.copy(obj, f"{dst_zarr}/{obj_name}")
+        # Use cat+pipe (download/upload) rather than fs.copy() which triggers
+        # the GCS storage.objects.rewrite API — that requires elevated OAuth
+        # scopes not always granted to GKE node service accounts.
+        fs.pipe(f"{dst_zarr}/{obj_name}", fs.cat(obj))
 
 
 def _copy_layer(
@@ -280,7 +283,7 @@ def _copy_global_params(
         objects = fs.ls(entry, detail=False)
         for obj in objects:
             obj_name = obj.split("/")[-1]
-            fs.copy(obj, f"{dst_items}/{name}/{obj_name}")
+            fs.pipe(f"{dst_items}/{name}/{obj_name}", fs.cat(obj))
         _log(f"  copied global: {name}")
         copied += 1
     _log(f"done global params ({copied} entries) in {time.time() - t0:.1f}s")
