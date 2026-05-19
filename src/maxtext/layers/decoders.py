@@ -950,22 +950,26 @@ class Decoder(nn.Module):
               slot,
           )
         elif cfg.decoder_block == DecoderBlockType.MIMO_V2_FLASH:
-          # MiMo-V2-Flash uses a 4-phase stacked checkpoint layout where each
-          # phase groups layers that share identical architecture so that
-          # nn.scan can be applied within each phase.
+          # MiMo-V2-Flash / MiMo-V2.5-Pro use a multi-phase stacked checkpoint
+          # layout where each phase groups architecturally identical layers so
+          # that nn.scan can be applied within each phase.
           #
-          #   Phase A: layer 0          (global attn + dense MLP, unique)
-          #   Phase B: layers 1–4       (SWA + MoE, all identical) → scan=4
-          #   Phase C: layers 5–46      (7 repetitions × 6-position cycle)
-          #                             → 6 independent scans of 7 each,
-          #                               nested under "layers_c"
-          #   Phase D: layer 47         (global attn + MoE, unique)
+          # V2-Flash (48 layers) — checkpoint keys must match mimo_stack_checkpoint.py:
+          #   decoder.layers_a.*                       (layer 0, single)
+          #   decoder.layers_b.*        stacked (4,…)  (layers 1–4)
+          #   decoder.layers_c.layers_p.* stacked (7,…) (layers 5–46, p in 0..5)
+          #   decoder.layers_d.*                       (layer 47, single)
           #
-          # Checkpoint key layout (must match mimo_stack_checkpoint.py):
-          #   decoder.layers_a.*
-          #   decoder.layers_b.*           (stacked dim=4)
-          #   decoder.layers_c.layers_p.*  (stacked dim=7, p in 0..5)
-          #   decoder.layers_d.*
+          # V2.5-Pro (70 layers) — checkpoint keys must match
+          # mimo_v2_5_pro_stack_checkpoint.py:
+          #   decoder.layers_a.*                        (layer 0, single)
+          #   decoder.layers_b.*        stacked (6,…)   (layers 1–6)
+          #   decoder.layers_c.layers_p.* stacked (6,…) (layers 7–54, p in 0..7)
+          #   decoder.layers_d.*                        (layer 55, single)
+          #   decoder.layers_e.*        stacked (6,…)   (layers 56–61)
+          #   decoder.layers_f.*                        (layer 62, single)
+          #   decoder.layers_g.*        stacked (6,…)   (layers 63–68)
+          #   decoder.layers_h.*                        (layer 69, single)
           RemattedBlockLayer = RemattedBlockLayers[0]
 
           # nn.scan cannot forward keyword arguments; extra per-call kwargs
@@ -1018,54 +1022,111 @@ class Decoder(nn.Module):
                 layer_idx=layer_idx_rep,
             )
 
-          # Phase A: layer 0 — global attn + dense MLP (no scan, single layer)
-          y, _ = RemattedBlockLayer(
-              config=cfg,
-              mesh=mesh,
-              name="layers_a",
-              quant=self.quant,
-              model_mode=self.model_mode,
-              layer_idx=0,
-          )(y, *broadcast_args,
-            previous_chunk=previous_chunk, page_state=page_state, slot=slot,
-            kv_cache=None, attention_metadata=attention_metadata)
+          def _mimo_single(layer_idx, name):
+            """Apply a single (non-scanned) MIMO layer."""
+            return RemattedBlockLayer(
+                config=cfg,
+                mesh=mesh,
+                name=name,
+                quant=self.quant,
+                model_mode=self.model_mode,
+                layer_idx=layer_idx,
+            )(y, *broadcast_args,
+              previous_chunk=previous_chunk, page_state=page_state, slot=slot,
+              kv_cache=None, attention_metadata=attention_metadata)
 
-          # Phase B: layers 1–4 — SWA + MoE (scan length=4).
-          # All four layers share the same structure; use layer_idx=1 as rep.
-          y, _ = _mimo_scan(1, 4, "layers_b")(y, *_mimo_bcast)
+          if cfg.base_num_decoder_layers == 70:
+            # ----------------------------------------------------------------
+            # MiMo-V2.5-Pro: 70-layer 8-phase layout
+            # Hybrid pattern: GA at {0,7,15,23,31,39,47,55,62,69}; all MoE
+            # except layer 0 (dense MLP).
+            #
+            # Phase A : layer 0          GA + dense, single
+            # Phase B : layers 1–6       SWA + MoE,  scan=6
+            # Phase C : layers 7–54      period-8 cycle (1 GA + 7 SWA) × 6 reps
+            #             layers_c.layers_0 : GA+MoE  layers [7,15,23,31,39,47]  scan=6
+            #             layers_c.layers_1 : SWA+MoE layers [8,16,24,32,40,48]  scan=6
+            #             …
+            #             layers_c.layers_7 : SWA+MoE layers [14,22,30,38,46,54] scan=6
+            # Phase D : layer 55         GA + MoE, single
+            # Phase E : layers 56–61     SWA + MoE,  scan=6
+            # Phase F : layer 62         GA + MoE, single
+            # Phase G : layers 63–68     SWA + MoE,  scan=6
+            # Phase H : layer 69         GA + MoE, single
+            # ----------------------------------------------------------------
 
-          # Phase C: layers 5–46 — 7 repetitions of a 6-position cycle.
-          # Each cycle position is homogeneous across all 7 repetitions:
-          #   pos 0: global-attn MoE  (representative: layer 5)
-          #   pos 1: SWA-MoE          (representative: layer 6)
-          #   pos 2: SWA-MoE          (representative: layer 7)
-          #   pos 3: SWA-MoE          (representative: layer 8)
-          #   pos 4: SWA-MoE          (representative: layer 9)
-          #   pos 5: SWA-MoE          (representative: layer 10)
-          _PHASE_C_REP_IDXS = [5, 6, 7, 8, 9, 10]
+            # Phase A
+            y, _ = _mimo_single(0, "layers_a")
 
-          class _MiMoPhaseCScope(nn.Module):  # pylint: disable=invalid-name
-            """Wraps the 6 phase-C scan groups under the 'layers_c' key."""
+            # Phase B: layers 1–6 (SWA+MoE, rep=1)
+            y, _ = _mimo_scan(1, 6, "layers_b")(y, *_mimo_bcast)
 
-            @nn.compact
-            def __call__(self_inner, inp, *bcast_args):  # pylint: disable=no-self-argument
-              for p, rep_idx in enumerate(_PHASE_C_REP_IDXS):
-                inp, _ = _mimo_scan(rep_idx, 7, f"layers_{p}")(inp, *bcast_args)
-              return inp, None
+            # Phase C: layers 7–54 — 8 cycle positions × 6 repetitions each.
+            # Rep indices match the first occurrence of each cycle position.
+            _PHASE_C_25PRO_REP_IDXS = [7, 8, 9, 10, 11, 12, 13, 14]
 
-          y, _ = _MiMoPhaseCScope(name="layers_c")(y, *_mimo_bcast)
+            class _MiMo25ProPhaseCScope(nn.Module):  # pylint: disable=invalid-name
+              """Wraps the 8 phase-C scan groups under the 'layers_c' key."""
 
-          # Phase D: layer 47 — global attn + MoE (no scan, single layer)
-          y, _ = RemattedBlockLayer(
-              config=cfg,
-              mesh=mesh,
-              name="layers_d",
-              quant=self.quant,
-              model_mode=self.model_mode,
-              layer_idx=47,
-          )(y, *broadcast_args,
-            previous_chunk=previous_chunk, page_state=page_state, slot=slot,
-            kv_cache=None, attention_metadata=attention_metadata)
+              @nn.compact
+              def __call__(self_inner, inp, *bcast_args):  # pylint: disable=no-self-argument
+                for p, rep_idx in enumerate(_PHASE_C_25PRO_REP_IDXS):
+                  inp, _ = _mimo_scan(rep_idx, 6, f"layers_{p}")(inp, *bcast_args)
+                return inp, None
+
+            y, _ = _MiMo25ProPhaseCScope(name="layers_c")(y, *_mimo_bcast)
+
+            # Phase D: layer 55 (GA+MoE, single)
+            y, _ = _mimo_single(55, "layers_d")
+
+            # Phase E: layers 56–61 (SWA+MoE, rep=56)
+            y, _ = _mimo_scan(56, 6, "layers_e")(y, *_mimo_bcast)
+
+            # Phase F: layer 62 (GA+MoE, single)
+            y, _ = _mimo_single(62, "layers_f")
+
+            # Phase G: layers 63–68 (SWA+MoE, rep=63)
+            y, _ = _mimo_scan(63, 6, "layers_g")(y, *_mimo_bcast)
+
+            # Phase H: layer 69 (GA+MoE, single)
+            y, _ = _mimo_single(69, "layers_h")
+
+          else:
+            # ----------------------------------------------------------------
+            # MiMo-V2-Flash: 48-layer 4-phase layout
+            # Checkpoint keys must match mimo_stack_checkpoint.py.
+            # ----------------------------------------------------------------
+
+            # Phase A: layer 0 — global attn + dense MLP (no scan, single layer)
+            y, _ = _mimo_single(0, "layers_a")
+
+            # Phase B: layers 1–4 — SWA + MoE (scan length=4).
+            # All four layers share the same structure; use layer_idx=1 as rep.
+            y, _ = _mimo_scan(1, 4, "layers_b")(y, *_mimo_bcast)
+
+            # Phase C: layers 5–46 — 7 repetitions of a 6-position cycle.
+            # Each cycle position is homogeneous across all 7 repetitions:
+            #   pos 0: global-attn MoE  (representative: layer 5)
+            #   pos 1: SWA-MoE          (representative: layer 6)
+            #   pos 2: SWA-MoE          (representative: layer 7)
+            #   pos 3: SWA-MoE          (representative: layer 8)
+            #   pos 4: SWA-MoE          (representative: layer 9)
+            #   pos 5: SWA-MoE          (representative: layer 10)
+            _PHASE_C_REP_IDXS = [5, 6, 7, 8, 9, 10]
+
+            class _MiMoPhaseCScope(nn.Module):  # pylint: disable=invalid-name
+              """Wraps the 6 phase-C scan groups under the 'layers_c' key."""
+
+              @nn.compact
+              def __call__(self_inner, inp, *bcast_args):  # pylint: disable=no-self-argument
+                for p, rep_idx in enumerate(_PHASE_C_REP_IDXS):
+                  inp, _ = _mimo_scan(rep_idx, 7, f"layers_{p}")(inp, *bcast_args)
+                return inp, None
+
+            y, _ = _MiMoPhaseCScope(name="layers_c")(y, *_mimo_bcast)
+
+            # Phase D: layer 47 — global attn + MoE (no scan, single layer)
+            y, _ = _mimo_single(47, "layers_d")
         else:
           RemattedBlockLayer = RemattedBlockLayers[0]
           scan_length = int(cfg.num_decoder_layers / cfg.inhomogeneous_layer_cycle_interval)

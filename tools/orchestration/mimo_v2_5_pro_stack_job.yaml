@@ -1,0 +1,138 @@
+# MiMo-V2.5-Pro checkpoint stacking job — GKE multi-host (2x2x2, 8 chips, 16 JAX devices)
+#
+# Purpose:
+#   Convert the flat per-layer OCDBT checkpoint (scan_layers=false) produced by
+#   the Phase 4 converter into the eight-phase stacked layout (scan_layers=true)
+#   expected by decoders.py when base_num_decoder_layers=70.
+#
+# Input:
+#   gs://jingnw-mimo-v2-5-pro-us-central1/mimo-v2-5-pro-fp8-ocdbt/0/items
+# Output:
+#   gs://jingnw-mimo-v2-5-pro-us-central1/mimo-v2-5-pro-fp8-ocdbt-stacked/0/items
+#
+# Must run on TPU (not CPU): loads the full ~1 TB FP8 model into HBM via
+# engine.load_params, then stacks layer groups in-place using donated jax.jit.
+# Parallelism matches inference: TP=8, EP=2 → 16 JAX devices total.
+#
+# Estimated duration: ~15–30 min (GCS read bottleneck; no XLA forward-pass
+# compilation — load_params does not compile the forward pass).
+#
+# Apply:
+#   kubectl apply -f tools/orchestration/mimo_v2_5_pro_stack_job.yaml
+#
+# Monitor:
+#   kubectl logs -f -l job-name=mimo-v25-pro-stack --prefix
+#
+# Clean up:
+#   kubectl delete job mimo-v25-pro-stack
+#   kubectl delete service mimo-v25-pro-stack
+
+# ---------------------------------------------------------------------------
+# Headless Service for JAX coordinator discovery (pod-0 DNS name).
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: mimo-v25-pro-stack
+  namespace: default
+spec:
+  clusterIP: None
+  selector:
+    job-name: mimo-v25-pro-stack
+
+---
+# ---------------------------------------------------------------------------
+# Indexed Job — 2 pods, one per TPU node (4 chips each = 8 chips total).
+# ---------------------------------------------------------------------------
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: mimo-v25-pro-stack
+  namespace: default
+spec:
+  completions: 2
+  parallelism: 2
+  completionMode: Indexed
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        job-name: mimo-v25-pro-stack
+    spec:
+      restartPolicy: Never
+      subdomain: mimo-v25-pro-stack
+      nodeSelector:
+        cloud.google.com/gke-nodepool: jingnw-flex-tpu7-8ch
+        cloud.google.com/gke-tpu-accelerator: tpu7x
+        cloud.google.com/gke-tpu-topology: 2x2x2
+      tolerations:
+      - key: google.com/tpu
+        operator: Equal
+        value: present
+        effect: NoSchedule
+      containers:
+      - name: mimo-v25-pro-stack
+        image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.8.1-rev1
+        env:
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        - name: NODE_RANK
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.annotations['batch.kubernetes.io/job-completion-index']
+        - name: JAX_COORDINATOR_ADDRESS
+          value: "mimo-v25-pro-stack-0.mimo-v25-pro-stack.default.svc.cluster.local:6006"
+        - name: JAX_COORDINATOR_PORT
+          value: "6006"
+        - name: NNODES
+          value: "2"
+        - name: STACKED_OUTPUT_PATH
+          value: "gs://jingnw-mimo-v2-5-pro-us-central1/mimo-v2-5-pro-fp8-ocdbt-stacked/0/items"
+        command:
+        - bash
+        - -lc
+        - |
+          set -euo pipefail
+          export PATH="/opt/venv/bin:${PATH}"
+
+          # Clone branch and install.
+          WORKDIR=/workspace
+          rm -rf "${WORKDIR}"
+          git clone https://github.com/geeningwang/maxtext.git "${WORKDIR}"
+          cd "${WORKDIR}"
+          git checkout MiMo-V2.5-Pro
+          /opt/venv/bin/python -m pip install -e ".[tpu]"
+          install_maxtext_tpu_github_deps
+          /opt/venv/bin/python -m pip install transformers safetensors huggingface_hub
+
+          echo "[mimo-v25-pro-stack] NODE_RANK=${NODE_RANK}  JAX_COORDINATOR_ADDRESS=${JAX_COORDINATOR_ADDRESS}"
+          echo "[mimo-v25-pro-stack] Starting checkpoint stacking (flat → eight-phase scan layout)..."
+          echo "[mimo-v25-pro-stack] Output: ${STACKED_OUTPUT_PATH}"
+
+          /opt/venv/bin/python -m maxtext.tools.mimo_v2_5_pro_stack_checkpoint \
+            src/maxtext/configs/base.yml \
+            model_name=mimo-v2-5-pro \
+            load_parameters_path=gs://jingnw-mimo-v2-5-pro-us-central1/mimo-v2-5-pro-fp8-ocdbt/0/items \
+            base_output_directory=gs://jingnw-mimo-v2-5-pro-us-central1/ \
+            run_name=mimo_v25pro_stack \
+            per_device_batch_size=1 \
+            max_target_length=8192 \
+            max_prefill_predict_length=8192 \
+            attention=dot_product \
+            scan_layers=false \
+            ici_tensor_parallelism=8 \
+            ici_expert_parallelism=2 \
+            async_checkpointing=false \
+            mimo_fp8_weight_mode=block_wise_fp8
+
+          echo "[mimo-v25-pro-stack] Done. Stacked checkpoint written to ${STACKED_OUTPUT_PATH}"
+
+        resources:
+          requests:
+            cpu: "10"
+            memory: 192Gi
+            google.com/tpu: "4"   # 4 chips per node; 2 nodes = 8 chips total
+          limits:
+            cpu: "10"
+            memory: 192Gi
+            google.com/tpu: "4"
