@@ -1353,7 +1353,7 @@ def convert_and_save_streaming(
         on_layer_complete=_on_layer_complete,
         keep_fp8=keep_fp8,
         shard_index_cache=shard_index_cache,
-        layer_range=(_start, _end),
+        layer_range=(resume_layer, _end),
         skip_global_weights=skip_global,
     )
 
