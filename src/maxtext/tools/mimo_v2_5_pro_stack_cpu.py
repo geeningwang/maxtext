@@ -96,9 +96,10 @@ _PHASE_E_INDICES = list(range(56, 62))  # [56, 57, 58, 59, 60, 61]
 _PHASE_G_INDICES = list(range(63, 69))  # [63, 64, 65, 66, 67, 68]
 
 # Number of parallel leaf-array processing threads per phase group.
-# Each expert-weight leaf buffers ~1.6 GB × N_layers in RAM.
-# 16 threads × (at most 3 large expert leaves concurrently) ≈ 29 GB peak.
-_N_LEAF_THREADS = 16
+# Peak RAM per thread: stacked_buf (9.66 GB) + 1 compressed chunk (~1.4 GB)
+# + 1 decompressed chunk (1.61 GB) ≈ 13 GB. With 4 threads: ~52 GB peak,
+# well within the 110 Gi pod limit.
+_N_LEAF_THREADS = 4
 
 
 # ---------------------------------------------------------------------------
@@ -211,10 +212,22 @@ def _stack_group(
         with ThreadPoolExecutor(max_workers=n) as inner_ex:
             compressed_chunks: list[bytes] = list(inner_ex.map(_read_chunk, src_layers))
 
-        # Decompress each chunk, concatenate raw bytes, re-compress.
-        raw_bufs = [numcodecs.Zstd().decode(c) for c in compressed_chunks]
-        stacked_bytes = b"".join(raw_bufs)
-        stacked_compressed = compressor.encode(stacked_bytes)
+        # Decompress into a pre-allocated bytearray one chunk at a time.
+        # This avoids holding N fully-decompressed buffers + the concatenated
+        # result simultaneously (which was the OOM root cause at 16 threads).
+        # Peak per thread: stacked_buf + 1 compressed chunk + 1 raw chunk.
+        first_raw = numcodecs.Zstd().decode(compressed_chunks[0])
+        chunk_bytes = len(first_raw)
+        stacked_buf = bytearray(n * chunk_bytes)
+        stacked_buf[0:chunk_bytes] = first_raw
+        del first_raw
+        for i in range(1, n):
+            raw = numcodecs.Zstd().decode(compressed_chunks[i])
+            stacked_buf[i * chunk_bytes:(i + 1) * chunk_bytes] = raw
+            del raw
+        del compressed_chunks
+        stacked_compressed = compressor.encode(bytes(stacked_buf))
+        del stacked_buf
 
         # Write stacked chunk.
         new_shape = [n] + list(shape)
