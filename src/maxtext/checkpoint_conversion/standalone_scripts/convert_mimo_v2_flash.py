@@ -153,6 +153,67 @@ def _write_text(path: str, content: str) -> None:
         pathlib.Path(path).write_text(content)
 
 
+def _st_np_dtype(st_dtype: str):
+    """Map a safetensors dtype string to a numpy dtype."""
+    mapping = {
+        "F64": np.float64,
+        "F32": np.float32,
+        "F16": np.float16,
+        "BF16": _BF16 if _BF16 is not None else np.float32,
+        "F8_E4M3": getattr(np, "float8_e4m3fn", None),
+        "F8_E5M2": getattr(np, "float8_e5m2", None),
+        "I64": np.int64,
+        "I32": np.int32,
+        "I16": np.int16,
+        "I8": np.int8,
+        "U8": np.uint8,
+        "BOOL": np.bool_,
+    }
+    dt = mapping.get(st_dtype)
+    if dt is None:
+        raise ValueError(f"Unknown safetensors dtype: {st_dtype!r}")
+    return dt
+
+
+def _cast_to_target(arr: np.ndarray, keep_fp8: bool) -> np.ndarray:
+    """Cast array to bf16, or keep as fp8 when keep_fp8=True."""
+    dtype_name = getattr(arr.dtype, "name", "")
+    if keep_fp8 and dtype_name.startswith("float8"):
+        return arr
+    arr_f32 = arr.astype(np.float32)
+    return arr_f32.astype(_BF16) if _BF16 is not None else arr_f32
+
+
+def _index_gcs_shard(shard_uri: str, key_to_info: dict) -> None:
+    """Read only the safetensors header from a GCS shard via two ranged reads.
+
+    The safetensors format starts with an 8-byte little-endian uint64 giving the
+    header length, followed by that many bytes of UTF-8 JSON.  We fetch only
+    those bytes (typically a few MB), parse the tensor metadata, and record the
+    absolute byte offset and size for each tensor in *key_to_info*.  The rest of
+    the file (tensor data, tens of GB) is never downloaded during indexing.
+    """
+    import gcsfs  # pylint: disable=import-outside-toplevel
+    import struct  # pylint: disable=import-outside-toplevel
+    import json as _json  # pylint: disable=import-outside-toplevel
+
+    fs = gcsfs.GCSFileSystem()
+    header_len = struct.unpack("<Q", fs.cat_file(shard_uri, start=0, end=8))[0]
+    header = _json.loads(fs.cat_file(shard_uri, start=8, end=8 + header_len))
+    data_base = 8 + header_len  # raw tensor data starts here in the file
+    for key, meta in header.items():
+        if key == "__metadata__":
+            continue
+        offsets = meta["data_offsets"]  # [start, end] relative to data section
+        key_to_info[key] = {
+            "shard": shard_uri,
+            "offset": data_base + offsets[0],
+            "size": offsets[1] - offsets[0],
+            "dtype": meta["dtype"],
+            "shape": meta["shape"],
+        }
+
+
 def _gcs_ls_safetensors(gcs_dir: str) -> list[str]:
     """List all *.safetensors GCS URIs under gcs_dir using gsutil."""
     result = subprocess.run(
@@ -250,76 +311,103 @@ MODEL_PARAMS = {
 # Shard-index helpers (no weights loaded until needed)
 # ---------------------------------------------------------------------------
 
-def _build_shard_index(shard_paths: list[pathlib.Path]) -> dict[str, pathlib.Path]:
-    """Map every weight key to the shard file that contains it.
+def _build_shard_index(shard_paths) -> dict:
+    """Map every weight key to its shard and byte location.
 
-    Opens each shard just long enough to read its key list — no tensor data is
-    loaded into RAM.  For GCS paths, each shard is downloaded to a temp file,
-    indexed, then immediately deleted (peak disk = one shard at a time).
+    For GCS paths: reads only the safetensors header (two ranged HTTP requests
+    of a few MB total) instead of downloading the full shard (~30 GB).  Returns
+    ``{key: {"shard": uri, "offset": int, "size": int, "dtype": str, "shape": [int]}}``.
+
+    For local paths: uses safe_open (memory-mapped); returns
+    ``{key: {"shard": path_str}}`` (no byte offset — safe_open used at load time).
     """
-    key_to_shard: dict[str, pathlib.Path] = {}
+    key_to_info: dict = {}
     for shard_path in tqdm(shard_paths, desc="Indexing shards"):
-        with _local_shard(shard_path) as local_path:
-            with safe_open(local_path, framework="np") as f:
+        path_str = str(shard_path)
+        if _is_gcs(path_str):
+            _index_gcs_shard(path_str, key_to_info)
+        else:
+            with safe_open(shard_path, framework="np") as f:
                 for key in f.keys():
-                    key_to_shard[key] = shard_path  # keep original (GCS) path
-    return key_to_shard
+                    key_to_info[key] = {"shard": path_str}
+    return key_to_info
 
 
 def _load_keys_batch(
     keys: Iterable[str],
-    key_to_shard: dict[str, pathlib.Path],
+    key_to_shard: dict,
     label: str = "",
     progress_every: int = 10,
     keep_fp8: bool = False,
 ) -> dict[str, np.ndarray]:
-    """Load a set of weight keys, opening each shard at most once.
+    """Load a set of weight keys using GCS ranged reads or local safe_open.
 
-    When keep_fp8=False (default), returns bfloat16 numpy arrays (FP8 tensors
-    are upcasted to float32 then downcasted to bfloat16).
+    For GCS entries (those with "offset" in their index record): fires one HTTP
+    Range request per tensor in parallel (up to 32 threads).  Downloads only the
+    exact bytes needed — no full shard download.
 
-    When keep_fp8=True, FP8 tensors (dtype starting with "float8") are kept in
-    their native ml_dtypes.float8_e4m3fn dtype; all other tensors are loaded as
-    bfloat16 as usual.  Use this for MoE expert weights when building a
-    block-wise FP8 checkpoint.
+    For local entries: uses safe_open (memory-mapped) as before.
     """
-    # Group requested keys by their shard file.
-    shard_to_keys: dict[pathlib.Path, list[str]] = {}
+    gcs_keys: list[str] = []
+    local_shard_to_keys: dict[str, list[str]] = {}
+
     for key in keys:
-        shard = key_to_shard.get(key)
-        if shard is not None:
-            shard_to_keys.setdefault(shard, []).append(key)
+        info = key_to_shard.get(key)
+        if info is None:
+            continue
+        if isinstance(info, dict) and "offset" in info:
+            gcs_keys.append(key)
+        else:
+            shard = info["shard"] if isinstance(info, dict) else str(info)
+            local_shard_to_keys.setdefault(shard, []).append(key)
 
     tensors: dict[str, np.ndarray] = {}
-    total_shards = len(shard_to_keys)
-    keys_loaded = 0
-    for idx, (shard_path, batch) in enumerate(shard_to_keys.items()):
-        shard_name = str(shard_path).rstrip("/").split("/")[-1]
+
+    # --- GCS path: parallel ranged reads (one HTTP Range request per tensor) ---
+    if gcs_keys:
+        import gcsfs  # pylint: disable=import-outside-toplevel
+        from concurrent.futures import ThreadPoolExecutor, as_completed  # pylint: disable=import-outside-toplevel
+
+        fs = gcsfs.GCSFileSystem()
+
+        def _fetch_one(key: str):
+            info = key_to_shard[key]
+            raw = fs.cat_file(info["shard"], start=info["offset"], end=info["offset"] + info["size"])
+            arr = np.frombuffer(raw, dtype=_st_np_dtype(info["dtype"])).reshape(info["shape"])
+            return key, _cast_to_target(arr, keep_fp8)
+
+        n_workers = min(len(gcs_keys), 32)
         print(
-            f"[convert] {label}  opening shard {idx+1}/{total_shards} ({shard_name}, {len(batch)} keys)  keys_so_far={keys_loaded}",
+            f"[convert] {label}  ranged reads: {len(gcs_keys)} tensors, {n_workers} workers",
+            flush=True,
+        )
+        done = 0
+        with ThreadPoolExecutor(max_workers=n_workers) as pool:
+            futures = {pool.submit(_fetch_one, k): k for k in gcs_keys}
+            for fut in as_completed(futures):
+                key, arr = fut.result()
+                tensors[key] = arr
+                done += 1
+                if progress_every > 0 and done % progress_every == 0:
+                    print(f"[convert] {label}  {done}/{len(gcs_keys)} tensors loaded", flush=True)
+        print(f"[convert] {label}  ranged reads done ({len(gcs_keys)} tensors)", flush=True)
+
+    # --- Local path: safe_open (memory-mapped, unchanged) ---
+    total_local = len(local_shard_to_keys)
+    keys_loaded = 0
+    for idx, (shard_path, batch) in enumerate(local_shard_to_keys.items()):
+        shard_name = shard_path.rstrip("/").split("/")[-1]
+        print(
+            f"[convert] {label}  local shard {idx+1}/{total_local} ({shard_name}, {len(batch)} keys)",
             flush=True,
         )
         with _local_shard(shard_path) as local_path, safe_open(local_path, framework="np") as f:
-            for ki, key in enumerate(batch):
+            for key in batch:
                 raw = f.get_tensor(key)
-                if keep_fp8 and getattr(raw.dtype, "name", "").startswith("float8"):
-                    # Preserve native FP8 dtype (e.g. float8_e4m3fn) — no upcast.
-                    tensors[key] = raw
-                else:
-                    # .astype(float32) handles fp8/fp16/bf16 → float32 via ml_dtypes.
-                    # Then astype(_BF16) downcasts to bf16 via ml_dtypes.
-                    arr_f32 = raw.astype(np.float32)
-                    tensors[key] = arr_f32.astype(_BF16) if _BF16 is not None else arr_f32
+                tensors[key] = _cast_to_target(raw, keep_fp8)
                 keys_loaded += 1
-                if progress_every > 0 and (ki + 1) % progress_every == 0:
-                    print(
-                        f"[convert] {label}  shard {idx+1}/{total_shards}  key {ki+1}/{len(batch)}  keys_loaded={keys_loaded}",
-                        flush=True,
-                    )
-        print(
-            f"[convert] {label}  shard {idx+1}/{total_shards} done  keys_loaded={keys_loaded}",
-            flush=True,
-        )
+        print(f"[convert] {label}  local shard {idx+1}/{total_local} done", flush=True)
+
     return tensors
 
 
@@ -544,7 +632,13 @@ def convert_hf_to_maxtext(
         import json as _json  # pylint: disable=import-outside-toplevel
         max_logging.log(f"Loading shard index from cache: {shard_index_cache}")
         print(f"[convert] Loading shard index from cache: {shard_index_cache}", flush=True)
-        key_to_shard = _json.loads(_read_text(shard_index_cache))
+        cached = _json.loads(_read_text(shard_index_cache))
+        if isinstance(cached, dict) and cached.get("__version__") == 2:
+            key_to_shard = cached["index"]
+        else:
+            # v1 cache (just {key: shard_uri}): no byte offsets, fall back to full-shard loads.
+            key_to_shard = {k: {"shard": v} for k, v in cached.items() if k != "__version__"}
+            max_logging.log("Warning: v1 shard index cache loaded — no byte offsets, ranged reads disabled.")
         max_logging.log(f"Loaded {len(key_to_shard)} weight keys from shard index cache")
         print(f"[convert] Loaded {len(key_to_shard)} weight keys from shard index cache", flush=True)
     else:
@@ -553,7 +647,7 @@ def convert_hf_to_maxtext(
         print(f"[convert] Indexed {len(key_to_shard)} weight keys across {len(shard_paths)} shards", flush=True)
         if shard_index_cache:
             import json as _json  # pylint: disable=import-outside-toplevel
-            _write_text(shard_index_cache, _json.dumps({k: str(v) for k, v in key_to_shard.items()}))
+            _write_text(shard_index_cache, _json.dumps({"__version__": 2, "index": key_to_shard}))
             max_logging.log(f"Shard index cached to: {shard_index_cache}")
             print(f"[convert] Shard index cached to: {shard_index_cache}", flush=True)
     sys.stdout.flush(); sys.stderr.flush()
