@@ -227,6 +227,7 @@ class HFTokenizer:
         add_bos_token=add_bos,
         add_eos_token=add_eos,
         token=hf_access_token,
+        trust_remote_code=True,
     )
     self.pad_id = self.tokenizer.pad_token_id
     self.unk_id = self.tokenizer.unk_token_id
