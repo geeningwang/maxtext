@@ -214,14 +214,14 @@ def _index_gcs_shard(shard_uri: str, key_to_info: dict) -> None:
         }
 
 
-def _find_resume_layer(items_dir_str: str, num_layers: int) -> int:
-    """Return the index of the first layer not yet written under items_dir.
+def _find_resume_layer(items_dir_str: str, start_layer: int, end_layer: int) -> int:
+    """Return the index of the first layer not yet written in [start_layer, end_layer).
 
     Probes for each layer's input_layernorm.scale zarr array (.zarray metadata
     file), which is always the first array written per layer.  Returns
-    num_layers if all layers are already present (full resume or complete run).
+    end_layer if all layers in the range are already present.
     """
-    for n in range(num_layers):
+    for n in range(start_layer, end_layer):
         probe = _path_join(
             items_dir_str,
             f"params.params.decoder.layers.{n}.input_layernorm.scale",
@@ -229,7 +229,7 @@ def _find_resume_layer(items_dir_str: str, num_layers: int) -> int:
         )
         if not _path_exists(probe):
             return n
-    return num_layers
+    return end_layer
 
 
 def _scan_existing_zarr_meta(items_dir_str: str) -> dict:
@@ -1230,6 +1230,8 @@ def convert_and_save_streaming(
     params: dict,
     step: int = 0,
     keep_fp8: bool = False,
+    start_layer: int | None = None,
+    end_layer: int | None = None,
 ) -> None:
     """Convert HF weights and write the zarr checkpoint in a single pass.
 
@@ -1262,14 +1264,20 @@ def convert_and_save_streaming(
     # them and reconstruct their tree_meta entries from GCS.
     # ------------------------------------------------------------------
     num_layers = params["num_hidden_layers"]
-    resume_layer = _find_resume_layer(items_dir_str, num_layers)
-    if resume_layer > 0:
-        max_logging.log(f"Resume: layers 0–{resume_layer - 1} already in GCS; starting from layer {resume_layer}.")
-        print(f"[convert] Resume: layers 0–{resume_layer - 1} already in GCS; starting from layer {resume_layer}.", flush=True)
+    _start = start_layer if start_layer is not None else 0
+    _end = end_layer if end_layer is not None else num_layers
+    is_partial = start_layer is not None or end_layer is not None
+    skip_global = _start > 0  # non-zero worker: global weights handled by worker 0
+
+    resume_layer = _find_resume_layer(items_dir_str, _start, _end)
+    if resume_layer > _start:
+        max_logging.log(f"Resume: layers {_start}–{resume_layer - 1} already in GCS; starting from layer {resume_layer}.")
+        print(f"[convert] Resume: layers {_start}–{resume_layer - 1} already in GCS; starting from layer {resume_layer}.", flush=True)
 
     _makedirs(root_str)
-    if resume_layer == 0:
-        # Fresh start — wipe any partial output so we don't mix stale data.
+    # Only worker 0 clears stale output on a fresh start; other workers never delete
+    # to avoid trampling each other's concurrently-written data.
+    if not is_partial and resume_layer == 0:
         try:
             if _path_exists(step_dir_str):
                 _rmtree(step_dir_str)
@@ -1288,9 +1296,11 @@ def convert_and_save_streaming(
     )
     z_step[()] = step
 
-    # Seed tree_meta with entries for layers already present on GCS.
+    # In single-pod mode, seed tree_meta with already-written layers so the final
+    # _METADATA is complete on resume.  In partial (multi-node) mode the finalizer
+    # rescans everything, so workers don't need to track prior layers.
     tree_meta: dict = {}
-    if resume_layer > 0:
+    if not is_partial and resume_layer > _start:
         tree_meta.update(_scan_existing_zarr_meta(items_dir_str))
         max_logging.log(f"Reconstructed {len(tree_meta)} existing zarr entries from GCS.")
         print(f"[convert] Reconstructed {len(tree_meta)} existing zarr entries from GCS.", flush=True)
@@ -1343,19 +1353,61 @@ def convert_and_save_streaming(
         on_layer_complete=_on_layer_complete,
         keep_fp8=keep_fp8,
         shard_index_cache=shard_index_cache,
-        layer_range=(resume_layer, num_layers) if resume_layer > 0 else None,
+        layer_range=(_start, _end),
+        skip_global_weights=skip_global,
     )
 
-    # Write remaining global weights (returned in flat after layer loop).
-    total_global = len(flat)
-    max_logging.log(f"Writing {total_global} global weight arrays to checkpoint...")
-    for key, arr in sorted(flat.items()):
-        tree_meta.update(_write_one_zarr_array(items_dir_str, key, arr, compressor))
-        arrays_written[0] += 1
+    # Write global weights — only worker 0 is responsible (skip_global=False).
+    if not skip_global:
+        total_global = len(flat)
+        max_logging.log(f"Writing {total_global} global weight arrays to checkpoint...")
+        for key, arr in sorted(flat.items()):
+            tree_meta.update(_write_one_zarr_array(items_dir_str, key, arr, compressor))
+            arrays_written[0] += 1
     del flat
     gc.collect()
 
-    _write_checkpoint_metadata(step_dir_str, items_dir_str, tree_meta, init_ts, arrays_written[0])
+    # In single-pod mode, write the final checkpoint metadata here.
+    # In partial (multi-node) mode, run --finalize_only after all workers complete.
+    if not is_partial:
+        _write_checkpoint_metadata(step_dir_str, items_dir_str, tree_meta, init_ts, arrays_written[0])
+    else:
+        max_logging.log(
+            f"Partial mode: layers {_start}–{_end - 1} done. "
+            "Run --finalize_only after all workers complete to write checkpoint metadata."
+        )
+        print(
+            f"[convert] Worker done: layers {_start}–{_end - 1} written. "
+            "Run --finalize_only job next.",
+            flush=True,
+        )
+
+
+def finalize_checkpoint(
+    maxtext_model_path: str,
+    params: dict,
+    step: int = 0,
+) -> None:
+    """Write checkpoint metadata by scanning all zarr arrays already in GCS.
+
+    Run this after all worker pods have completed in multi-node mode.
+    Scans items_dir for every ``params.params.*`` zarr directory, reconstructs
+    tree_metadata, and writes ``_METADATA`` + ``_CHECKPOINT_METADATA``.
+    """
+    import time  # pylint: disable=import-outside-toplevel
+
+    root_str = maxtext_model_path.rstrip("/")
+    step_dir_str = _path_join(root_str, str(step))
+    items_dir_str = _path_join(step_dir_str, "items")
+
+    print("[finalize] Scanning GCS for zarr arrays...", flush=True)
+    tree_meta = _scan_existing_zarr_meta(items_dir_str)
+    total = len(tree_meta)
+    print(f"[finalize] Found {total} zarr arrays. Writing checkpoint metadata...", flush=True)
+
+    init_ts = time.time_ns()
+    _write_checkpoint_metadata(step_dir_str, items_dir_str, tree_meta, init_ts, total)
+    print(f"[finalize] Done. Checkpoint finalized at {step_dir_str}", flush=True)
 
 
 def _save_zarr_direct(
@@ -1474,6 +1526,14 @@ def main(args):
         )
 
     keep_fp8 = getattr(args, "keep_fp8", False)
+
+    if getattr(args, "finalize_only", False):
+        params = MODEL_PARAMS[args.model_size]
+        max_logging.log(f"Finalize-only mode: scanning GCS and writing checkpoint metadata. Output: {args.maxtext_model_path}")
+        finalize_checkpoint(args.maxtext_model_path, params)
+        max_logging.log("Finalization complete.")
+        return
+
     if keep_fp8 and not args.streaming_save:
         raise ValueError("--keep_fp8 requires --streaming_save (FP8 stacking is only implemented in the streaming-save path).")
 
@@ -1482,11 +1542,19 @@ def main(args):
         # Peak RAM ≈ one MoE layer (~50 GB) regardless of total model size.
         # No --tmpdir needed; use --streaming_save instead of --tmpdir.
         params = MODEL_PARAMS[args.model_size]
+        start_layer = getattr(args, "start_layer", None)
+        end_layer = getattr(args, "end_layer", None)
         max_logging.log(
             f"Streaming-save mode: converting and saving layer by layer "
-            f"(peak RAM ~50 GB, keep_fp8={keep_fp8}). Output: {args.maxtext_model_path}"
+            f"(peak RAM ~50 GB, keep_fp8={keep_fp8}, "
+            f"layers={start_layer}–{end_layer}). Output: {args.maxtext_model_path}"
         )
-        convert_and_save_streaming(model_path, args.maxtext_model_path, params, keep_fp8=keep_fp8)
+        convert_and_save_streaming(
+            model_path, args.maxtext_model_path, params,
+            keep_fp8=keep_fp8,
+            start_layer=start_layer,
+            end_layer=end_layer,
+        )
         max_logging.log("Streaming conversion + save complete.")
     elif getattr(args, "resume_from_tmpdir", False):
         # Skip the ~53-min conversion phase and restore memmaps from disk.
@@ -1625,6 +1693,39 @@ if __name__ == "__main__":
             "Non-expert weights (attention projections, dense MLP) are still dequantized to "
             "bfloat16 as normal.  Requires --streaming_save.  "
             "The resulting checkpoint is ~155 GB (FP8 experts) vs ~384 GB (BF16)."
+        ),
+    )
+
+    parser.add_argument(
+        "--start_layer",
+        type=int,
+        default=None,
+        help=(
+            "First decoder layer index (inclusive) this worker converts. "
+            "Used with --end_layer for multi-node parallel conversion. "
+            "Worker 0 (start_layer=0) also writes the global weights (embeddings, norm, lm_head). "
+            "Example: --start_layer 0 --end_layer 18"
+        ),
+    )
+    parser.add_argument(
+        "--end_layer",
+        type=int,
+        default=None,
+        help=(
+            "Last decoder layer index (exclusive) this worker converts. "
+            "Used with --start_layer for multi-node parallel conversion. "
+            "Example: --start_layer 18 --end_layer 36"
+        ),
+    )
+    parser.add_argument(
+        "--finalize_only",
+        action="store_true",
+        default=False,
+        help=(
+            "Skip conversion entirely; scan the GCS output directory for all zarr arrays "
+            "already written by worker pods, reconstruct tree_metadata, and write "
+            "_METADATA + _CHECKPOINT_METADATA to finalize the checkpoint. "
+            "Run this after all --start_layer/--end_layer worker jobs have completed."
         ),
     )
 

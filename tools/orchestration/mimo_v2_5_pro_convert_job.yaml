@@ -1,19 +1,31 @@
+# Worker Job — 4 pods in parallel, each converting a non-overlapping layer range.
+# Layer split (70 layers total, 0-69):
+#   Worker 0: layers  0-17  (also writes global weights: embeddings, norm, lm_head)
+#   Worker 1: layers 18-35
+#   Worker 2: layers 36-52
+#   Worker 3: layers 53-69
+#
+# After this Job completes, apply mimo_v2_5_pro_finalize_job.yaml to write
+# the final checkpoint metadata (_METADATA, _CHECKPOINT_METADATA).
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: mimo-v25-pro-convert-v9
+  name: mimo-v25-pro-convert-v10-workers
 spec:
+  completionMode: Indexed
+  completions: 4
+  parallelism: 4
   backoffLimit: 0
   template:
     metadata:
       labels:
-        app: mimo-v25-pro-convert-v9
+        app: mimo-v25-pro-convert-v10-workers
     spec:
       restartPolicy: Never
       nodeSelector:
         cloud.google.com/gke-nodepool: jingnw-cpu-highmem
       containers:
-      - name: mimo-v25-pro-convert-v9
+      - name: mimo-v25-pro-convert-v10-worker
         image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.8.1-rev1
         command:
         - bash
@@ -33,7 +45,14 @@ spec:
           /opt/venv/bin/python -m pip install -e ".[tpu]" -q
           /opt/venv/bin/python -m pip install transformers safetensors huggingface_hub "zarr<3" numcodecs gcsfs -q
 
-          echo "[convert] Starting MiMo-V2.5-Pro HF→MaxText conversion (streaming-save, FP8 mode)..."
+          # Compute layer range from pod index (JOB_COMPLETION_INDEX = 0..3)
+          INDEX=${JOB_COMPLETION_INDEX}
+          LAYER_STARTS=(0 18 36 53)
+          LAYER_ENDS=(18 36 53 70)
+          START=${LAYER_STARTS[$INDEX]}
+          END=${LAYER_ENDS[$INDEX]}
+
+          echo "[convert] Worker ${INDEX}/3: layers ${START}–$((END-1))"
           echo "[convert] Input:  gs://jingnw-mimo-v2-5-pro-us-central1/hf-weights"
           echo "[convert] Output: gs://jingnw-mimo-v2-5-pro-us-central1/mimo-v2-5-pro-fp8-ocdbt"
 
@@ -43,9 +62,11 @@ spec:
             --maxtext_model_path gs://jingnw-mimo-v2-5-pro-us-central1/mimo-v2-5-pro-fp8-ocdbt \
             --model_size mimo-v2-5-pro \
             --streaming_save \
-            --keep_fp8
+            --keep_fp8 \
+            --start_layer "${START}" \
+            --end_layer "${END}"
 
-          echo "[convert] Done."
+          echo "[convert] Worker ${INDEX} done."
 
         resources:
           requests:
