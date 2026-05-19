@@ -1,6 +1,5 @@
 {
   "permissions": {
-    "defaultMode": "bypassPermissions",
     "allow": [
       "Bash(grep -v \"^commit\\\\|^Author\\\\|^Date\\\\|^Merge\\\\|^$\\\\|---\")",
       "Bash(git checkout *)",
@@ -54,8 +53,11 @@
       "Bash(ssh -T git@github.com)",
       "Bash(git ls-remote *)",
       "Bash(sudo apt-get install -y google-cloud-cli-gke-gcloud-auth-plugin)",
-      "Bash(python3 -)"
+      "Bash(python3 -)",
+      "Bash(top -bn1)",
+      "Bash(ps aux *)"
     ],
+    "defaultMode": "bypassPermissions",
     "additionalDirectories": [
       "/tmp"
     ]
