@@ -1,13 +1,13 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: mimo-v25-pro-convert-v7
+  name: mimo-v25-pro-convert-v8
 spec:
   backoffLimit: 0
   template:
     metadata:
       labels:
-        app: mimo-v25-pro-convert-v7
+        app: mimo-v25-pro-convert-v8
     spec:
       restartPolicy: Never
       nodeSelector:
@@ -33,16 +33,17 @@ spec:
           /opt/venv/bin/python -m pip install -e ".[tpu]" -q
           /opt/venv/bin/python -m pip install transformers safetensors huggingface_hub "zarr<3" numcodecs gcsfs -q
 
-          echo "[convert] Starting MiMo-V2.5-Pro HF→MaxText conversion (streaming-save mode)..."
+          echo "[convert] Starting MiMo-V2.5-Pro HF→MaxText conversion (streaming-save, FP8 mode)..."
           echo "[convert] Input:  gs://jingnw-mimo-v2-5-pro-us-central1/hf-weights"
-          echo "[convert] Output: gs://jingnw-mimo-v2-5-pro-us-central1/mimo-v2-5-pro-bf16-ocdbt"
+          echo "[convert] Output: gs://jingnw-mimo-v2-5-pro-us-central1/mimo-v2-5-pro-fp8-ocdbt"
 
           /opt/venv/bin/python \
             -m maxtext.checkpoint_conversion.standalone_scripts.convert_mimo_v2_flash \
             --base_model_path gs://jingnw-mimo-v2-5-pro-us-central1/hf-weights \
-            --maxtext_model_path gs://jingnw-mimo-v2-5-pro-us-central1/mimo-v2-5-pro-bf16-ocdbt \
+            --maxtext_model_path gs://jingnw-mimo-v2-5-pro-us-central1/mimo-v2-5-pro-fp8-ocdbt \
             --model_size mimo-v2-5-pro \
-            --streaming_save
+            --streaming_save \
+            --keep_fp8
 
           echo "[convert] Done."
 
