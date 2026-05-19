@@ -1607,7 +1607,7 @@ class MaxEngine(_BaseEngine):
 
         def __init__(self, md):
           from transformers import AutoTokenizer  # pylint: disable=import-outside-toplevel
-          self.tokenizer = AutoTokenizer.from_pretrained(md.path, token=md.access_token or None)
+          self.tokenizer = AutoTokenizer.from_pretrained(md.path, token=md.access_token or None, trust_remote_code=True)
           self.metadata = md
 
         def encode(self, s, **kwargs):
