@@ -201,32 +201,35 @@ def _stack_group(
         ndim = len(shape)
         chunk_name = ".".join(["0"] * ndim) if ndim > 0 else "0"
 
-        # Read all N source chunks concurrently (one thread per layer).
-        def _read_chunk(layer_idx: int) -> bytes:
+        # Read and decompress chunks one at a time — never hold more than
+        # 1 compressed + 1 raw chunk alongside stacked_buf.
+        #
+        # Previous OOM (attempt 2, 4 threads, 110 GB RSS) had two bugs:
+        #   (a) inner ThreadPoolExecutor pre-fetched all N compressed chunks
+        #       into a list (~9 GB held per thread while stacked_buf grew)
+        #   (b) bytes(stacked_buf) made a full 9.66 GB copy for encode()
+        # Combined: ~28 GB/thread × 4 = 113 GB → OOM at 110 Gi limit.
+        #
+        # Fix: sequential GCS reads (no list), memoryview for encode (no copy).
+        # Peak per thread: stacked_buf (9.66 GB) + compressed (~1.5 GB)
+        #                  + raw (1.61 GB) ≈ 13 GB → 4 threads ≈ 52 GB total.
+        stacked_buf: bytearray | None = None
+        chunk_bytes = 0
+        for i, layer_idx in enumerate(src_layers):
             path = (
                 f"{src_items}/params.params.decoder.layers.{layer_idx}.{suffix}"
                 f"/{chunk_name}"
             )
-            return fs.cat(path)
-
-        with ThreadPoolExecutor(max_workers=n) as inner_ex:
-            compressed_chunks: list[bytes] = list(inner_ex.map(_read_chunk, src_layers))
-
-        # Decompress into a pre-allocated bytearray one chunk at a time.
-        # This avoids holding N fully-decompressed buffers + the concatenated
-        # result simultaneously (which was the OOM root cause at 16 threads).
-        # Peak per thread: stacked_buf + 1 compressed chunk + 1 raw chunk.
-        first_raw = numcodecs.Zstd().decode(compressed_chunks[0])
-        chunk_bytes = len(first_raw)
-        stacked_buf = bytearray(n * chunk_bytes)
-        stacked_buf[0:chunk_bytes] = first_raw
-        del first_raw
-        for i in range(1, n):
-            raw = numcodecs.Zstd().decode(compressed_chunks[i])
+            compressed = fs.cat(path)
+            raw = numcodecs.Zstd().decode(compressed)
+            del compressed
+            if stacked_buf is None:
+                chunk_bytes = len(raw)
+                stacked_buf = bytearray(n * chunk_bytes)
             stacked_buf[i * chunk_bytes:(i + 1) * chunk_bytes] = raw
             del raw
-        del compressed_chunks
-        stacked_compressed = compressor.encode(bytes(stacked_buf))
+        # memoryview avoids a 9.66 GB copy when passing bytearray to encode().
+        stacked_compressed = compressor.encode(memoryview(stacked_buf))
         del stacked_buf
 
         # Write stacked chunk.
