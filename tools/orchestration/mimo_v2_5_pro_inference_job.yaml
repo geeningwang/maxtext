@@ -6,11 +6,11 @@
 #
 # Parallelism: TP=8, EP=2  (8×2=16 devices)
 # HBM budget:  ~71 GB weights / 80 GB usable per device  → ~9 GB XLA headroom
-#              scan_layers=false: checkpoint is standard (non-stacked) layout
+#              scan_layers=true: stacked checkpoint, XLA compiles 1 layer body at a time
 #
 # Pre-requisites:
-#   1. Checkpoint converted to MaxText zarr2 format (Phase 4):
-#      gs://jingnw-mimo-v2-5-pro-us-central1/mimo-v2-5-pro-fp8-ocdbt/0/items
+#   1. Stacked checkpoint (CPU stacker, Phase 5):
+#      gs://jingnw-mimo-v2-5-pro-us-central1/mimo-v2-5-pro-fp8-ocdbt-stacked-cpu/0/items
 #   2. Node pool jingnw-flex-tpu7-8ch available (autoscales from 0)
 #   3. Broken 16ch pool cleaned up (see env_restore.md pending cleanup section)
 #
@@ -117,7 +117,7 @@ spec:
           # in HBM, dequantized per 128×128 block to BF16 before each MoE matmul.
           /opt/venv/bin/python demos/mimo_v2_flash_demo_jax.py \
             --model_name mimo-v2-5-pro \
-            --checkpoint_path gs://jingnw-mimo-v2-5-pro-us-central1/mimo-v2-5-pro-fp8-ocdbt/0/items \
+            --checkpoint_path gs://jingnw-mimo-v2-5-pro-us-central1/mimo-v2-5-pro-fp8-ocdbt-stacked-cpu/0/items \
             --tokenizer_path XiaomiMiMo/MiMo-V2.5-Pro \
             --ici_tensor_parallelism 8 \
             --ici_expert_parallelism 2 \

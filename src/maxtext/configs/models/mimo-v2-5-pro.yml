@@ -96,10 +96,9 @@ logits_via_embedding: false
 # Disable QK norm (MiMo does not use it)
 use_qk_norm: false
 
-# scan_layers=false: checkpoint is in standard per-layer format (not stacked).
-# scan_layers=true requires a stacked checkpoint produced by a separate process;
-# the HF→MaxText converter writes standard layout, so scan must stay false.
-scan_layers: false
+# scan_layers=true: checkpoint is in the 8-phase stacked layout produced by
+# mimo_v2_5_pro_stack_cpu.py. Caps XLA compilation to 1 layer body at a time.
+scan_layers: true
 
 # Tokenizer: HuggingFace Qwen2 tokenizer (same vocab as V2-Flash)
 tokenizer_path: "XiaomiMiMo/MiMo-V2.5-Pro"
