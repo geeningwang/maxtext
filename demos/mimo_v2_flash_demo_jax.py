@@ -167,6 +167,7 @@ def build_decode_command(
     checkpoint_is_quantized: bool = False,
     checkpoint_storage_use_zarr3: bool = True,
     mimo_fp8_weight_mode: str = "",
+    model_name: str = "mimo-v2-flash",
 ) -> list[str]:
     """Build the shell command for maxtext.inference.decode.
 
@@ -180,7 +181,7 @@ def build_decode_command(
         "-m",
         "maxtext.inference.decode",
         "src/maxtext/configs/base.yml",
-        f"model_name=mimo-v2-flash",
+        f"model_name={model_name}",
         f"run_name={run_name}",
         f"load_parameters_path={checkpoint_path}",
         f"tokenizer_path={tokenizer_path}",
@@ -254,6 +255,7 @@ def run_inference(
     checkpoint_is_quantized: bool = False,
     checkpoint_storage_use_zarr3: bool = True,
     mimo_fp8_weight_mode: str = "",
+    model_name: str = "mimo-v2-flash",
 ) -> tuple[str, float | None, bool]:
     """Execute MaxText inference and return (generated_text, tok_per_s, eos_fired).
 
@@ -283,6 +285,7 @@ def run_inference(
         checkpoint_is_quantized=checkpoint_is_quantized,
         checkpoint_storage_use_zarr3=checkpoint_storage_use_zarr3,
         mimo_fp8_weight_mode=mimo_fp8_weight_mode,
+        model_name=model_name,
     )
     if verbose:
         print("Running command:")
@@ -559,6 +562,13 @@ def main():
             "Use with an --keep_fp8-converted checkpoint."
         ),
     )
+    parser.add_argument(
+        "--model_name",
+        type=str,
+        default="mimo-v2-flash",
+        help="MaxText model name (maps to src/maxtext/configs/models/<name>.yml). "
+             "Use 'mimo-v2-5-pro' for MiMo-V2.5-Pro inference.",
+    )
     args = parser.parse_args()
 
     if args.print_arch:
@@ -594,6 +604,7 @@ def main():
         checkpoint_is_quantized=args.checkpoint_is_quantized,
         checkpoint_storage_use_zarr3=not args.checkpoint_is_quantized,
         mimo_fp8_weight_mode=getattr(args, "mimo_fp8_weight_mode", ""),
+        model_name=getattr(args, "model_name", "mimo-v2-flash"),
     )
     print("-" * 60)
     if tok_per_s is not None:

@@ -10,7 +10,7 @@
 #
 # Pre-requisites:
 #   1. Checkpoint converted to MaxText zarr2 format (Phase 4):
-#      gs://jingnw-mimo-v2-5-pro-us-central1/mimo-v2-5-pro-bf16-ocdbt/0/items
+#      gs://jingnw-mimo-v2-5-pro-us-central1/mimo-v2-5-pro-fp8-ocdbt/0/items
 #   2. Node pool jingnw-flex-tpu7-8ch available (autoscales from 0)
 #   3. Broken 16ch pool cleaned up (see env_restore.md pending cleanup section)
 #
@@ -113,12 +113,16 @@ spec:
           # Phase 6 smoke test: single-token decode at batch=1.
           # scan_layers=true is critical — caps XLA temp buffer to 1 layer at a time,
           # keeping within the ~9 GB XLA headroom on this 8-chip pool.
+          # mimo_fp8_weight_mode=block_wise_fp8: expert weights kept as float8_e4m3fn
+          # in HBM, dequantized per 128×128 block to BF16 before each MoE matmul.
           /opt/venv/bin/python demos/mimo_v2_flash_demo_jax.py \
-            --checkpoint_path gs://jingnw-mimo-v2-5-pro-us-central1/mimo-v2-5-pro-bf16-ocdbt/0/items \
+            --model_name mimo-v2-5-pro \
+            --checkpoint_path gs://jingnw-mimo-v2-5-pro-us-central1/mimo-v2-5-pro-fp8-ocdbt/0/items \
             --tokenizer_path XiaomiMiMo/MiMo-V2.5-Pro \
             --ici_tensor_parallelism 8 \
             --ici_expert_parallelism 2 \
             --scan_layers \
+            --mimo_fp8_weight_mode block_wise_fp8 \
             --max_prefill 128 \
             --max_new_tokens 32 \
             --verbose \
@@ -127,9 +131,9 @@ spec:
         resources:
           requests:
             cpu: "10"
-            memory: 512Gi
+            memory: 192Gi
             google.com/tpu: "4"   # 4 chips per node; 2 nodes = 8 chips total
           limits:
             cpu: "10"
-            memory: 512Gi
+            memory: 192Gi
             google.com/tpu: "4"
