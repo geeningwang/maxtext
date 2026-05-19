@@ -64,10 +64,10 @@ spec:
         resources:
           requests:
             cpu: "14"
-            memory: 115Gi
+            memory: 500Gi
           limits:
             cpu: "14"
-            memory: 115Gi
+            memory: 500Gi
         env:
         - name: PYTHONUNBUFFERED
           value: "1"
