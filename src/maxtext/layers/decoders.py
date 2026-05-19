@@ -482,7 +482,7 @@ class Decoder(nn.Module):
         return [llama4.Llama4ScannableBlockToLinen] if self.config.scan_layers else [llama4.Llama4DecoderLayerToLinen]
       case DecoderBlockType.OLMO3:
         return [olmo3.Olmo3ScannableBlockToLinen] if self.config.scan_layers else [olmo3.Olmo3DecoderLayerToLinen]
-      case DecoderBlockType.MIMO_V2_FLASH:
+      case DecoderBlockType.MIMO_V2:
         return [mimo_v2_flash.MiMoV2FlashScannableBlockToLinen] if self.config.scan_layers else [mimo_v2_flash.MiMoV2FlashDecoderLayerToLinen]
 
       case _:
@@ -535,7 +535,7 @@ class Decoder(nn.Module):
         DecoderBlockType.SIMPLE_MLP,
         DecoderBlockType.LLAMA4,
         DecoderBlockType.OLMO3,
-        DecoderBlockType.MIMO_V2_FLASH,
+        DecoderBlockType.MIMO_V2,
     ):
       return functools.partial(rms_norm, num_features=num_features, shard_mode=self.config.shard_mode)
     elif self.config.decoder_block == DecoderBlockType.GPT3:
@@ -949,7 +949,7 @@ class Decoder(nn.Module):
               page_state,
               slot,
           )
-        elif cfg.decoder_block == DecoderBlockType.MIMO_V2_FLASH:
+        elif cfg.decoder_block == DecoderBlockType.MIMO_V2:
           # MiMo-V2-Flash / MiMo-V2.5-Pro use a multi-phase stacked checkpoint
           # layout where each phase groups architecturally identical layers so
           # that nn.scan can be applied within each phase.
@@ -1186,8 +1186,8 @@ class Decoder(nn.Module):
               if kv_caches is not None and kv_cache is not None:
                 kv_caches[index] = kv_cache
             global_layer_idx_offset += num_layers
-        elif cfg.decoder_block == DecoderBlockType.MIMO_V2_FLASH:
-          # MIMO_V2_FLASH checkpoint uses "layers/{i}" key structure (e.g.
+        elif cfg.decoder_block == DecoderBlockType.MIMO_V2:
+          # MIMO_V2 checkpoint uses "layers/{i}" key structure (e.g.
           # params.params.decoder.layers.0.*) rather than "layers_{i}".
           # We replicate that by naming each layer module str(lyr) and wrapping
           # them inside a Linen module called "layers".

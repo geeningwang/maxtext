@@ -2441,7 +2441,7 @@ class MaxTextConfig(
           self.base_mlp_dim = self.base_moe_mlp_dim
           _, _, mlp_dim_scale, _ = get_individual_scales(self.global_parameter_scale)
           self.mlp_dim = (2**mlp_dim_scale) * self.base_mlp_dim
-        elif self.decoder_block == DecoderBlockType.MIMO_V2_FLASH:
+        elif self.decoder_block == DecoderBlockType.MIMO_V2:
           # MiMo-V2-Flash uses mimo_moe_layer_freq to select MoE vs dense layers;
           # base_mlp_dim (dense layer 0) and base_moe_mlp_dim (MoE layers) are
           # intentionally different, so skip the standard "fully MoE" check.
@@ -2522,7 +2522,7 @@ class MaxTextConfig(
             f"The number of decoder layers ({self.base_num_decoder_layers}) must be divisible by interleave moe layer step "
             f"({self.interleave_moe_layer_step})"
         )
-    if self.decoder_block in (DecoderBlockType.QWEN3_NEXT, DecoderBlockType.MIMO_V2_FLASH):
+    if self.decoder_block in (DecoderBlockType.QWEN3_NEXT, DecoderBlockType.MIMO_V2):
       if self.decoder_block == DecoderBlockType.QWEN3_NEXT:
         if int(self.gdn_num_value_heads) % int(self.gdn_num_key_heads) != 0:
           raise ValueError("gdn_num_value_heads must be divisible by gdn_num_key_heads")

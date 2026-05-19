@@ -101,7 +101,7 @@ class DecoderBlockType(enum.Enum):
   SIMPLE_MLP = "simple_mlp"
   LLAMA4 = "llama4"
   OLMO3 = "olmo3"
-  MIMO_V2_FLASH = "mimo_v2_flash"
+  MIMO_V2 = "mimo_v2"
 
 
 class AttentionType(enum.Enum):

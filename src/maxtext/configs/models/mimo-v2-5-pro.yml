@@ -29,7 +29,7 @@
 #   • vocab_size=152576 (Qwen2 tokenizer base, same as V2-Flash)
 
 # Decoder block selector
-decoder_block: "mimo_v2_flash"
+decoder_block: "mimo_v2"
 
 # Core architectural parameters
 base_emb_dim: 6144
