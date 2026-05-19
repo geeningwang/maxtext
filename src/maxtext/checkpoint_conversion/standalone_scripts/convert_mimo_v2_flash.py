@@ -1079,7 +1079,8 @@ def convert_hf_to_maxtext(
         _layer_elapsed = time.monotonic() - _t0
         _layer_times.append(_layer_elapsed)
         avg = sum(_layer_times) / len(_layer_times)
-        remaining = (num_layers - (i + 1)) * avg
+        _eff_end = layer_range[1] if layer_range is not None else num_layers
+        remaining = (_eff_end - (i + 1)) * avg
         max_logging.log(
             f"[layer {i:02d}/{num_layers-1}] Done  layer_time={_layer_elapsed:.0f}s  "
             f"avg={avg:.0f}s  ETA={remaining/60:.1f}min  "
