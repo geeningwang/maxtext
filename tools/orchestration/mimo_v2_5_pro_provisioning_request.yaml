@@ -41,7 +41,7 @@ metadata:
 spec:
   provisioningClassName: queued-provisioning.gke.io
   parameters:
-    maxRunDurationSeconds: "43200"   # 12 hours
+    maxRunDurationSeconds: "86400"   # 24 hours
   podSets:
   - count: 2
     podTemplateRef:
