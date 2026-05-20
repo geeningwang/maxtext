@@ -54,7 +54,7 @@ spec:
   completions: 2
   parallelism: 2
   completionMode: Indexed
-  backoffLimit: 0
+  backoffLimit: 1
   template:
     metadata:
       labels:
@@ -90,6 +90,10 @@ spec:
           value: "6006"
         - name: NNODES
           value: "2"
+        - name: JAX_LOG_COMPILES
+          value: "1"
+        - name: TF_CPP_MIN_LOG_LEVEL
+          value: "0"
         command:
         - bash
         - -lc
@@ -127,8 +131,8 @@ spec:
             tokenizer_path=XiaomiMiMo/MiMo-V2.5-Pro \
             tokenizer_type=huggingface \
             "prompt=Hello, what is 1+1?" \
-            max_prefill_predict_length=2048 \
-            max_target_length=2080 \
+            max_prefill_predict_length=512 \
+            max_target_length=544 \
             per_device_batch_size=1 \
             dtype=bfloat16 \
             weight_dtype=bfloat16 \
