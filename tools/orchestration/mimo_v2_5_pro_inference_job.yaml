@@ -62,6 +62,7 @@ spec:
       annotations:
         cluster-autoscaler.kubernetes.io/consume-provisioning-request: mimo-v25-pro-dws
         cluster-autoscaler.kubernetes.io/provisioning-class-name: queued-provisioning.gke.io
+        cluster-autoscaler.kubernetes.io/provisioning-class-name: queued-provisioning.gke.io
     spec:
       restartPolicy: Never
       # subdomain + headless Service gives pod-0 a stable DNS hostname:

@@ -1,3 +1,38 @@
+# PodTemplate describing resources needed by each inference pod.
+# Referenced by the ProvisioningRequest so DWS can reserve capacity.
+apiVersion: v1
+kind: PodTemplate
+metadata:
+  name: mimo-v25-pro-dws-template
+  namespace: default
+template:
+  spec:
+    restartPolicy: Never
+    nodeSelector:
+      cloud.google.com/gke-nodepool: jingnw-dws-tpu7-8ch
+      cloud.google.com/gke-tpu-accelerator: tpu7x
+      cloud.google.com/gke-tpu-topology: 2x2x2
+    tolerations:
+    - key: google.com/tpu
+      operator: Equal
+      value: present
+      effect: NoSchedule
+    containers:
+    - name: mimo-v25-pro-inference
+      image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.8.1-rev1
+      resources:
+        requests:
+          cpu: "220"
+          memory: 192Gi
+          google.com/tpu: "4"
+        limits:
+          cpu: "220"
+          memory: 192Gi
+          google.com/tpu: "4"
+
+---
+# ProvisioningRequest: queues for 2 TPU nodes for 12 hours (no preemption).
+# Apply this BEFORE the Job. DWS will provision capacity and hold it.
 apiVersion: autoscaling.x-k8s.io/v1beta1
 kind: ProvisioningRequest
 metadata:
@@ -5,10 +40,9 @@ metadata:
   namespace: default
 spec:
   provisioningClassName: queued-provisioning.gke.io
-  # 12 hours — enough for checkpoint restore (~90 min) + XLA compilation (~8 h)
   parameters:
-    maxRunDurationSeconds: "43200"
+    maxRunDurationSeconds: "43200"   # 12 hours
   podSets:
   - count: 2
     podTemplateRef:
-      name: mimo-v25-pro-inference
+      name: mimo-v25-pro-dws-template
