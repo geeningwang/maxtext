@@ -94,6 +94,8 @@ spec:
           value: "1"
         - name: TF_CPP_MIN_LOG_LEVEL
           value: "0"
+        - name: LIBTPU_INIT_ARGS
+          value: "--xla_compilation_parallelism=220"
         command:
         - bash
         - -lc
@@ -153,10 +155,10 @@ spec:
 
         resources:
           requests:
-            cpu: "10"
+            cpu: "220"
             memory: 192Gi
             google.com/tpu: "4"   # 4 chips per node; 2 nodes = 8 chips total
           limits:
-            cpu: "10"
+            cpu: "220"
             memory: 192Gi
             google.com/tpu: "4"
