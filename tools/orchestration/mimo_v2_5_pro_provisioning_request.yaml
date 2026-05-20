@@ -1,0 +1,14 @@
+apiVersion: autoscaling.x-k8s.io/v1beta1
+kind: ProvisioningRequest
+metadata:
+  name: mimo-v25-pro-dws
+  namespace: default
+spec:
+  provisioningClassName: queued-provisioning.gke.io
+  # 12 hours — enough for checkpoint restore (~90 min) + XLA compilation (~8 h)
+  parameters:
+    maxRunDurationSeconds: "43200"
+  podSets:
+  - count: 2
+    podTemplateRef:
+      name: mimo-v25-pro-inference

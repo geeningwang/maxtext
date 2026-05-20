@@ -59,13 +59,16 @@ spec:
     metadata:
       labels:
         job-name: mimo-v25-pro-inference
+      annotations:
+        cluster-autoscaler.kubernetes.io/consume-provisioning-request: mimo-v25-pro-dws
+        cluster-autoscaler.kubernetes.io/provisioning-class-name: queued-provisioning.gke.io
     spec:
       restartPolicy: Never
       # subdomain + headless Service gives pod-0 a stable DNS hostname:
       #   mimo-v25-pro-inference-0.mimo-v25-pro-inference.default.svc.cluster.local
       subdomain: mimo-v25-pro-inference
       nodeSelector:
-        cloud.google.com/gke-nodepool: jingnw-ondemand-tpu7-8ch
+        cloud.google.com/gke-nodepool: jingnw-dws-tpu7-8ch
         cloud.google.com/gke-tpu-accelerator: tpu7x
         cloud.google.com/gke-tpu-topology: 2x2x2
       tolerations:
