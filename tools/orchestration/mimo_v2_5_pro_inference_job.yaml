@@ -105,6 +105,17 @@ spec:
           set -euo pipefail
           export PATH="/opt/venv/bin:${PATH}"
 
+          # Persist logs to GCS so they survive pod failure / preemption.
+          # Background loop uploads every 30 s; EXIT trap does a final upload.
+          LOG_START=$(date -u +%Y%m%d_%H%M%S)
+          LOG_FILE=/tmp/mimo_run.log
+          GCS_LOG="gs://jingnw-mimo-v2-5-pro-us-central1/inference-logs/${LOG_START}_rank${NODE_RANK}.log"
+          exec > >(tee "${LOG_FILE}") 2>&1
+          (while true; do sleep 30; gsutil -q cp "${LOG_FILE}" "${GCS_LOG}" || true; done) &
+          UPLOADER_PID=$!
+          trap "gsutil -q cp '${LOG_FILE}' '${GCS_LOG}' || true; kill ${UPLOADER_PID} 2>/dev/null || true" EXIT
+          echo "[mimo-v25-pro] Logs mirrored to ${GCS_LOG} every 30 s"
+
           # Clone branch and install.
           WORKDIR=/workspace
           rm -rf "${WORKDIR}"
