@@ -77,6 +77,10 @@ spec:
         operator: Equal
         value: present
         effect: NoSchedule
+      - key: cloud.google.com/gke-queued
+        operator: Equal
+        value: "true"
+        effect: NoSchedule
       containers:
       - name: mimo-v25-pro-inference
         image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.8.1-rev1
